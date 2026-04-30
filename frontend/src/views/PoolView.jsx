@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import StakePoolView from '../stake/StakePoolView.jsx';
 
 export default function PoolView({ mint, onBack }) {
   const [pool, setPool] = useState(null);
@@ -46,13 +47,7 @@ export default function PoolView({ mint, onBack }) {
             <Stat label="wSOL claimed" value={pool.rewardWsol?.totalClaimed || '0'} />
           </div>
 
-          <div style={panelStyle}>
-            <h3 style={{ marginTop: 0 }}>Stake / Claim / Unstake</h3>
-            <p style={{ color: 'var(--muted)' }}>
-              Coming soon in the next phase. Stakrr will reuse the POB500 stake/claim/unstake
-              flow for every pool, parameterized by mint.
-            </p>
-          </div>
+          <StakePoolView stakeMintB58={pool.stakeMint} />
         </div>
       )}
     </div>

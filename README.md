@@ -81,7 +81,7 @@ Each phase is committed and pushed; this section is the source of truth for "wha
 - [x] Phase 1 — Pool registry + multi-pool worker loop (PumpDev claim → 2% cut → wSOL deposit → claim_push)
 - [x] Phase 2 — Self-serve launch backend (`POST /api/launch`) + frontend launch flow form
 - [x] Phase 3a — Pool directory + per-pool stats page + public partner API (`GET /api/pools/:mint/public`)
-- [ ] Phase 3b — Per-pool stake / claim / unstake UI (port from POBINDEX, parameterized by mint)
+- [x] Phase 3b — Per-pool stake / claim / unstake UI (multi-pool StakeClient, claim → wSOL → unwrap to SOL in one tx)
 - [ ] Phase 4 — Hosting (DO server, separate pm2 namespace, nginx vhost), domain selection
 - [ ] Phase 5 — Faith integration (announce launches, scan pools)
 
@@ -100,7 +100,10 @@ Each phase is committed and pushed; this section is the source of truth for "wha
 - `frontend/src/App.jsx` — shell + tabs (Pools / Launch)
 - `frontend/src/views/LaunchView.jsx` — token launch form
 - `frontend/src/views/DirectoryView.jsx` — list of active pools
-- `frontend/src/views/PoolView.jsx` — per-pool stats placeholder; staking UI is Phase 3b
+- `frontend/src/views/PoolView.jsx` — per-pool stats + embedded `StakePoolView`
+- `frontend/src/staking-sdk/` — copy of pob-index-stake JS SDK (PDAs, ix builders); inlined into the frontend for Vite polyfill compatibility
+- `frontend/src/stake/useStakePoolClient.js` — hook: builds an Anchor `StakeClient` for any `stakeMint`
+- `frontend/src/stake/StakePoolView.jsx` — stake form (amount + lock tier), positions list, claim wSOL → unwrap to SOL, unstake / unstake_early
 
 ## Run (dev)
 
