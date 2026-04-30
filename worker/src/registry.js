@@ -54,10 +54,12 @@ export function upsertPool(pool) {
         version: 1,
         status: 'active',
         rewardMint: 'So11111111111111111111111111111111111111112',
+        rewardMode: 'sol',
         platformFeeBps: 200,
         totalCreatorFeesClaimedLamports: '0',
         totalPlatformFeesLamports: '0',
         totalRewardsDistributedLamports: '0',
+        totalRewardsTokenRaw: '0',
         lastClaimedAt: null,
         lastDistributedAt: null,
         createdAt: now,
@@ -91,6 +93,25 @@ export function addToPoolMetrics(stakeMint, deltas) {
   for (const [key, lamports] of Object.entries(deltas)) {
     const current = BigInt(pool[key] || '0');
     pool[key] = (current + BigInt(lamports)).toString();
+  }
+  pool.updatedAt = new Date().toISOString();
+  reg.pools[idx] = pool;
+  writeRegistry(reg);
+  return pool;
+}
+
+/**
+ * Set arbitrary scalar/object fields on a pool atomically. Used by the worker
+ * to persist diagnostics like `lastClaimAttemptAt` / `lastClaimedAt` /
+ * `lastClaimAttemptEstimate` without going through the deltas helper.
+ */
+export function updatePoolFields(stakeMint, fields) {
+  const reg = readRegistryRaw();
+  const idx = reg.pools.findIndex((p) => p.stakeMint === stakeMint);
+  if (idx < 0) return null;
+  const pool = reg.pools[idx];
+  for (const [key, value] of Object.entries(fields)) {
+    pool[key] = value;
   }
   pool.updatedAt = new Date().toISOString();
   reg.pools[idx] = pool;

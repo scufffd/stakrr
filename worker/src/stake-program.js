@@ -30,6 +30,8 @@ const SEEDS = {
   checkpoint: Buffer.from('checkpoint'),
 };
 
+const VALID_LOCK_DAYS = new Set([1, 3, 7, 14, 21, 30]);
+
 let cachedIdl = null;
 function loadIdl() {
   if (!cachedIdl) cachedIdl = JSON.parse(fs.readFileSync(IDL_PATH, 'utf8'));
@@ -50,6 +52,19 @@ export function findRewardMintPda(pool, mint) {
 export function findCheckpointPda(position, rewardMintPda) {
   return PublicKey.findProgramAddressSync(
     [SEEDS.checkpoint, position.toBuffer(), rewardMintPda.toBuffer()],
+    config.programId,
+  )[0];
+}
+
+export function findPositionPda(pool, beneficiary, nonce) {
+  const nonceBn = BN.isBN(nonce) ? nonce : new BN(nonce);
+  return PublicKey.findProgramAddressSync(
+    [
+      SEEDS.position,
+      pool.toBuffer(),
+      beneficiary.toBuffer(),
+      nonceBn.toArrayLike(Buffer, 'le', 8),
+    ],
     config.programId,
   )[0];
 }
@@ -148,6 +163,77 @@ export async function depositRewardsIx({ connection, funder, stakeMint, rewardMi
     })
     .instruction();
   return { ix, pool, rewardMintPda, vault, funderAta, tokenProgram };
+}
+
+/**
+ * Build a `stake_for` instruction. Treasury (payer) funds tokens + rent for a
+ * fresh position whose `owner` is `beneficiary` — used to atomically stake
+ * dev-bought tokens on behalf of a launcher inside the launch flow.
+ */
+export async function stakeForIx({
+  connection,
+  payer,           // Keypair (signer) — treasury
+  stakeMint,
+  beneficiary,     // PublicKey — wallet that will own the position
+  amountRaw,       // bigint | string | number — raw token units
+  lockDays,        // number — must be one of LOCK_TIERS
+  nonce,           // BN | number | string
+}) {
+  if (!VALID_LOCK_DAYS.has(Number(lockDays))) {
+    throw new Error(`Invalid lock tier: ${lockDays}`);
+  }
+  const program = loadProgram(connection, payer);
+  const tokenProgram = await detectTokenProgram(connection, stakeMint);
+  const pool = findPoolPda(stakeMint);
+  const stakeVault = getAssociatedTokenAddressSync(stakeMint, pool, true, tokenProgram);
+  const payerTokenAccount = getAssociatedTokenAddressSync(stakeMint, payer.publicKey, false, tokenProgram);
+  const position = findPositionPda(pool, beneficiary, nonce);
+  const nonceBn = BN.isBN(nonce) ? nonce : new BN(nonce);
+  const ix = await program.methods
+    .stakeFor(new BN(amountRaw.toString()), Number(lockDays), nonceBn, beneficiary)
+    .accounts({
+      pool,
+      stakeMint,
+      stakeVault,
+      payer: payer.publicKey,
+      payerTokenAccount,
+      position,
+      tokenProgram,
+      systemProgram: SystemProgram.programId,
+      rent: SYSVAR_RENT_PUBKEY,
+    })
+    .instruction();
+  return { ix, pool, position, payerTokenAccount, stakeVault, tokenProgram };
+}
+
+/**
+ * Build a `prime_checkpoint` instruction so a fresh position is baselined
+ * against an existing reward mint and starts accruing from the next deposit.
+ */
+export async function primeCheckpointIx({
+  connection,
+  payer,           // Keypair — pays rent / signs
+  stakeMint,
+  position,
+  rewardTokenMint,
+}) {
+  const program = loadProgram(connection, payer);
+  const pool = findPoolPda(stakeMint);
+  const rewardMintPda = findRewardMintPda(pool, rewardTokenMint);
+  const checkpoint = findCheckpointPda(position, rewardMintPda);
+  const ix = await program.methods
+    .primeCheckpoint()
+    .accounts({
+      pool,
+      rewardMint: rewardMintPda,
+      position,
+      checkpoint,
+      payer: payer.publicKey,
+      systemProgram: SystemProgram.programId,
+      rent: SYSVAR_RENT_PUBKEY,
+    })
+    .instruction();
+  return { ix, checkpoint, rewardMintPda };
 }
 
 export async function fetchPool({ connection, signer, stakeMint }) {

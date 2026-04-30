@@ -32,9 +32,18 @@ function fmtSol(rawStr) {
   return fmtAmount(rawStr, 9);
 }
 
-export default function StakePoolView({ stakeMintB58 }) {
+export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol', rewardMintB58 }) {
   const { client, ready, wallet, connection, stakeMint, stakeTokenProgram } = useStakePoolClient(stakeMintB58);
   const walletState = useWallet();
+  const isSolReward = rewardMode !== 'token';
+  const rewardMintPk = useMemo(() => {
+    if (rewardMintB58) {
+      try { return new PublicKey(rewardMintB58); } catch {}
+    }
+    return isSolReward ? WSOL : null;
+  }, [rewardMintB58, isSolReward]);
+  const tickerLabel = symbol ? `$${symbol}` : 'tokens';
+  const rewardLabel = isSolReward ? 'SOL' : (symbol ? `$${symbol}` : 'tokens');
 
   const [pool, setPool] = useState(null);
   const [decimals, setDecimals] = useState(null);
@@ -43,6 +52,8 @@ export default function StakePoolView({ stakeMintB58 }) {
   const [refreshTick, setRefreshTick] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const [loadError, setLoadError] = useState(null);
+  const [loadingPool, setLoadingPool] = useState(false);
   const [lastSig, setLastSig] = useState(null);
 
   // form state
@@ -54,9 +65,24 @@ export default function StakePoolView({ stakeMintB58 }) {
   useEffect(() => {
     if (!ready || !client) return;
     let cancelled = false;
+    setLoadingPool(true);
+    setLoadError(null);
     (async () => {
       try {
-        const p = await client.fetchPool();
+        // Use direct fetch (not the SDK's silent-null wrapper) so RPC errors
+        // surface to the user instead of leaving us stuck on "loading".
+        let p = null;
+        try {
+          p = await client.program.account.stakePool.fetch(client.pool);
+        } catch (e) {
+          // "Account does not exist" is a real "not initialized" state; any
+          // other error is an RPC issue worth surfacing.
+          if (e?.message && /Account does not exist/i.test(e.message)) {
+            p = null;
+          } else {
+            throw e;
+          }
+        }
         if (cancelled) return;
         setPool(p);
         // mint decimals
@@ -77,7 +103,9 @@ export default function StakePoolView({ stakeMintB58 }) {
         if (cancelled) return;
         setPositions(owned);
       } catch (e) {
-        if (!cancelled) setError(e.message || String(e));
+        if (!cancelled) setLoadError(e.message || String(e));
+      } finally {
+        if (!cancelled) setLoadingPool(false);
       }
     })();
     return () => { cancelled = true; };
@@ -135,30 +163,56 @@ export default function StakePoolView({ stakeMintB58 }) {
   const onClaim = useCallback(async (position) => {
     setBusy(true); setError(null); setLastSig(null);
     try {
-      const userWsolAta = getAssociatedTokenAddressSync(WSOL, wallet.publicKey, false, TOKEN_PROGRAM_ID);
-      const ataIx = createAssociatedTokenAccountIdempotentInstruction(
-        wallet.publicKey, userWsolAta, wallet.publicKey, WSOL, TOKEN_PROGRAM_ID,
-      );
-      const claimIx = await client.claimIx({
-        owner: wallet.publicKey,
-        position: position.publicKey,
-        rewardTokenMint: WSOL,
-        userTokenAccount: userWsolAta,
-        rewardTokenProgram: TOKEN_PROGRAM_ID,
-      });
-      // unwrap to native SOL by closing the wSOL ATA
-      const closeIx = createCloseAccountInstruction(
-        userWsolAta, wallet.publicKey, wallet.publicKey, [], TOKEN_PROGRAM_ID,
-      );
-      const sig = await sendTx([ataIx, claimIx, closeIx]);
-      setLastSig(sig);
+      if (isSolReward) {
+        // SOL mode: build an ATA-create + claim + close (auto-unwrap to SOL).
+        const userWsolAta = getAssociatedTokenAddressSync(WSOL, wallet.publicKey, false, TOKEN_PROGRAM_ID);
+        const ataIx = createAssociatedTokenAccountIdempotentInstruction(
+          wallet.publicKey, userWsolAta, wallet.publicKey, WSOL, TOKEN_PROGRAM_ID,
+        );
+        const claimIx = await client.claimIx({
+          owner: wallet.publicKey,
+          position: position.publicKey,
+          rewardTokenMint: WSOL,
+          userTokenAccount: userWsolAta,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        });
+        const closeIx = createCloseAccountInstruction(
+          userWsolAta, wallet.publicKey, wallet.publicKey, [], TOKEN_PROGRAM_ID,
+        );
+        const sig = await sendTx([ataIx, claimIx, closeIx]);
+        setLastSig(sig);
+      } else {
+        // Token mode: rewards are paid in the launched mint itself, so the
+        // user's reward ATA is the same as their stake-mint ATA. No unwrap.
+        // CRITICAL: pump.fun tokens are Token-2022, so we MUST pass the
+        // correct token program (`stakeTokenProgram`) to claimIx so the SDK
+        // derives the right vault & user ATA. The SDK's param is
+        // `tokenProgram` (not `rewardTokenProgram`); a typo here silently
+        // falls back to legacy SPL and the on-chain `vault` account lookup
+        // fails with AccountNotInitialized (0xbc4 / 3012).
+        const tokenMint = rewardMintPk || stakeMint;
+        const tokenProgram = stakeTokenProgram;
+        const userAta = getAssociatedTokenAddressSync(tokenMint, wallet.publicKey, false, tokenProgram);
+        const ataIx = createAssociatedTokenAccountIdempotentInstruction(
+          wallet.publicKey, userAta, wallet.publicKey, tokenMint, tokenProgram,
+        );
+        const claimIx = await client.claimIx({
+          owner: wallet.publicKey,
+          position: position.publicKey,
+          rewardTokenMint: tokenMint,
+          userTokenAccount: userAta,
+          tokenProgram,
+        });
+        const sig = await sendTx([ataIx, claimIx]);
+        setLastSig(sig);
+      }
       reload();
     } catch (e) {
       setError(e.message || String(e));
     } finally {
       setBusy(false);
     }
-  }, [client, wallet, reload, sendTx]);
+  }, [client, wallet, reload, sendTx, isSolReward, rewardMintPk, stakeMint, stakeTokenProgram]);
 
   const onUnstake = useCallback(async (position, early) => {
     setBusy(true); setError(null); setLastSig(null);
@@ -184,10 +238,56 @@ export default function StakePoolView({ stakeMintB58 }) {
   }, [client, stakeMint, stakeTokenProgram, wallet, reload, sendTx]);
 
   if (!walletState?.connected) {
-    return <div style={panel}>connect a wallet to stake.</div>;
+    return (
+      <div style={panel}>
+        <h3 style={{ marginTop: 0 }}>Stake</h3>
+        <div style={{ color: 'var(--muted)', fontSize: 13 }}>
+          connect a wallet (top-right) to stake, claim, or unstake.
+        </div>
+      </div>
+    );
   }
-  if (!ready || !pool) {
-    return <div style={panel}>loading staking client…</div>;
+  if (!ready) {
+    return (
+      <div style={panel}>
+        <h3 style={{ marginTop: 0 }}>Stake</h3>
+        <div style={{ color: 'var(--muted)', fontSize: 13 }}>resolving stake mint…</div>
+      </div>
+    );
+  }
+  if (loadError) {
+    return (
+      <div style={panel}>
+        <h3 style={{ marginTop: 0 }}>Stake</h3>
+        <div style={errorStyle}>
+          failed to load pool from RPC: {loadError}
+        </div>
+        <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 8, lineHeight: 1.5 }}>
+          if you see &quot;429&quot; or rate-limit errors, set <code>VITE_RPC_URL</code> in
+          <code> frontend/.env</code> to a private endpoint (Helius / QuickNode) and reload.
+        </div>
+        <button onClick={reload} style={{ ...smallBtn, marginTop: 10 }}>retry</button>
+      </div>
+    );
+  }
+  if (loadingPool && !pool) {
+    return (
+      <div style={panel}>
+        <h3 style={{ marginTop: 0 }}>Stake</h3>
+        <div style={{ color: 'var(--muted)', fontSize: 13 }}>loading on-chain pool state…</div>
+      </div>
+    );
+  }
+  if (!pool) {
+    return (
+      <div style={panel}>
+        <h3 style={{ marginTop: 0 }}>Stake</h3>
+        <div style={{ color: 'var(--muted)', fontSize: 13 }}>
+          this pool isn't initialized on-chain yet. give it a few seconds and refresh.
+        </div>
+        <button onClick={reload} style={{ ...smallBtn, marginTop: 10 }}>refresh</button>
+      </div>
+    );
   }
 
   const balanceFmt = decimals != null ? fmtAmount(userBalanceRaw, decimals) : '—';
@@ -195,22 +295,34 @@ export default function StakePoolView({ stakeMintB58 }) {
   return (
     <div style={{ display: 'grid', gap: 16 }}>
       <div style={panel}>
-        <h3 style={{ marginTop: 0 }}>Stake</h3>
+        <h3 style={{ marginTop: 0 }}>Stake {tickerLabel}</h3>
         <div style={{ color: 'var(--muted)', fontSize: 13 }}>
-          your balance: <strong>{balanceFmt}</strong>
+          your balance: <strong>{balanceFmt} {symbol ? `$${symbol}` : ''}</strong>
         </div>
         <form onSubmit={onStake} style={{ display: 'grid', gap: 10, marginTop: 12 }}>
           <div style={field}>
             <label style={label}>Amount</label>
-            <input
-              style={input}
-              type="number"
-              step="0.000001"
-              min="0"
-              value={amount}
-              onChange={(e) => setAmount(e.target.value)}
-              required
-            />
+            <div style={{ display: 'flex', gap: 6 }}>
+              <input
+                style={{ ...input, flex: 1 }}
+                type="number"
+                step="0.000001"
+                min="0"
+                value={amount}
+                onChange={(e) => setAmount(e.target.value)}
+                required
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  if (decimals == null) return;
+                  setAmount(fmtAmount(userBalanceRaw, decimals));
+                }}
+                style={maxBtn}
+              >
+                max
+              </button>
+            </div>
           </div>
           <div style={field}>
             <label style={label}>Lock</label>
@@ -221,7 +333,7 @@ export default function StakePoolView({ stakeMintB58 }) {
             </select>
           </div>
           <button type="submit" disabled={busy} style={primaryBtn(busy)}>
-            {busy ? 'submitting…' : 'stake'}
+            {busy ? 'submitting…' : `stake ${tickerLabel}`}
           </button>
         </form>
       </div>
@@ -250,7 +362,7 @@ export default function StakePoolView({ stakeMintB58 }) {
                 </div>
                 <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
                   <button onClick={() => onClaim(p)} disabled={busy} style={smallBtn}>
-                    claim wSOL → SOL
+                    {isSolReward ? 'claim wSOL → SOL' : `claim ${rewardLabel}`}
                   </button>
                   {expired ? (
                     <button onClick={() => onUnstake(p, false)} disabled={busy} style={smallBtn}>
@@ -320,6 +432,17 @@ const smallBtn = {
   borderRadius: 8,
   cursor: 'pointer',
   fontSize: 13,
+};
+
+const maxBtn = {
+  background: 'rgba(255,255,255,0.04)',
+  color: 'var(--accent)',
+  border: '1px solid var(--border)',
+  padding: '0 14px',
+  borderRadius: 8,
+  cursor: 'pointer',
+  fontSize: 12,
+  fontWeight: 700,
 };
 
 const smallBtnDanger = {

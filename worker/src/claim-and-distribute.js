@@ -12,16 +12,17 @@ import {
   sendAndConfirmTransaction,
 } from '@solana/web3.js';
 import {
-  ASSOCIATED_TOKEN_PROGRAM_ID,
-  TOKEN_PROGRAM_ID,
   createAssociatedTokenAccountIdempotentInstruction,
+  getAccount,
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token';
 import { config, authoritySigner } from './config.js';
 import { wrapSolIxs } from './wsol.js';
-import { buildClaimCreatorFeesTx } from './pumpdev.js';
+import { buildClaimCreatorFeesTx, buildBuyTokenTx } from './pumpdev.js';
+import { shouldAttemptClaim } from './dexscreener.js';
 import {
   depositRewardsIx,
+  detectTokenProgram,
   fetchActivePositions,
   fetchPool,
   fetchRewardMint,
@@ -30,7 +31,7 @@ import {
   findRewardMintPda,
   loadProgram,
 } from './stake-program.js';
-import { addToPoolMetrics, recordEvent } from './registry.js';
+import { addToPoolMetrics, recordEvent, updatePoolFields } from './registry.js';
 
 function log(message, extra = {}) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), message, ...extra }));
@@ -46,11 +47,14 @@ async function getSolBalance(connection, pubkey) {
   return BigInt(await connection.getBalance(pubkey, 'confirmed'));
 }
 
-async function claimCreatorFees(connection, treasury) {
+async function claimCreatorFees(connection, treasury, { mint } = {}) {
   const beforeLamports = await getSolBalance(connection, treasury.publicKey);
   let signature = null;
   try {
-    const vt = await buildClaimCreatorFeesTx({ publicKey: treasury.publicKey.toBase58() });
+    const vt = await buildClaimCreatorFeesTx({
+      publicKey: treasury.publicKey.toBase58(),
+      mint, // required if fee-sharing is configured for this token
+    });
     vt.sign([treasury]);
     signature = await connection.sendRawTransaction(vt.serialize(), { skipPreflight: false });
     await connection.confirmTransaction(signature, 'confirmed');
@@ -73,17 +77,15 @@ function splitFees(claimedLamports) {
   return { platform, stakers };
 }
 
-async function depositToPool({ connection, treasury, stakeMint, lamports }) {
+async function depositSolAsWsolToPool({ connection, treasury, stakeMint, lamports }) {
   if (lamports <= 0n) return null;
 
-  // 1) wrap SOL -> wSOL on treasury's wSOL ATA
   const wrap = await wrapSolIxs({
     payer: treasury.publicKey,
     owner: treasury.publicKey,
     lamports,
   });
 
-  // 2) deposit_rewards into the pool's wSOL reward vault
   const dep = await depositRewardsIx({
     connection,
     funder: treasury,
@@ -105,7 +107,83 @@ async function depositToPool({ connection, treasury, stakeMint, lamports }) {
   return signature;
 }
 
+/**
+ * Token-reward path: spend `lamports` SOL on the bonding curve to buy the
+ * launched mint, then deposit the resulting tokens as a separate tx.
+ *
+ * Returns `{ buySig, depositSig, depositedRaw }` or null if no tokens were
+ * acquired (e.g. PumpDev rejection / curve issues).
+ */
+async function depositTokensToPool({ connection, treasury, stakeMint, lamports }) {
+  if (lamports <= 0n) return null;
+
+  const tokenProgram = await detectTokenProgram(connection, stakeMint);
+  const treasuryAta = getAssociatedTokenAddressSync(
+    stakeMint,
+    treasury.publicKey,
+    false,
+    tokenProgram,
+  );
+
+  let beforeRaw = 0n;
+  try {
+    const acc = await getAccount(connection, treasuryAta, 'confirmed', tokenProgram);
+    beforeRaw = acc.amount;
+  } catch {
+    beforeRaw = 0n;
+  }
+
+  // 1) Buy the launched token from the bonding curve.
+  const solAmount = Number(lamports) / 1e9;
+  const buyTx = await buildBuyTokenTx({
+    publicKey: treasury.publicKey.toBase58(),
+    mint: stakeMint.toBase58(),
+    solAmount,
+    slippage: 5,
+    pool: 'auto',
+  });
+  buyTx.sign([treasury]);
+  const buySig = await connection.sendRawTransaction(buyTx.serialize(), { skipPreflight: false });
+  await connection.confirmTransaction(buySig, 'confirmed');
+
+  // 2) Compute how many tokens we actually got, with a tiny retry to allow
+  //    the ATA balance to settle on the RPC.
+  let acquiredRaw = 0n;
+  for (let i = 0; i < 5; i++) {
+    try {
+      const acc = await getAccount(connection, treasuryAta, 'confirmed', tokenProgram);
+      const delta = acc.amount - beforeRaw;
+      if (delta > 0n) { acquiredRaw = delta; break; }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 600));
+  }
+  if (acquiredRaw <= 0n) {
+    log('cycle: token swap returned 0 tokens', { stakeMint: stakeMint.toBase58(), buySig });
+    return { buySig, depositSig: null, depositedRaw: '0' };
+  }
+
+  // 3) deposit_rewards(token) into the pool's reward vault.
+  const dep = await depositRewardsIx({
+    connection,
+    funder: treasury,
+    stakeMint,
+    rewardMint: stakeMint,
+    amountLamports: acquiredRaw,
+  });
+  const tx = new Transaction();
+  const fee = priorityFeeIx();
+  if (fee) tx.add(fee);
+  tx.add(dep.ix);
+  const depositSig = await sendAndConfirmTransaction(connection, tx, [treasury], {
+    commitment: 'confirmed',
+    preflightCommitment: 'confirmed',
+  });
+  return { buySig, depositSig, depositedRaw: acquiredRaw.toString() };
+}
+
 // Build a single claim_push instruction for a given (position, rewardMintPda).
+// Caller passes `tokenProgram` since reward mints can be classic SPL (wSOL) or
+// Token-2022 (pump.fun launches).
 async function buildClaimPushIx({
   connection,
   authority,
@@ -113,12 +191,12 @@ async function buildClaimPushIx({
   rewardMint,
   position,
   positionOwner,
+  tokenProgram,
 }) {
   const program = loadProgram(connection, authority);
   const pool = findPoolPda(stakeMint);
   const rewardMintPda = findRewardMintPda(pool, rewardMint);
   const checkpoint = findCheckpointPda(position, rewardMintPda);
-  const tokenProgram = TOKEN_PROGRAM_ID; // wSOL is classic SPL
   const vault = getAssociatedTokenAddressSync(rewardMint, pool, true, tokenProgram);
   const userTokenAccount = getAssociatedTokenAddressSync(rewardMint, positionOwner, false, tokenProgram);
 
@@ -190,12 +268,13 @@ function packIxs({ groups, feePayer, recentBlockhash }) {
   return txs;
 }
 
-async function pushClaimsToActiveStakers({ connection, stakeMint }) {
+async function pushClaimsToActiveStakers({ connection, stakeMint, rewardMint }) {
   const authority = authoritySigner();
   const positions = await fetchActivePositions({ connection, signer: authority, stakeMint });
   if (positions.length === 0) {
     return { pushed: 0, skipped: 0, txSigs: [] };
   }
+  const tokenProgram = await detectTokenProgram(connection, rewardMint);
 
   const groups = [];
   for (const p of positions) {
@@ -204,9 +283,10 @@ async function pushClaimsToActiveStakers({ connection, stakeMint }) {
         connection,
         authority,
         stakeMint,
-        rewardMint: config.wsolMint,
+        rewardMint,
         position: p.publicKey,
         positionOwner: p.account.owner,
+        tokenProgram,
       });
       groups.push([ataIx, ix]);
     } catch (e) {
@@ -234,6 +314,10 @@ async function pushClaimsToActiveStakers({ connection, stakeMint }) {
 
 export async function runPoolCycle({ pool }) {
   const stakeMint = new PublicKey(pool.stakeMint);
+  const rewardMode = pool.rewardMode || 'sol';
+  const rewardMint = rewardMode === 'token'
+    ? stakeMint
+    : new PublicKey(pool.rewardMint || config.wsolMint.toBase58());
   const connection = new Connection(config.stakeRpcUrl, 'confirmed');
   const treasury = config.treasuryKeypair;
   const authority = authoritySigner();
@@ -247,24 +331,75 @@ export async function runPoolCycle({ pool }) {
     log('cycle: pool has zero effective stake, skipping deposit', { stakeMint: pool.stakeMint });
   }
 
-  const wsolReward = await fetchRewardMint({
+  const reward = await fetchRewardMint({
     connection,
     signer: authority,
     stakeMint,
-    rewardMint: config.wsolMint,
+    rewardMint,
   });
-  if (!wsolReward) {
-    log('cycle: wSOL reward mint not registered, skipping', { stakeMint: pool.stakeMint });
+  if (!reward) {
+    log('cycle: reward mint not registered, skipping', {
+      stakeMint: pool.stakeMint,
+      rewardMint: rewardMint.toBase58(),
+      rewardMode,
+    });
     return { status: 'reward_unregistered' };
   }
 
-  // 1) Claim creator fees.
-  const { claimedLamports, signature: claimSig } = await claimCreatorFees(connection, treasury);
+  // 1) Pre-claim probe via DexScreener. Pump.fun's `CollectCreatorFee`
+  //    instruction returns "no creator fee to collect" silently when nothing
+  //    has accrued, but we still pay tx + priority fees (~0.0026 SOL). Skip
+  //    the claim entirely when DexScreener says there hasn't been enough
+  //    volume since our last successful claim.
+  const probe = await shouldAttemptClaim({
+    mint: pool.stakeMint,
+    lastClaimedAt: pool.lastClaimedAt,
+    lastClaimAttemptAt: pool.lastClaimAttemptAt,
+    // Require ~2× the average claim tx cost in projected creator fees before
+    // we attempt — keeps us net-positive even on noisy probes.
+    minLamports: 6_000n,
+  });
+  log('cycle: pre-claim probe', {
+    stakeMint: pool.stakeMint,
+    attempt: probe.attempt,
+    reason: probe.reason,
+    estimate: probe.est ? {
+      window: probe.est.window,
+      elapsedSec: probe.est.elapsedSec,
+      volumeUsd: probe.est.volumeUsd,
+      accruedLamports: probe.est.accruedLamports,
+      source: probe.est.source,
+    } : null,
+  });
+  // Always update lastClaimAttemptAt so the catch-up timer is correct.
+  updatePoolFields(pool.stakeMint, {
+    lastClaimAttemptAt: new Date().toISOString(),
+    lastClaimAttemptReason: probe.reason,
+    lastClaimAttemptEstimate: probe.est || null,
+  });
+  if (!probe.attempt) {
+    return {
+      status: 'skipped_no_volume',
+      reason: probe.reason,
+      estimate: probe.est || null,
+    };
+  }
+
+  // 2) Claim creator fees. We pass the pool's stakeMint so PumpDev uses the
+  //    correct claim instruction when fee-sharing is configured.
+  const { claimedLamports, signature: claimSig } = await claimCreatorFees(
+    connection,
+    treasury,
+    { mint: pool.stakeMint },
+  );
   log('cycle: claimed', {
     stakeMint: pool.stakeMint,
     claimedLamports: claimedLamports.toString(),
     claimSig,
   });
+  if (claimedLamports > 0n) {
+    updatePoolFields(pool.stakeMint, { lastClaimedAt: new Date().toISOString() });
+  }
   if (claimedLamports < BigInt(config.minDistributeLamports)) {
     return { status: 'below_min_distribute', claimedLamports: claimedLamports.toString() };
   }
@@ -273,41 +408,80 @@ export async function runPoolCycle({ pool }) {
   const { platform, stakers } = splitFees(claimedLamports);
   log('cycle: split', {
     stakeMint: pool.stakeMint,
+    rewardMode,
     platform: platform.toString(),
     stakers: stakers.toString(),
   });
 
   let depositSig = null;
+  let buySig = null;
+  let rewardsDepositedRaw = '0';
+  let rewardsDepositedLabel = stakers.toString(); // for SOL mode, lamports == raw
+
   if (stakers > 0n && !onchain.totalEffective?.isZero?.()) {
-    depositSig = await depositToPool({
-      connection,
-      treasury,
-      stakeMint,
-      lamports: stakers,
-    });
-    log('cycle: deposited wSOL to pool', { stakeMint: pool.stakeMint, sig: depositSig });
+    if (rewardMode === 'token') {
+      const res = await depositTokensToPool({
+        connection,
+        treasury,
+        stakeMint,
+        lamports: stakers,
+      });
+      if (res) {
+        buySig = res.buySig;
+        depositSig = res.depositSig;
+        rewardsDepositedRaw = res.depositedRaw;
+        rewardsDepositedLabel = res.depositedRaw;
+        log('cycle: swapped SOL to token + deposited', {
+          stakeMint: pool.stakeMint,
+          buySig,
+          depositSig,
+          depositedRaw: res.depositedRaw,
+        });
+      }
+    } else {
+      depositSig = await depositSolAsWsolToPool({
+        connection,
+        treasury,
+        stakeMint,
+        lamports: stakers,
+      });
+      rewardsDepositedRaw = stakers.toString();
+      rewardsDepositedLabel = stakers.toString();
+      log('cycle: deposited wSOL to pool', { stakeMint: pool.stakeMint, sig: depositSig });
+    }
   }
 
   // 3) Push to stakers (only if we deposited).
   let pushResult = { pushed: 0, skipped: 0, txSigs: [] };
   if (depositSig) {
-    pushResult = await pushClaimsToActiveStakers({ connection, stakeMint });
+    pushResult = await pushClaimsToActiveStakers({ connection, stakeMint, rewardMint });
     log('cycle: pushed claims', { stakeMint: pool.stakeMint, ...pushResult });
   }
 
-  // 4) Update metrics.
-  addToPoolMetrics(pool.stakeMint, {
+  // 4) Update metrics. We bookkeep SOL-denominated metrics regardless (so the
+  //    UI can always show "creator fees claimed in SOL" + "platform fee in SOL")
+  //    and only fill in token-denominated fields when rewardMode === 'token'.
+  const metricsDelta = {
     totalCreatorFeesClaimedLamports: claimedLamports.toString(),
     totalPlatformFeesLamports: platform.toString(),
-    totalRewardsDistributedLamports: stakers.toString(),
-  });
+  };
+  if (rewardMode === 'token') {
+    metricsDelta.totalRewardsTokenRaw = rewardsDepositedRaw;
+  } else {
+    metricsDelta.totalRewardsDistributedLamports = stakers.toString();
+  }
+  addToPoolMetrics(pool.stakeMint, metricsDelta);
+
   recordEvent({
     type: 'cycle',
     stakeMint: pool.stakeMint,
+    rewardMode,
     claimedLamports: claimedLamports.toString(),
     platformFeeLamports: platform.toString(),
-    rewardsDepositedLamports: stakers.toString(),
+    rewardsDepositedRaw,
+    rewardsDepositedLabel,
     claimSig,
+    buySig,
     depositSig,
     pushedClaims: pushResult.pushed,
     pushTxSigs: pushResult.txSigs,
@@ -315,10 +489,12 @@ export async function runPoolCycle({ pool }) {
 
   return {
     status: 'ok',
+    rewardMode,
     claimedLamports: claimedLamports.toString(),
     platformFeeLamports: platform.toString(),
-    rewardsDepositedLamports: stakers.toString(),
+    rewardsDepositedRaw,
     claimSig,
+    buySig,
     depositSig,
     pushedClaims: pushResult.pushed,
   };
