@@ -70,102 +70,73 @@ export default function PoolView({ mint, onBack }) {
 
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
-        <button onClick={onBack} style={backBtnStyle}>← back to pools</button>
-        <button onClick={() => setRefreshTick((t) => t + 1)} style={backBtnStyle}>refresh</button>
+      <div className="pool-toolbar">
+        <button type="button" onClick={onBack} className="btn-ghost">← Back to pools</button>
+        <button type="button" onClick={() => setRefreshTick((t) => t + 1)} className="btn-ghost">Refresh</button>
       </div>
 
-      {loading && <div style={mutedTextStyle}>loading pool…</div>}
-      {error && <div style={errorBoxStyle}>error: {error}</div>}
+      {loading && <div className="muted" style={{ padding: 16 }}>Loading pool…</div>}
+      {error && <div className="alert alert--error" style={{ marginBottom: 16 }}>{error}</div>}
 
       {pool && (
-        <div style={{ display: 'grid', gap: 16 }}>
-          {/* HEADER */}
-          <div style={panelStyle}>
-            <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+        <div style={{ display: 'grid', gap: 20 }}>
+          <div className="panel panel--tight">
+            <div style={{ display: 'flex', gap: 20, alignItems: 'flex-start', flexWrap: 'wrap' }}>
               {meta.image && (
                 <img
                   src={meta.image}
                   alt={meta.symbol || 'token'}
-                  style={{ width: 72, height: 72, borderRadius: 12, objectFit: 'cover', border: '1px solid var(--border)' }}
+                  className="token-avatar"
                   onError={(e) => { e.currentTarget.style.display = 'none'; }}
                 />
               )}
               <div style={{ flex: 1, minWidth: 240 }}>
-                <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
-                  <span style={{ fontSize: 26, fontWeight: 800 }}>{meta.name || 'Untitled'}</span>
-                  <span style={{ color: 'var(--accent)', fontWeight: 700, fontSize: 16 }}>${meta.symbol || 'TKN'}</span>
-                  <span style={{
-                    fontSize: 11,
-                    color: 'var(--muted)',
-                    background: 'rgba(255,255,255,0.04)',
-                    padding: '2px 8px',
-                    borderRadius: 999,
-                    border: '1px solid var(--border)',
-                  }}>
-                    {pool.initialized ? 'POB STAKING · LIVE' : 'POOL UNINITIALIZED'}
+                <div className="pool-header__title-row">
+                  <span className="pool-header__name">{meta.name || 'Untitled'}</span>
+                  <span className="pool-header__sym">${meta.symbol || 'TKN'}</span>
+                  <span className="badge">
+                    {pool.initialized ? 'Staking live' : 'Pool uninitialized'}
                   </span>
                   {pool.initialized && (
-                    <span style={{
-                      fontSize: 11,
-                      color: pool.rewardMode === 'token' ? '#a78bfa' : '#4ade80',
-                      background: 'rgba(255,255,255,0.04)',
-                      padding: '2px 8px',
-                      borderRadius: 999,
-                      border: '1px solid var(--border)',
-                    }}>
-                      REWARDS · {pool.rewardMode === 'token' ? `$${meta.symbol || 'TKN'}` : 'SOL'}
+                    <span className={`badge ${pool.rewardMode === 'token' ? 'badge--token' : 'badge--sol'}`}>
+                      Rewards · {pool.rewardMode === 'token' ? `$${meta.symbol || 'TKN'}` : 'SOL'}
                     </span>
                   )}
                 </div>
                 {meta.description && (
-                  <div style={{ color: 'var(--muted)', marginTop: 6, fontSize: 13, maxWidth: 720 }}>
+                  <div className="muted" style={{ marginTop: 10, fontSize: '0.9375rem', maxWidth: 720, lineHeight: 1.55 }}>
                     {meta.description}
                   </div>
                 )}
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10, alignItems: 'center' }}>
-                  <button
-                    onClick={() => copy(pool.stakeMint)}
-                    title="click to copy"
-                    style={chipBtnStyle}
-                  >
-                    CA: {shorten(pool.stakeMint, 6, 6)}
+                <div className="chips-row">
+                  <button type="button" onClick={() => copy(pool.stakeMint)} className="btn-chip" title="Copy mint">
+                    CA {shorten(pool.stakeMint, 6, 6)}
                   </button>
                   {pool.creatorWallet && (
-                    <button
-                      onClick={() => copy(pool.creatorWallet)}
-                      title="launcher (informational)"
-                      style={chipBtnStyle}
-                    >
-                      launcher: {shorten(pool.creatorWallet)}
+                    <button type="button" onClick={() => copy(pool.creatorWallet)} className="btn-chip" title="Copy launcher">
+                      Launcher {shorten(pool.creatorWallet)}
                     </button>
                   )}
-                  {meta.twitter && <a href={meta.twitter} target="_blank" rel="noreferrer" style={linkChipStyle}>twitter</a>}
-                  {meta.telegram && <a href={meta.telegram} target="_blank" rel="noreferrer" style={linkChipStyle}>telegram</a>}
-                  {meta.website && <a href={meta.website} target="_blank" rel="noreferrer" style={linkChipStyle}>site</a>}
-                  <a href={pumpfunUrl} target="_blank" rel="noreferrer" style={pumpBtnStyle}>
-                    buy on pump.fun ↗
+                  {meta.twitter && <a href={meta.twitter} target="_blank" rel="noreferrer" className="link-chip">Twitter</a>}
+                  {meta.telegram && <a href={meta.telegram} target="_blank" rel="noreferrer" className="link-chip">Telegram</a>}
+                  {meta.website && <a href={meta.website} target="_blank" rel="noreferrer" className="link-chip">Site</a>}
+                  <a href={pumpfunUrl} target="_blank" rel="noreferrer" className="btn-pump" style={{ marginLeft: 'auto' }}>
+                    Buy on Pump.fun ↗
                   </a>
                 </div>
               </div>
             </div>
           </div>
 
-          {/* STATS STRIP */}
-          <div style={statsRowStyle}>
+          <div className="stats-row">
             <Stat
               label="Total staked"
-              value={pool.totalStaked && pool.totalStaked !== '0'
-                ? fmtRaw(pool.totalStaked, 6)
-                : '0'}
+              value={pool.totalStaked && pool.totalStaked !== '0' ? fmtRaw(pool.totalStaked, 6) : '0'}
               suffix={meta.symbol || ''}
             />
             <Stat label="Active positions" value={String(pool.activePositions ?? '—')} />
             <Stat label="Unique stakers" value={String(pool.uniqueStakers ?? '—')} />
-            <Stat
-              label="Fees claimed (SOL)"
-              value={fmtSol(pool.totalCreatorFeesClaimedLamports || '0')}
-            />
+            <Stat label="Fees claimed (SOL)" value={fmtSol(pool.totalCreatorFeesClaimedLamports || '0')} />
             {pool.rewardMode === 'token' ? (
               <>
                 <Stat
@@ -185,10 +156,7 @@ export default function PoolView({ mint, onBack }) {
               </>
             ) : (
               <>
-                <Stat
-                  label="Stakers earned (SOL)"
-                  value={fmtSol(pool.rewardWsol?.totalDeposited || '0')}
-                />
+                <Stat label="Stakers earned (SOL)" value={fmtSol(pool.rewardWsol?.totalDeposited || '0')} />
                 <Stat
                   label="Pending claim (SOL)"
                   value={fmtSol(
@@ -203,50 +171,56 @@ export default function PoolView({ mint, onBack }) {
           </div>
 
           {!pool.initialized && (
-            <div style={errorBoxStyle}>
-              this pool's on-chain state isn't initialized yet — try again in a few seconds.
+            <div className="alert alert--error">
+              This pool&apos;s on-chain state isn&apos;t initialized yet — try again in a few seconds.
             </div>
           )}
 
-          {/* TWO-COLUMN BODY */}
-          <div style={twoColStyle}>
-            <div style={{ display: 'grid', gap: 16 }}>
-              <div style={panelStyle}>
-                <h3 style={{ marginTop: 0 }}>How this pool works</h3>
-                <ul style={{ color: 'var(--muted)', fontSize: 13, lineHeight: 1.6, paddingLeft: 18, margin: 0 }}>
-                  <li>Buy ${meta.symbol || 'TKN'} on pump.fun (link top-right) to start.</li>
-                  <li>Stake your tokens here for a lock tier — longer locks earn higher reward weight.</li>
+          <div className="two-col">
+            <div style={{ display: 'grid', gap: 20 }}>
+              <div className="panel panel--tight">
+                <h3 className="section-title" style={{ fontSize: '1.35rem', marginBottom: 12 }}>How this pool works</h3>
+                <ul className="muted" style={{ fontSize: '0.875rem', lineHeight: 1.65, paddingLeft: 20, margin: 0 }}>
+                  <li>Buy ${meta.symbol || 'TKN'} on Pump.fun (link above) to start.</li>
+                  <li>Stake your tokens for a lock tier — longer locks earn higher reward weight.</li>
                   {pool.rewardMode === 'token' ? (
                     <>
-                      <li>The platform treasury claims pump.fun creator fees periodically. <strong>2%</strong> stays as platform fee. The remaining SOL is <strong>swapped to ${meta.symbol || 'TKN'}</strong> via Pump.fun and deposited into this pool as rewards (buyback-and-distribute).</li>
-                      <li>Stakers earn ${meta.symbol || 'TKN'} proportionally. The worker pushes claims automatically; you can also claim from your position card.</li>
-                      <li>Rewards arrive in your wallet as ${meta.symbol || 'TKN'}.</li>
+                      <li>
+                        The treasury claims Pump.fun creator fees on a schedule. <strong>2%</strong> is platform fee.
+                        The rest is <strong>swapped to ${meta.symbol || 'TKN'}</strong> and deposited as rewards.
+                      </li>
+                      <li>Stakers earn ${meta.symbol || 'TKN'} proportionally; you can claim from your position card.</li>
                     </>
                   ) : (
                     <>
-                      <li>The platform treasury claims pump.fun creator fees periodically. <strong>2%</strong> stays as platform fee, <strong>98%</strong> is wrapped to wSOL and deposited into this pool.</li>
-                      <li>Stakers earn proportionally. The worker pushes claims automatically; you can also claim from your position card.</li>
-                      <li>Rewards arrive in your wallet as native SOL (wSOL is auto-unwrapped on claim).</li>
+                      <li>
+                        The treasury claims creator fees periodically. <strong>2%</strong> platform fee,{' '}
+                        <strong>98%</strong> wrapped to wSOL and deposited.
+                      </li>
+                      <li>Stakers earn proportionally; rewards arrive as native SOL (unwrap on claim).</li>
                     </>
                   )}
                 </ul>
               </div>
 
-              <div style={panelStyle}>
-                <h3 style={{ marginTop: 0 }}>Pool details</h3>
+              <div className="panel panel--tight">
+                <h3 className="section-title" style={{ fontSize: '1.35rem', marginBottom: 12 }}>Pool details</h3>
                 <DetailRow label="Stake mint" value={pool.stakeMint} mono />
-                <DetailRow label="Reward mode" value={pool.rewardMode === 'token' ? `$${meta.symbol || 'TKN'} (buyback)` : 'SOL (wSOL → SOL on claim)'} />
+                <DetailRow
+                  label="Reward mode"
+                  value={pool.rewardMode === 'token' ? `$${meta.symbol || 'TKN'} (buyback)` : 'SOL (wSOL → SOL on claim)'}
+                />
                 <DetailRow label="Reward mint" value={pool.rewardMint} mono />
                 <DetailRow label="Platform fee" value={`${(pool.platformFeeBps || 200) / 100}%`} />
                 {pool.rewardMode === 'token' ? (
                   <>
                     <DetailRow
                       label={`Total deposited ($${meta.symbol || 'TKN'})`}
-                      value={fmtRaw(pool.rewardToken?.totalDeposited || '0', 6) + ` $${meta.symbol || 'TKN'}`}
+                      value={`${fmtRaw(pool.rewardToken?.totalDeposited || '0', 6)} $${meta.symbol || 'TKN'}`}
                     />
                     <DetailRow
                       label={`Total claimed ($${meta.symbol || 'TKN'})`}
-                      value={fmtRaw(pool.rewardToken?.totalClaimed || '0', 6) + ` $${meta.symbol || 'TKN'}`}
+                      value={`${fmtRaw(pool.rewardToken?.totalClaimed || '0', 6)} $${meta.symbol || 'TKN'}`}
                     />
                     {pool.rewardToken?.lastDepositTs && pool.rewardToken.lastDepositTs !== '0' && (
                       <DetailRow
@@ -257,8 +231,8 @@ export default function PoolView({ mint, onBack }) {
                   </>
                 ) : (
                   <>
-                    <DetailRow label="Total deposited (wSOL)" value={fmtSol(pool.rewardWsol?.totalDeposited || '0') + ' SOL'} />
-                    <DetailRow label="Total claimed (wSOL)" value={fmtSol(pool.rewardWsol?.totalClaimed || '0') + ' SOL'} />
+                    <DetailRow label="Total deposited (wSOL)" value={`${fmtSol(pool.rewardWsol?.totalDeposited || '0')} SOL`} />
+                    <DetailRow label="Total claimed (wSOL)" value={`${fmtSol(pool.rewardWsol?.totalClaimed || '0')} SOL`} />
                     {pool.rewardWsol?.lastDepositTs && pool.rewardWsol.lastDepositTs !== '0' && (
                       <DetailRow
                         label="Last deposit"
@@ -271,7 +245,7 @@ export default function PoolView({ mint, onBack }) {
               </div>
             </div>
 
-            <div style={{ display: 'grid', gap: 16 }}>
+            <div style={{ display: 'grid', gap: 20 }}>
               {pool.initialized ? (
                 <StakePoolView
                   stakeMintB58={pool.stakeMint}
@@ -280,8 +254,8 @@ export default function PoolView({ mint, onBack }) {
                   rewardMintB58={pool.rewardMint}
                 />
               ) : (
-                <div style={panelStyle}>
-                  staking client unavailable — pool not initialized yet.
+                <div className="panel panel--tight muted">
+                  Staking client unavailable — pool not initialized yet.
                 </div>
               )}
             </div>
@@ -294,11 +268,15 @@ export default function PoolView({ mint, onBack }) {
 
 function Stat({ label, value, suffix }) {
   return (
-    <div style={statBoxStyle}>
-      <div style={{ color: 'var(--muted)', fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5 }}>{label}</div>
-      <div style={{ fontWeight: 700, fontSize: 20, marginTop: 6, wordBreak: 'break-all' }}>
+    <div className="stat-box">
+      <div className="stat-box__label">{label}</div>
+      <div className="stat-box__value">
         {value}
-        {suffix && <span style={{ marginLeft: 6, fontSize: 13, color: 'var(--muted)', fontWeight: 500 }}>{suffix}</span>}
+        {suffix && (
+          <span className="muted" style={{ marginLeft: 6, fontSize: '0.875rem', fontWeight: 600 }}>
+            {suffix}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -306,84 +284,9 @@ function Stat({ label, value, suffix }) {
 
 function DetailRow({ label, value, mono }) {
   return (
-    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, padding: '6px 0', fontSize: 13, borderBottom: '1px dashed rgba(255,255,255,0.05)' }}>
-      <span style={{ color: 'var(--muted)' }}>{label}</span>
-      <span style={{ fontFamily: mono ? 'ui-monospace, SF Mono, Menlo, monospace' : 'inherit', textAlign: 'right', wordBreak: 'break-all', maxWidth: '60%' }}>
-        {value}
-      </span>
+    <div className="detail-row">
+      <span className="detail-row__label">{label}</span>
+      <span className={`detail-row__value${mono ? ' mono' : ''}`}>{value}</span>
     </div>
   );
 }
-
-const panelStyle = {
-  background: 'var(--panel)',
-  border: '1px solid var(--border)',
-  borderRadius: 12,
-  padding: 18,
-};
-
-const statsRowStyle = {
-  display: 'grid',
-  gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
-  gap: 10,
-};
-
-const statBoxStyle = {
-  ...panelStyle,
-  padding: 14,
-};
-
-const twoColStyle = {
-  display: 'grid',
-  gridTemplateColumns: 'minmax(0, 1.4fr) minmax(320px, 1fr)',
-  gap: 16,
-};
-
-const mutedTextStyle = { color: 'var(--muted)', padding: 16 };
-
-const backBtnStyle = {
-  background: 'transparent',
-  color: 'var(--muted)',
-  border: '1px solid var(--border)',
-  padding: '6px 12px',
-  borderRadius: 8,
-  cursor: 'pointer',
-};
-
-const chipBtnStyle = {
-  background: 'rgba(255,255,255,0.03)',
-  color: 'var(--text)',
-  border: '1px solid var(--border)',
-  borderRadius: 999,
-  padding: '4px 10px',
-  fontSize: 11,
-  cursor: 'pointer',
-  fontFamily: 'ui-monospace, SF Mono, Menlo, monospace',
-};
-
-const linkChipStyle = {
-  ...chipBtnStyle,
-  textDecoration: 'none',
-  display: 'inline-block',
-};
-
-const pumpBtnStyle = {
-  background: 'linear-gradient(135deg, #4ade80, #16a34a)',
-  color: '#0a0a0f',
-  border: 'none',
-  borderRadius: 999,
-  padding: '6px 14px',
-  fontSize: 12,
-  fontWeight: 700,
-  textDecoration: 'none',
-  marginLeft: 'auto',
-};
-
-const errorBoxStyle = {
-  padding: 12,
-  background: '#3a1c1c',
-  border: '1px solid #6a2c2c',
-  borderRadius: 8,
-  color: '#ffb4b4',
-  fontSize: 13,
-};

@@ -25,31 +25,39 @@ export default function DirectoryView({ onSelectPool }) {
 
   return (
     <div>
-      <h2 style={{ marginTop: 0 }}>Active pools</h2>
-      <p style={{ color: 'var(--muted)', marginTop: 0 }}>
-        Every Stakrr token has a public staking pool. Lock to earn 1.0x &ndash; 3.0x of the
-        token's creator fees, paid out as SOL.
+      <h2 className="section-title">Active pools</h2>
+      <p className="section-lead">
+        Every Stakrr token has a public staking pool. Lock to earn up to 3× weight on the token&apos;s
+        creator fees, paid out as SOL or the token itself.
       </p>
-      {loading && <div style={mutedTextStyle}>loading…</div>}
-      {error && <div style={mutedTextStyle}>error: {error}</div>}
+      {loading && <div className="muted" style={{ padding: '16px 0' }}>Loading…</div>}
+      {error && <div className="alert alert--error" style={{ marginBottom: 16 }}>{error}</div>}
       {!loading && !error && pools.length === 0 && (
-        <div style={emptyStyle}>
+        <div className="empty-state">
           <strong>No pools yet.</strong>
-          <div style={{ color: 'var(--muted)', marginTop: 4 }}>
-            Be the first &mdash; click <em>Launch</em> in the nav.
+          <div className="muted" style={{ marginTop: 8 }}>
+            Be the first — open <strong>Launch</strong> in the nav.
           </div>
         </div>
       )}
-      <div style={gridStyle}>
+      <div className="pool-grid">
         {pools.map((p) => (
-          <button key={p.stakeMint} onClick={() => onSelectPool(p.stakeMint)} style={cardStyle}>
-            <div style={{ fontWeight: 700, fontSize: 18 }}>{p.metadata?.symbol || 'TKN'}</div>
-            <div style={{ color: 'var(--muted)', fontSize: 13 }}>{p.metadata?.name || p.stakeMint.slice(0, 8) + '...'}</div>
-            <div style={{ marginTop: 12, fontSize: 12, color: 'var(--muted)' }}>
-              fees claimed: {(BigInt(p.totalCreatorFeesClaimedLamports || '0') / 10n ** 9n).toString()} SOL
-            </div>
-            <div style={{ fontSize: 12, color: 'var(--muted)' }}>
-              distributed: {(BigInt(p.totalRewardsDistributedLamports || '0') / 10n ** 9n).toString()} SOL
+          <button
+            key={p.stakeMint}
+            type="button"
+            onClick={() => onSelectPool(p.stakeMint)}
+            className="pool-card"
+          >
+            <div className="pool-card__sym">{p.metadata?.symbol || 'TKN'}</div>
+            <div className="pool-card__name">{p.metadata?.name || `${p.stakeMint.slice(0, 8)}…`}</div>
+            <div className="pool-card__meta">
+              <div>
+                Fees claimed:{' '}
+                {(BigInt(p.totalCreatorFeesClaimedLamports || '0') / 10n ** 9n).toString()} SOL
+              </div>
+              <div>
+                Distributed: {(BigInt(p.totalRewardsDistributedLamports || '0') / 10n ** 9n).toString()} SOL
+              </div>
             </div>
           </button>
         ))}
@@ -57,29 +65,3 @@ export default function DirectoryView({ onSelectPool }) {
     </div>
   );
 }
-
-const gridStyle = {
-  display: 'grid',
-  gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
-  gap: 12,
-  marginTop: 16,
-};
-
-const cardStyle = {
-  background: 'var(--panel)',
-  border: '1px solid var(--border)',
-  borderRadius: 12,
-  padding: 16,
-  textAlign: 'left',
-  color: 'var(--text)',
-  cursor: 'pointer',
-};
-
-const mutedTextStyle = { color: 'var(--muted)', padding: 16 };
-
-const emptyStyle = {
-  padding: 24,
-  border: '1px dashed var(--border)',
-  borderRadius: 12,
-  background: 'rgba(255,255,255,0.02)',
-};

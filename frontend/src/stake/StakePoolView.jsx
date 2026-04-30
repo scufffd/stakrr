@@ -239,53 +239,53 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
 
   if (!walletState?.connected) {
     return (
-      <div style={panel}>
-        <h3 style={{ marginTop: 0 }}>Stake</h3>
-        <div style={{ color: 'var(--muted)', fontSize: 13 }}>
-          connect a wallet (top-right) to stake, claim, or unstake.
-        </div>
+      <div className="panel panel--tight">
+        <h3 className="section-title" style={{ fontSize: '1.25rem', marginBottom: 8 }}>Stake</h3>
+        <p className="muted" style={{ fontSize: '0.875rem', margin: 0 }}>
+          Connect a wallet (top right) to stake, claim, or unstake.
+        </p>
       </div>
     );
   }
   if (!ready) {
     return (
-      <div style={panel}>
-        <h3 style={{ marginTop: 0 }}>Stake</h3>
-        <div style={{ color: 'var(--muted)', fontSize: 13 }}>resolving stake mint…</div>
+      <div className="panel panel--tight">
+        <h3 className="section-title" style={{ fontSize: '1.25rem', marginBottom: 8 }}>Stake</h3>
+        <p className="muted" style={{ fontSize: '0.875rem', margin: 0 }}>Resolving stake mint…</p>
       </div>
     );
   }
   if (loadError) {
     return (
-      <div style={panel}>
-        <h3 style={{ marginTop: 0 }}>Stake</h3>
-        <div style={errorStyle}>
-          failed to load pool from RPC: {loadError}
+      <div className="panel panel--tight">
+        <h3 className="section-title" style={{ fontSize: '1.25rem', marginBottom: 8 }}>Stake</h3>
+        <div className="alert alert--error" style={{ marginBottom: 12 }}>
+          Failed to load pool from RPC: {loadError}
         </div>
-        <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 8, lineHeight: 1.5 }}>
-          if you see &quot;429&quot; or rate-limit errors, set <code>VITE_RPC_URL</code> in
-          <code> frontend/.env</code> to a private endpoint (Helius / QuickNode) and reload.
-        </div>
-        <button onClick={reload} style={{ ...smallBtn, marginTop: 10 }}>retry</button>
+        <p className="muted" style={{ fontSize: '0.8125rem', lineHeight: 1.55, margin: 0 }}>
+          If you see 429 or rate limits, set <code className="mono">VITE_RPC_URL</code> in{' '}
+          <code className="mono">frontend/.env</code> to a private RPC (Helius / QuickNode) and reload.
+        </p>
+        <button type="button" onClick={reload} className="btn-small" style={{ marginTop: 12 }}>Retry</button>
       </div>
     );
   }
   if (loadingPool && !pool) {
     return (
-      <div style={panel}>
-        <h3 style={{ marginTop: 0 }}>Stake</h3>
-        <div style={{ color: 'var(--muted)', fontSize: 13 }}>loading on-chain pool state…</div>
+      <div className="panel panel--tight">
+        <h3 className="section-title" style={{ fontSize: '1.25rem', marginBottom: 8 }}>Stake</h3>
+        <p className="muted" style={{ fontSize: '0.875rem', margin: 0 }}>Loading on-chain pool state…</p>
       </div>
     );
   }
   if (!pool) {
     return (
-      <div style={panel}>
-        <h3 style={{ marginTop: 0 }}>Stake</h3>
-        <div style={{ color: 'var(--muted)', fontSize: 13 }}>
-          this pool isn't initialized on-chain yet. give it a few seconds and refresh.
-        </div>
-        <button onClick={reload} style={{ ...smallBtn, marginTop: 10 }}>refresh</button>
+      <div className="panel panel--tight">
+        <h3 className="section-title" style={{ fontSize: '1.25rem', marginBottom: 8 }}>Stake</h3>
+        <p className="muted" style={{ fontSize: '0.875rem', margin: 0 }}>
+          This pool isn&apos;t initialized on-chain yet. Wait a few seconds and refresh.
+        </p>
+        <button type="button" onClick={reload} className="btn-small" style={{ marginTop: 12 }}>Refresh</button>
       </div>
     );
   }
@@ -294,17 +294,19 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
 
   return (
     <div style={{ display: 'grid', gap: 16 }}>
-      <div style={panel}>
-        <h3 style={{ marginTop: 0 }}>Stake {tickerLabel}</h3>
-        <div style={{ color: 'var(--muted)', fontSize: 13 }}>
-          your balance: <strong>{balanceFmt} {symbol ? `$${symbol}` : ''}</strong>
-        </div>
-        <form onSubmit={onStake} style={{ display: 'grid', gap: 10, marginTop: 12 }}>
-          <div style={field}>
-            <label style={label}>Amount</label>
-            <div style={{ display: 'flex', gap: 6 }}>
+      <div className="panel panel--tight">
+        <h3 className="section-title" style={{ fontSize: '1.25rem', marginBottom: 8 }}>Stake {tickerLabel}</h3>
+        <p className="muted" style={{ fontSize: '0.875rem', margin: '0 0 12px' }}>
+          Your balance: <strong>{balanceFmt} {symbol ? `$${symbol}` : ''}</strong>
+        </p>
+        <form onSubmit={onStake} className="form-grid" style={{ gap: 12 }}>
+          <div className="form-field">
+            <label className="form-label" htmlFor="stake-amt">Amount</label>
+            <div style={{ display: 'flex', gap: 8 }}>
               <input
-                style={{ ...input, flex: 1 }}
+                id="stake-amt"
+                className="input"
+                style={{ flex: 1 }}
                 type="number"
                 step="0.000001"
                 min="0"
@@ -318,30 +320,30 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
                   if (decimals == null) return;
                   setAmount(fmtAmount(userBalanceRaw, decimals));
                 }}
-                style={maxBtn}
+                className="btn-max"
               >
-                max
+                Max
               </button>
             </div>
           </div>
-          <div style={field}>
-            <label style={label}>Lock</label>
-            <select style={input} value={lockDays} onChange={(e) => setLockDays(Number(e.target.value))}>
+          <div className="form-field">
+            <label className="form-label" htmlFor="stake-lock">Lock</label>
+            <select id="stake-lock" className="select" value={lockDays} onChange={(e) => setLockDays(Number(e.target.value))}>
               {LOCK_TIERS.map((t) => (
                 <option key={t.days} value={t.days}>{t.label}</option>
               ))}
             </select>
           </div>
-          <button type="submit" disabled={busy} style={primaryBtn(busy)}>
-            {busy ? 'submitting…' : `stake ${tickerLabel}`}
+          <button type="submit" disabled={busy} className="btn-primary" style={{ justifySelf: 'start' }}>
+            {busy ? 'Submitting…' : `Stake ${tickerLabel}`}
           </button>
         </form>
       </div>
 
-      <div style={panel}>
-        <h3 style={{ marginTop: 0 }}>Your positions</h3>
-        {positions.length === 0 && <div style={{ color: 'var(--muted)' }}>no active positions yet.</div>}
-        <div style={{ display: 'grid', gap: 10 }}>
+      <div className="panel panel--tight">
+        <h3 className="section-title" style={{ fontSize: '1.25rem', marginBottom: 8 }}>Your positions</h3>
+        {positions.length === 0 && <p className="muted" style={{ fontSize: '0.875rem', margin: 0 }}>No active positions yet.</p>}
+        <div style={{ display: 'grid', gap: 12, marginTop: positions.length ? 12 : 0 }}>
           {positions.map((p) => {
             const a = p.account;
             const lockEnd = Number(a.lockEnd?.toString?.() || a.lockEnd || 0);
@@ -349,28 +351,28 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
             const expired = lockEnd > 0 && now >= lockEnd;
             const dec = decimals ?? 9;
             return (
-              <div key={p.publicKey.toBase58()} style={{ ...panelInset }}>
-                <div style={{ fontSize: 13 }}>
-                  amount: <strong>{fmtAmount(a.amount?.toString?.() || '0', dec)}</strong>
+              <div key={p.publicKey.toBase58()} className="position-card">
+                <div style={{ fontSize: '0.875rem' }}>
+                  Amount: <strong>{fmtAmount(a.amount?.toString?.() || '0', dec)}</strong>
                   {' · '}
-                  lock: <strong>{a.lockDays} days</strong>
+                  Lock: <strong>{a.lockDays} days</strong>
                   {' · '}
-                  multiplier: <strong>{(Number(a.multiplierBps || 0) / 10_000).toFixed(2)}×</strong>
+                  Multiplier: <strong>{(Number(a.multiplierBps || 0) / 10_000).toFixed(2)}×</strong>
                 </div>
-                <div style={{ color: 'var(--muted)', fontSize: 12 }}>
-                  ends: {lockEnd ? new Date(lockEnd * 1000).toLocaleString() : '—'}
+                <div className="muted" style={{ fontSize: '0.8125rem', marginTop: 4 }}>
+                  Ends: {lockEnd ? new Date(lockEnd * 1000).toLocaleString() : '—'}
                 </div>
-                <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
-                  <button onClick={() => onClaim(p)} disabled={busy} style={smallBtn}>
-                    {isSolReward ? 'claim wSOL → SOL' : `claim ${rewardLabel}`}
+                <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
+                  <button type="button" onClick={() => onClaim(p)} disabled={busy} className="btn-small">
+                    {isSolReward ? 'Claim wSOL → SOL' : `Claim ${rewardLabel}`}
                   </button>
                   {expired ? (
-                    <button onClick={() => onUnstake(p, false)} disabled={busy} style={smallBtn}>
-                      unstake
+                    <button type="button" onClick={() => onUnstake(p, false)} disabled={busy} className="btn-small">
+                      Unstake
                     </button>
                   ) : (
-                    <button onClick={() => onUnstake(p, true)} disabled={busy} style={smallBtnDanger}>
-                      unstake early (10% penalty)
+                    <button type="button" onClick={() => onUnstake(p, true)} disabled={busy} className="btn-small btn-small--danger">
+                      Unstake early (10% penalty)
                     </button>
                   )}
                 </div>
@@ -380,92 +382,12 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
         </div>
       </div>
 
-      {error && <div style={errorStyle}>error: {error}</div>}
-      {lastSig && <div style={successStyle}>sig: <code>{lastSig}</code></div>}
+      {error && <div className="alert alert--error">Error: {error}</div>}
+      {lastSig && (
+        <div className="alert alert--success mono" style={{ fontSize: '0.8125rem', wordBreak: 'break-all' }}>
+          Signature: {lastSig}
+        </div>
+      )}
     </div>
   );
 }
-
-const panel = {
-  background: 'var(--panel)',
-  border: '1px solid var(--border)',
-  borderRadius: 12,
-  padding: 16,
-};
-
-const panelInset = {
-  background: 'rgba(255,255,255,0.02)',
-  border: '1px solid var(--border)',
-  borderRadius: 10,
-  padding: 12,
-};
-
-const field = { display: 'flex', flexDirection: 'column', gap: 6 };
-const label = { color: 'var(--muted)', fontSize: 13 };
-const input = {
-  background: '#1a1a25',
-  border: '1px solid var(--border)',
-  color: 'var(--text)',
-  padding: '10px 12px',
-  borderRadius: 8,
-  fontSize: 14,
-};
-
-function primaryBtn(disabled) {
-  return {
-    background: disabled ? '#3a3a4a' : 'var(--accent)',
-    color: '#0a0a0f',
-    border: 'none',
-    padding: '10px 16px',
-    borderRadius: 10,
-    fontSize: 14,
-    fontWeight: 700,
-    cursor: disabled ? 'not-allowed' : 'pointer',
-  };
-}
-
-const smallBtn = {
-  background: '#1a1a25',
-  color: 'var(--text)',
-  border: '1px solid var(--border)',
-  padding: '6px 12px',
-  borderRadius: 8,
-  cursor: 'pointer',
-  fontSize: 13,
-};
-
-const maxBtn = {
-  background: 'rgba(255,255,255,0.04)',
-  color: 'var(--accent)',
-  border: '1px solid var(--border)',
-  padding: '0 14px',
-  borderRadius: 8,
-  cursor: 'pointer',
-  fontSize: 12,
-  fontWeight: 700,
-};
-
-const smallBtnDanger = {
-  ...smallBtn,
-  borderColor: '#6a2c2c',
-  color: '#ffb4b4',
-};
-
-const errorStyle = {
-  padding: 12,
-  background: '#3a1c1c',
-  border: '1px solid #6a2c2c',
-  borderRadius: 8,
-  color: '#ffb4b4',
-  fontSize: 13,
-};
-
-const successStyle = {
-  padding: 12,
-  background: '#1a3a1a',
-  border: '1px solid #2c6a2c',
-  borderRadius: 8,
-  color: '#b4ffb4',
-  fontSize: 12,
-  wordBreak: 'break-all',
-};
