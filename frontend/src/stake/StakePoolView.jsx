@@ -4,12 +4,12 @@ import { PublicKey, Transaction } from '@solana/web3.js';
 import {
   TOKEN_PROGRAM_ID,
   createAssociatedTokenAccountIdempotentInstruction,
-  createCloseAccountInstruction,
   getAccount,
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token';
 import BN from 'bn.js';
 import { LOCK_TIERS } from '../staking-sdk/index.js';
+import { claimPositionRewards } from './claimPosition.js';
 import { useStakePoolClient } from './useStakePoolClient.js';
 
 const WSOL = new PublicKey('So11111111111111111111111111111111111111112');
@@ -163,56 +163,33 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
   const onClaim = useCallback(async (position) => {
     setBusy(true); setError(null); setLastSig(null);
     try {
-      if (isSolReward) {
-        // SOL mode: build an ATA-create + claim + close (auto-unwrap to SOL).
-        const userWsolAta = getAssociatedTokenAddressSync(WSOL, wallet.publicKey, false, TOKEN_PROGRAM_ID);
-        const ataIx = createAssociatedTokenAccountIdempotentInstruction(
-          wallet.publicKey, userWsolAta, wallet.publicKey, WSOL, TOKEN_PROGRAM_ID,
-        );
-        const claimIx = await client.claimIx({
-          owner: wallet.publicKey,
-          position: position.publicKey,
-          rewardTokenMint: WSOL,
-          userTokenAccount: userWsolAta,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        });
-        const closeIx = createCloseAccountInstruction(
-          userWsolAta, wallet.publicKey, wallet.publicKey, [], TOKEN_PROGRAM_ID,
-        );
-        const sig = await sendTx([ataIx, claimIx, closeIx]);
-        setLastSig(sig);
-      } else {
-        // Token mode: rewards are paid in the launched mint itself, so the
-        // user's reward ATA is the same as their stake-mint ATA. No unwrap.
-        // CRITICAL: pump.fun tokens are Token-2022, so we MUST pass the
-        // correct token program (`stakeTokenProgram`) to claimIx so the SDK
-        // derives the right vault & user ATA. The SDK's param is
-        // `tokenProgram` (not `rewardTokenProgram`); a typo here silently
-        // falls back to legacy SPL and the on-chain `vault` account lookup
-        // fails with AccountNotInitialized (0xbc4 / 3012).
-        const tokenMint = rewardMintPk || stakeMint;
-        const tokenProgram = stakeTokenProgram;
-        const userAta = getAssociatedTokenAddressSync(tokenMint, wallet.publicKey, false, tokenProgram);
-        const ataIx = createAssociatedTokenAccountIdempotentInstruction(
-          wallet.publicKey, userAta, wallet.publicKey, tokenMint, tokenProgram,
-        );
-        const claimIx = await client.claimIx({
-          owner: wallet.publicKey,
-          position: position.publicKey,
-          rewardTokenMint: tokenMint,
-          userTokenAccount: userAta,
-          tokenProgram,
-        });
-        const sig = await sendTx([ataIx, claimIx]);
-        setLastSig(sig);
-      }
+      const sig = await claimPositionRewards({
+        connection,
+        wallet,
+        signTransaction: walletState.signTransaction,
+        stakeMintB58: stakeMint.toBase58(),
+        rewardMode: isSolReward ? 'sol' : 'token',
+        rewardMintB58: rewardMintPk ? rewardMintPk.toBase58() : undefined,
+        positionB58: position.publicKey.toBase58(),
+        programId: client.programId,
+      });
+      setLastSig(sig);
       reload();
     } catch (e) {
       setError(e.message || String(e));
     } finally {
       setBusy(false);
     }
-  }, [client, wallet, reload, sendTx, isSolReward, rewardMintPk, stakeMint, stakeTokenProgram]);
+  }, [
+    connection,
+    wallet,
+    walletState,
+    client,
+    reload,
+    isSolReward,
+    rewardMintPk,
+    stakeMint,
+  ]);
 
   const onUnstake = useCallback(async (position, early) => {
     setBusy(true); setError(null); setLastSig(null);
@@ -260,7 +237,7 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
       <div className="panel panel--tight">
         <h3 className="section-title" style={{ fontSize: '1.25rem', marginBottom: 8 }}>Stake</h3>
         <div className="alert alert--error" style={{ marginBottom: 12 }}>
-          Failed to load pool from RPC: {loadError}
+          Failed to load staking data from RPC: {loadError}
         </div>
         <p className="muted" style={{ fontSize: '0.8125rem', lineHeight: 1.55, margin: 0 }}>
           If you see 429 or rate limits, set <code className="mono">VITE_RPC_URL</code> in{' '}
@@ -274,7 +251,7 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
     return (
       <div className="panel panel--tight">
         <h3 className="section-title" style={{ fontSize: '1.25rem', marginBottom: 8 }}>Stake</h3>
-        <p className="muted" style={{ fontSize: '0.875rem', margin: 0 }}>Loading on-chain pool state…</p>
+        <p className="muted" style={{ fontSize: '0.875rem', margin: 0 }}>Loading on-chain staking…</p>
       </div>
     );
   }
@@ -283,7 +260,7 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
       <div className="panel panel--tight">
         <h3 className="section-title" style={{ fontSize: '1.25rem', marginBottom: 8 }}>Stake</h3>
         <p className="muted" style={{ fontSize: '0.875rem', margin: 0 }}>
-          This pool isn&apos;t initialized on-chain yet. Wait a few seconds and refresh.
+          Staking isn&apos;t initialized on-chain yet. Wait a few seconds and refresh.
         </p>
         <button type="button" onClick={reload} className="btn-small" style={{ marginTop: 12 }}>Refresh</button>
       </div>

@@ -259,4 +259,10 @@ export async function fetchActivePositions({ connection, signer, stakeMint }) {
   return all.filter((p) => !p.account.closed);
 }
 
+/** Open stake positions for `owner` in one pool (non-closed). */
+export async function fetchOwnerPositionsInPool({ connection, signer, stakeMint, owner }) {
+  const rows = await fetchActivePositions({ connection, signer, stakeMint });
+  return rows.filter((p) => p.account.owner.equals(owner));
+}
+
 export { BN };

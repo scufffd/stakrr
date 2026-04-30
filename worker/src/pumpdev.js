@@ -48,6 +48,8 @@ export async function buildCreateTokenTx({
   slippage = 30,
   jitoTip,
   cashbackEnabled,
+  /** Optional: base58-encoded mint secret key (64 bytes). PumpDev field `mintKeypair`. */
+  mintKeypairSecretB58 = null,
 }) {
   if (!publicKey) throw new Error('buildCreateTokenTx: publicKey required');
   if (!name || !symbol) throw new Error('buildCreateTokenTx: name + symbol required');
@@ -61,6 +63,7 @@ export async function buildCreateTokenTx({
     buyAmountSol: Number(buyAmountSol) || 0,
     slippage: Number(slippage) || 30,
   };
+  if (mintKeypairSecretB58) body.mintKeypair = mintKeypairSecretB58;
   if (jitoTip != null) body.jitoTip = Number(jitoTip);
   if (cashbackEnabled) body.cashbackEnabled = true;
 

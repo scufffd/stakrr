@@ -61,6 +61,11 @@ export const config = {
   registryFile: optional('POOL_REGISTRY_FILE', './data/pools.json'),
   eventLedgerFile: optional('EVENT_LEDGER_FILE', './data/events.jsonl'),
 
+  /** Optional JSON pool of pre-ground mints (see vanity-mints.js). */
+  vanityMintPoolFile: optional('VANITY_MINT_POOL_FILE', ''),
+  /** Public key must end with this base58 substring (e.g. STK, pump). */
+  vanityMintSuffix: optional('VANITY_MINT_SUFFIX', 'STK'),
+
   rpcAccountCacheTtlMs: intEnv('POB_RPC_ACCOUNT_CACHE_TTL_MS', 21_600_000),
 };
 

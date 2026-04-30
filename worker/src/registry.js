@@ -84,6 +84,24 @@ export function recordEvent(event) {
   fs.appendFileSync(config.eventLedgerFile, line);
 }
 
+/** Read last N JSONL events (newest last in returned array). */
+export function readRecentEvents(limit = 200) {
+  const file = config.eventLedgerFile;
+  if (!fs.existsSync(file)) return [];
+  const raw = fs.readFileSync(file, 'utf8');
+  const lines = raw.split('\n').filter((l) => l.trim());
+  const slice = lines.slice(-Math.max(1, Math.min(2000, limit)));
+  const out = [];
+  for (const line of slice) {
+    try {
+      out.push(JSON.parse(line));
+    } catch {
+      /* skip */
+    }
+  }
+  return out;
+}
+
 // Convenience helpers for accumulating per-pool metrics atomically.
 export function addToPoolMetrics(stakeMint, deltas) {
   const reg = readRegistryRaw();

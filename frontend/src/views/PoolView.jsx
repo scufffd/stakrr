@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import StakePoolView from '../stake/StakePoolView.jsx';
+import { apiUrl } from '../apiBase.js';
 
 const LAMPORTS = 1_000_000_000n;
 
@@ -37,7 +38,7 @@ function fmtRaw(rawStr, decimals = 6) {
 }
 
 export default function PoolView({ mint, onBack }) {
-  const [pool, setPool] = useState(null);
+  const [token, setToken] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [refreshTick, setRefreshTick] = useState(0);
@@ -47,10 +48,10 @@ export default function PoolView({ mint, onBack }) {
     (async () => {
       try {
         setLoading(true);
-        const res = await fetch(`/api/pools/${mint}/public`);
+        const res = await fetch(apiUrl(`/api/tokens/${mint}/public`));
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
-        if (!cancelled) setPool(data.pool);
+        if (!cancelled) setToken(data.token);
       } catch (e) {
         if (!cancelled) setError(e.message || String(e));
       } finally {
@@ -60,8 +61,8 @@ export default function PoolView({ mint, onBack }) {
     return () => { cancelled = true; };
   }, [mint, refreshTick]);
 
-  const meta = pool?.metadata || {};
-  const pumpfunUrl = useMemo(() => `https://pump.fun/${pool?.stakeMint || ''}`, [pool]);
+  const meta = token?.metadata || {};
+  const pumpfunUrl = useMemo(() => `https://pump.fun/${token?.stakeMint || ''}`, [token]);
 
   const copy = (text) => {
     if (!text) return;
@@ -71,14 +72,14 @@ export default function PoolView({ mint, onBack }) {
   return (
     <div>
       <div className="pool-toolbar">
-        <button type="button" onClick={onBack} className="btn-ghost">← Back to pools</button>
+        <button type="button" onClick={onBack} className="btn-ghost">← Back to tokens</button>
         <button type="button" onClick={() => setRefreshTick((t) => t + 1)} className="btn-ghost">Refresh</button>
       </div>
 
-      {loading && <div className="muted" style={{ padding: 16 }}>Loading pool…</div>}
+      {loading && <div className="muted" style={{ padding: 16 }}>Loading token…</div>}
       {error && <div className="alert alert--error" style={{ marginBottom: 16 }}>{error}</div>}
 
-      {pool && (
+      {token && (
         <div style={{ display: 'grid', gap: 20 }}>
           <div className="panel panel--tight">
             <div style={{ display: 'flex', gap: 20, alignItems: 'flex-start', flexWrap: 'wrap' }}>
@@ -95,11 +96,11 @@ export default function PoolView({ mint, onBack }) {
                   <span className="pool-header__name">{meta.name || 'Untitled'}</span>
                   <span className="pool-header__sym">${meta.symbol || 'TKN'}</span>
                   <span className="badge">
-                    {pool.initialized ? 'Staking live' : 'Pool uninitialized'}
+                    {token.initialized ? 'Staking live' : 'Staking not ready'}
                   </span>
-                  {pool.initialized && (
-                    <span className={`badge ${pool.rewardMode === 'token' ? 'badge--token' : 'badge--sol'}`}>
-                      Rewards · {pool.rewardMode === 'token' ? `$${meta.symbol || 'TKN'}` : 'SOL'}
+                  {token.initialized && (
+                    <span className={`badge ${token.rewardMode === 'token' ? 'badge--token' : 'badge--sol'}`}>
+                      Rewards · {token.rewardMode === 'token' ? `$${meta.symbol || 'TKN'}` : 'SOL'}
                     </span>
                   )}
                 </div>
@@ -109,12 +110,12 @@ export default function PoolView({ mint, onBack }) {
                   </div>
                 )}
                 <div className="chips-row">
-                  <button type="button" onClick={() => copy(pool.stakeMint)} className="btn-chip" title="Copy mint">
-                    CA {shorten(pool.stakeMint, 6, 6)}
+                  <button type="button" onClick={() => copy(token.stakeMint)} className="btn-chip" title="Copy mint">
+                    CA {shorten(token.stakeMint, 6, 6)}
                   </button>
-                  {pool.creatorWallet && (
-                    <button type="button" onClick={() => copy(pool.creatorWallet)} className="btn-chip" title="Copy launcher">
-                      Launcher {shorten(pool.creatorWallet)}
+                  {token.creatorWallet && (
+                    <button type="button" onClick={() => copy(token.creatorWallet)} className="btn-chip" title="Copy launcher">
+                      Launcher {shorten(token.creatorWallet)}
                     </button>
                   )}
                   {meta.twitter && <a href={meta.twitter} target="_blank" rel="noreferrer" className="link-chip">Twitter</a>}
@@ -131,24 +132,24 @@ export default function PoolView({ mint, onBack }) {
           <div className="stats-row">
             <Stat
               label="Total staked"
-              value={pool.totalStaked && pool.totalStaked !== '0' ? fmtRaw(pool.totalStaked, 6) : '0'}
+              value={token.totalStaked && token.totalStaked !== '0' ? fmtRaw(token.totalStaked, 6) : '0'}
               suffix={meta.symbol || ''}
             />
-            <Stat label="Active positions" value={String(pool.activePositions ?? '—')} />
-            <Stat label="Unique stakers" value={String(pool.uniqueStakers ?? '—')} />
-            <Stat label="Fees claimed (SOL)" value={fmtSol(pool.totalCreatorFeesClaimedLamports || '0')} />
-            {pool.rewardMode === 'token' ? (
+            <Stat label="Active positions" value={String(token.activePositions ?? '—')} />
+            <Stat label="Unique stakers" value={String(token.uniqueStakers ?? '—')} />
+            <Stat label="Fees claimed (SOL)" value={fmtSol(token.totalCreatorFeesClaimedLamports || '0')} />
+            {token.rewardMode === 'token' ? (
               <>
                 <Stat
                   label={`Rewards deposited ($${meta.symbol || 'TKN'})`}
-                  value={fmtRaw(pool.rewardToken?.totalDeposited || '0', 6)}
+                  value={fmtRaw(token.rewardToken?.totalDeposited || '0', 6)}
                 />
                 <Stat
                   label={`Pending claim ($${meta.symbol || 'TKN'})`}
                   value={fmtRaw(
                     String(
-                      BigInt(pool.rewardToken?.totalDeposited || '0') -
-                        BigInt(pool.rewardToken?.totalClaimed || '0'),
+                      BigInt(token.rewardToken?.totalDeposited || '0') -
+                        BigInt(token.rewardToken?.totalClaimed || '0'),
                     ),
                     6,
                   )}
@@ -156,13 +157,13 @@ export default function PoolView({ mint, onBack }) {
               </>
             ) : (
               <>
-                <Stat label="Stakers earned (SOL)" value={fmtSol(pool.rewardWsol?.totalDeposited || '0')} />
+                <Stat label="Stakers earned (SOL)" value={fmtSol(token.rewardWsol?.totalDeposited || '0')} />
                 <Stat
                   label="Pending claim (SOL)"
                   value={fmtSol(
                     String(
-                      BigInt(pool.rewardWsol?.totalDeposited || '0') -
-                        BigInt(pool.rewardWsol?.totalClaimed || '0'),
+                      BigInt(token.rewardWsol?.totalDeposited || '0') -
+                        BigInt(token.rewardWsol?.totalClaimed || '0'),
                     ),
                   )}
                 />
@@ -170,20 +171,20 @@ export default function PoolView({ mint, onBack }) {
             )}
           </div>
 
-          {!pool.initialized && (
+          {!token.initialized && (
             <div className="alert alert--error">
-              This pool&apos;s on-chain state isn&apos;t initialized yet — try again in a few seconds.
+              On-chain staking isn&apos;t ready yet — try again in a few seconds.
             </div>
           )}
 
           <div className="two-col">
             <div style={{ display: 'grid', gap: 20 }}>
               <div className="panel panel--tight">
-                <h3 className="section-title" style={{ fontSize: '1.35rem', marginBottom: 12 }}>How this pool works</h3>
+                <h3 className="section-title" style={{ fontSize: '1.35rem', marginBottom: 12 }}>How staking works</h3>
                 <ul className="muted" style={{ fontSize: '0.875rem', lineHeight: 1.65, paddingLeft: 20, margin: 0 }}>
                   <li>Buy ${meta.symbol || 'TKN'} on Pump.fun (link above) to start.</li>
                   <li>Stake your tokens for a lock tier — longer locks earn higher reward weight.</li>
-                  {pool.rewardMode === 'token' ? (
+                  {token.rewardMode === 'token' ? (
                     <>
                       <li>
                         The treasury claims Pump.fun creator fees on a schedule. <strong>2%</strong> is platform fee.
@@ -204,58 +205,58 @@ export default function PoolView({ mint, onBack }) {
               </div>
 
               <div className="panel panel--tight">
-                <h3 className="section-title" style={{ fontSize: '1.35rem', marginBottom: 12 }}>Pool details</h3>
-                <DetailRow label="Stake mint" value={pool.stakeMint} mono />
+                <h3 className="section-title" style={{ fontSize: '1.35rem', marginBottom: 12 }}>Token details</h3>
+                <DetailRow label="Stake mint" value={token.stakeMint} mono />
                 <DetailRow
                   label="Reward mode"
-                  value={pool.rewardMode === 'token' ? `$${meta.symbol || 'TKN'} (buyback)` : 'SOL (wSOL → SOL on claim)'}
+                  value={token.rewardMode === 'token' ? `$${meta.symbol || 'TKN'} (buyback)` : 'SOL (wSOL → SOL on claim)'}
                 />
-                <DetailRow label="Reward mint" value={pool.rewardMint} mono />
-                <DetailRow label="Platform fee" value={`${(pool.platformFeeBps || 200) / 100}%`} />
-                {pool.rewardMode === 'token' ? (
+                <DetailRow label="Reward mint" value={token.rewardMint} mono />
+                <DetailRow label="Platform fee" value={`${(token.platformFeeBps || 200) / 100}%`} />
+                {token.rewardMode === 'token' ? (
                   <>
                     <DetailRow
                       label={`Total deposited ($${meta.symbol || 'TKN'})`}
-                      value={`${fmtRaw(pool.rewardToken?.totalDeposited || '0', 6)} $${meta.symbol || 'TKN'}`}
+                      value={`${fmtRaw(token.rewardToken?.totalDeposited || '0', 6)} $${meta.symbol || 'TKN'}`}
                     />
                     <DetailRow
                       label={`Total claimed ($${meta.symbol || 'TKN'})`}
-                      value={`${fmtRaw(pool.rewardToken?.totalClaimed || '0', 6)} $${meta.symbol || 'TKN'}`}
+                      value={`${fmtRaw(token.rewardToken?.totalClaimed || '0', 6)} $${meta.symbol || 'TKN'}`}
                     />
-                    {pool.rewardToken?.lastDepositTs && pool.rewardToken.lastDepositTs !== '0' && (
+                    {token.rewardToken?.lastDepositTs && token.rewardToken.lastDepositTs !== '0' && (
                       <DetailRow
                         label="Last deposit"
-                        value={new Date(Number(pool.rewardToken.lastDepositTs) * 1000).toLocaleString()}
+                        value={new Date(Number(token.rewardToken.lastDepositTs) * 1000).toLocaleString()}
                       />
                     )}
                   </>
                 ) : (
                   <>
-                    <DetailRow label="Total deposited (wSOL)" value={`${fmtSol(pool.rewardWsol?.totalDeposited || '0')} SOL`} />
-                    <DetailRow label="Total claimed (wSOL)" value={`${fmtSol(pool.rewardWsol?.totalClaimed || '0')} SOL`} />
-                    {pool.rewardWsol?.lastDepositTs && pool.rewardWsol.lastDepositTs !== '0' && (
+                    <DetailRow label="Total deposited (wSOL)" value={`${fmtSol(token.rewardWsol?.totalDeposited || '0')} SOL`} />
+                    <DetailRow label="Total claimed (wSOL)" value={`${fmtSol(token.rewardWsol?.totalClaimed || '0')} SOL`} />
+                    {token.rewardWsol?.lastDepositTs && token.rewardWsol.lastDepositTs !== '0' && (
                       <DetailRow
                         label="Last deposit"
-                        value={new Date(Number(pool.rewardWsol.lastDepositTs) * 1000).toLocaleString()}
+                        value={new Date(Number(token.rewardWsol.lastDepositTs) * 1000).toLocaleString()}
                       />
                     )}
                   </>
                 )}
-                <DetailRow label="Created" value={pool.createdAt ? new Date(pool.createdAt).toLocaleString() : '—'} />
+                <DetailRow label="Created" value={token.createdAt ? new Date(token.createdAt).toLocaleString() : '—'} />
               </div>
             </div>
 
             <div style={{ display: 'grid', gap: 20 }}>
-              {pool.initialized ? (
+              {token.initialized ? (
                 <StakePoolView
-                  stakeMintB58={pool.stakeMint}
+                  stakeMintB58={token.stakeMint}
                   symbol={meta.symbol}
-                  rewardMode={pool.rewardMode || 'sol'}
-                  rewardMintB58={pool.rewardMint}
+                  rewardMode={token.rewardMode || 'sol'}
+                  rewardMintB58={token.rewardMint}
                 />
               ) : (
                 <div className="panel panel--tight muted">
-                  Staking client unavailable — pool not initialized yet.
+                  Staking UI will load once the program account is ready.
                 </div>
               )}
             </div>

@@ -1,0 +1,338 @@
+/*
+ * Stakrr Design Boost — from github.com/scufffd/Stakrr-Design-Boost (artifacts/stakrr).
+ * Loaded after global.css; overrides shell colors for the marketing layout.
+ */
+:root {
+  --db-sky: #35c5e0;
+  --db-ink: #0c0c0c;
+  --db-white: #ffffff;
+}
+
+html,
+body,
+#root {
+  background: var(--db-sky) !important;
+  color: var(--db-ink) !important;
+}
+
+.design-boost-shell {
+  position: relative;
+  min-height: 100vh;
+  font-family: 'Syne', sans-serif;
+}
+
+/* Noise grain overlay (fixed) */
+.sky-grain {
+  position: relative;
+}
+
+.sky-grain::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='300' height='300' filter='url(%23noise)' opacity='0.035'/%3E%3C/svg%3E");
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* Cloud shapes */
+.cloud {
+  position: absolute;
+  filter: drop-shadow(0 12px 24px rgba(0, 100, 130, 0.18));
+  pointer-events: none;
+}
+
+@keyframes db-drift {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  50% {
+    transform: translateX(14px);
+  }
+}
+
+@keyframes db-drift2 {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  50% {
+    transform: translateX(-10px);
+  }
+}
+
+@keyframes db-drift3 {
+  0%,
+  100% {
+    transform: translateY(0) translateX(0);
+  }
+  33% {
+    transform: translateY(-8px) translateX(6px);
+  }
+  66% {
+    transform: translateY(4px) translateX(-4px);
+  }
+}
+
+.cloud-drift {
+  animation: db-drift 12s ease-in-out infinite;
+}
+
+.cloud-drift2 {
+  animation: db-drift2 15s ease-in-out infinite 2s;
+}
+
+.cloud-drift3 {
+  animation: db-drift3 18s ease-in-out infinite 4s;
+}
+
+.float-card {
+  animation: db-float-card-bob 6s ease-in-out infinite;
+}
+
+@keyframes db-float-card-bob {
+  0%,
+  100% {
+    transform: rotate(-4deg) translateY(0);
+  }
+  50% {
+    transform: rotate(-3deg) translateY(-6px);
+  }
+}
+
+@keyframes db-marquee {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-33.333%);
+  }
+}
+
+.design-boost-marquee {
+  display: flex;
+  gap: 48px;
+  white-space: nowrap;
+  animation: db-marquee 30s linear infinite;
+  font-size: clamp(20px, 3.5vw, 36px);
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  color: var(--db-ink);
+}
+
+@keyframes db-scroll-line {
+  0% {
+    transform: scaleY(0);
+    transform-origin: top;
+    opacity: 0;
+  }
+  30% {
+    opacity: 1;
+  }
+  100% {
+    transform: scaleY(1);
+    transform-origin: top;
+    opacity: 0;
+  }
+}
+
+.design-boost-scroll-line {
+  width: 1px;
+  height: 40px;
+  background: rgba(0, 0, 0, 0.2);
+  animation: db-scroll-line 1.5s ease-in-out infinite;
+}
+
+@keyframes db-moon-bob {
+  0%,
+  100% {
+    transform: translateY(0) rotate(-5deg);
+  }
+  50% {
+    transform: translateY(-14px) rotate(-3deg);
+  }
+}
+
+.design-boost-moon-bob {
+  animation: db-moon-bob 8s ease-in-out infinite;
+}
+
+@keyframes db-star-twinkle {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(0.82);
+  }
+}
+
+.design-boost-star {
+  animation: db-star-twinkle 3s ease-in-out infinite;
+}
+
+/* Inner pages: wallet button on sky */
+.design-boost-inner .wallet-adapter-button-trigger {
+  background: rgba(0, 0, 0, 0.1) !important;
+  color: var(--db-ink) !important;
+  border: none !important;
+  border-radius: 100px !important;
+  font-family: 'Syne', sans-serif !important;
+  font-weight: 700 !important;
+  font-size: 14px !important;
+  backdrop-filter: blur(8px);
+}
+
+.design-boost-inner .wallet-adapter-button-trigger:not([disabled]):hover {
+  background: rgba(0, 0, 0, 0.18) !important;
+}
+
+.design-boost-shell .wallet-adapter-button-trigger {
+  background: rgba(0, 0, 0, 0.1) !important;
+  color: var(--db-ink) !important;
+  border: none !important;
+  border-radius: 100px !important;
+  font-family: 'Syne', sans-serif !important;
+  font-weight: 700 !important;
+  font-size: 14px !important;
+  backdrop-filter: blur(8px);
+}
+
+.design-boost-shell .wallet-adapter-button-trigger:not([disabled]):hover {
+  background: rgba(0, 0, 0, 0.18) !important;
+}
+
+@media (max-width: 1024px) {
+  .home-boost-tier-grid {
+    grid-template-columns: repeat(3, 1fr) !important;
+  }
+}
+
+@media (max-width: 520px) {
+  .home-boost-tier-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
+}
+
+@keyframes db-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Mascot on marketing hero — gentle bob, respects reduced motion */
+@keyframes db-bluebird-float {
+  0%,
+  100% {
+    transform: translateY(0) rotate(-2deg);
+  }
+  50% {
+    transform: translateY(-8px) rotate(2deg);
+  }
+}
+
+.db-bluebird-hero {
+  animation: db-bluebird-float 5.5s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .db-bluebird-hero {
+    animation: none;
+  }
+}
+
+.db-spin {
+  animation: db-spin 0.9s linear infinite;
+}
+
+/* —— Inner pages: mobile-friendly shell —— */
+.db-nav {
+  padding: 14px 16px !important;
+  flex-wrap: wrap !important;
+  row-gap: 10px;
+  column-gap: 6px !important;
+}
+
+@media (min-width: 769px) {
+  .db-nav {
+    padding: 22px 48px !important;
+    column-gap: 8px !important;
+  }
+}
+
+.db-content-shell {
+  padding: 28px 16px 56px !important;
+}
+
+@media (min-width: 640px) {
+  .db-content-shell {
+    padding: 48px 48px 80px !important;
+  }
+}
+
+.db-inner-hero {
+  padding: 24px 16px 40px !important;
+}
+
+@media (min-width: 640px) {
+  .db-inner-hero {
+    padding: 32px 48px 56px !important;
+  }
+}
+
+.db-user-table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.db-user-table {
+  width: 100%;
+  min-width: 520px;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.db-user-table th {
+  text-align: left;
+  padding: 10px 8px;
+  border-bottom: 1px solid #e8e8e8;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #888;
+}
+
+.db-user-table td {
+  padding: 12px 8px;
+  border-bottom: 1px solid #f0f0f0;
+  vertical-align: middle;
+}
+
+.db-user-row-btn {
+  background: #0c0c0c;
+  color: #fff;
+  border: none;
+  border-radius: 100px;
+  padding: 8px 14px;
+  font-weight: 700;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: Syne, sans-serif;
+}
+
+.db-footer-inner {
+  padding: 24px 16px !important;
+  flex-direction: column;
+  align-items: flex-start !important;
+}
+
+@media (min-width: 640px) {
+  .db-footer-inner {
+    padding: 32px 48px !important;
+    flex-direction: row !important;
+    align-items: center !important;
+  }
+}

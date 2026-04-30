@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
+import { apiUrl } from '../apiBase.js';
 
-export default function DirectoryView({ onSelectPool }) {
-  const [pools, setPools] = useState([]);
+export default function DirectoryView({ onSelectToken }) {
+  const [tokens, setTokens] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -10,17 +11,19 @@ export default function DirectoryView({ onSelectPool }) {
     (async () => {
       try {
         setLoading(true);
-        const res = await fetch('/api/pools');
+        const res = await fetch(apiUrl('/api/tokens'));
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
-        if (!cancelled) setPools(data.pools || []);
+        if (!cancelled) setTokens(data.tokens || []);
       } catch (e) {
         if (!cancelled) setError(e.message || String(e));
       } finally {
         if (!cancelled) setLoading(false);
       }
     })();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   return (
@@ -31,35 +34,34 @@ export default function DirectoryView({ onSelectPool }) {
           route creator fees back to the wallets that chose to believe — not to the void between clicks.
         </span>
       </p>
-      <h2 className="section-title">active pools</h2>
+      <h2 className="section-title">active tokens</h2>
       <p className="section-lead">
-        Every Stakrr token has a public staking pool. Lock to earn up to 3× weight on the token&apos;s
-        creator fees, paid out as SOL or the token itself.
+        Every Stakrr token has public on-chain staking. Lock to earn up to 3× weight on the token&apos;s creator fees,
+        paid out as SOL or the token itself.
       </p>
       {loading && <div className="muted" style={{ padding: '16px 0' }}>Loading…</div>}
       {error && <div className="alert alert--error" style={{ marginBottom: 16 }}>{error}</div>}
-      {!loading && !error && pools.length === 0 && (
+      {!loading && !error && tokens.length === 0 && (
         <div className="empty-state">
-          <strong>No pools yet.</strong>
+          <strong>No tokens yet.</strong>
           <div className="muted" style={{ marginTop: 8 }}>
             Be the first — open <strong>Launch</strong> in the nav.
           </div>
         </div>
       )}
       <div className="pool-grid">
-        {pools.map((p) => (
+        {tokens.map((p) => (
           <button
             key={p.stakeMint}
             type="button"
-            onClick={() => onSelectPool(p.stakeMint)}
+            onClick={() => onSelectToken(p.stakeMint)}
             className="pool-card"
           >
             <div className="pool-card__sym">{p.metadata?.symbol || 'TKN'}</div>
             <div className="pool-card__name">{p.metadata?.name || `${p.stakeMint.slice(0, 8)}…`}</div>
             <div className="pool-card__meta">
               <div>
-                Fees claimed:{' '}
-                {(BigInt(p.totalCreatorFeesClaimedLamports || '0') / 10n ** 9n).toString()} SOL
+                Fees claimed: {(BigInt(p.totalCreatorFeesClaimedLamports || '0') / 10n ** 9n).toString()} SOL
               </div>
               <div>
                 Distributed: {(BigInt(p.totalRewardsDistributedLamports || '0') / 10n ** 9n).toString()} SOL

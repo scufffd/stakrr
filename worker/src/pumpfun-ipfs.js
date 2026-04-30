@@ -1,5 +1,10 @@
 // Upload token metadata to Pump.fun's IPFS endpoint, with Pinata fallback.
 //
+// The web app first tries POST https://pump.fun/api/ipfs from the *browser*
+// (LaunchView): same multipart as below, but the request uses the user's IP and
+// often succeeds when the worker would get HTTP 403. If that fails, the image
+// is posted to this worker and we pin here (Pinata first when PINATA_JWT is set).
+//
 // Pump.fun's frontend uses POST https://pump.fun/api/ipfs with multipart/form-data:
 //   file (Blob)         - the token image
 //   name, symbol        - required
@@ -7,18 +12,29 @@
 //   showName=true       - show token name on cards
 // Returns: { metadata, metadataUri }
 //
-// Pump.fun blocks requests without a browser-like User-Agent. If pump.fun still
-// rejects (sometimes it Cloudflare-blocks server IPs), we fall back to Pinata
-// when PINATA_JWT is configured. The metadata JSON shape is the standard
-// Solana token metadata used by both pump.fun and Pinata flows.
-
-import { config } from './config.js';
+// Pump.fun often returns 403 from datacenters/VPNs (blocked page) even with a
+// browser User-Agent. When PINATA_JWT is set we try Pinata first, then pump.fun
+// as backup. Without JWT, we try pump.fun then Pinata (which then errors with
+// a clear "configure PINATA_JWT" message).
+//
+// Pinata upload URIs use IPFS_GATEWAY_BASE (default Pinata public gateway) so
+// metadata resolves without relying on ipfs.io (often slow or blocked).
 
 const PUMPFUN_IPFS_URL = 'https://pump.fun/api/ipfs';
 const PINATA_PIN_FILE_URL = 'https://api.pinata.cloud/pinning/pinFileToIPFS';
 const PINATA_PIN_JSON_URL = 'https://api.pinata.cloud/pinning/pinJSONToIPFS';
 
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+/** Base URL for ipfs/{cid} paths we construct after Pinata pin (no trailing slash). */
+function ipfsGatewayBase() {
+  const raw = process.env.IPFS_GATEWAY_BASE || 'https://gateway.pinata.cloud/ipfs';
+  return raw.replace(/\/$/, '');
+}
+
+function ipfsPublicUrl(cid) {
+  return `${ipfsGatewayBase()}/${cid}`;
+}
 
 function fileNameForType(contentType) {
   if (!contentType) return 'logo.png';
@@ -100,7 +116,7 @@ async function pinataUpload({
       throw new Error(`Pinata pinFile HTTP ${r.status}: ${t.slice(0, 200)}`);
     }
     const j = await r.json();
-    imageUri = `https://ipfs.io/ipfs/${j.IpfsHash}`;
+    imageUri = ipfsPublicUrl(j.IpfsHash);
   }
 
   const metadata = {
@@ -131,7 +147,7 @@ async function pinataUpload({
   }
   const j2 = await r2.json();
   return {
-    metadataUri: `https://ipfs.io/ipfs/${j2.IpfsHash}`,
+    metadataUri: ipfsPublicUrl(j2.IpfsHash),
     imageUri,
     raw: { metadata, ipfsHash: j2.IpfsHash },
     source: 'pinata',
@@ -142,7 +158,8 @@ async function pinataUpload({
  * Upload metadata using either a pre-fetched file buffer (preferred — direct
  * upload from the browser) or by fetching `imageUrl` server-side.
  *
- * Tries pump.fun first, falls back to Pinata if PINATA_JWT is set.
+ * Order: Pinata first when PINATA_JWT is set (pump.fun /api/ipfs often 403s from
+ * servers), otherwise pump.fun then Pinata.
  */
 export async function uploadMetadata({
   name,
@@ -173,17 +190,28 @@ export async function uploadMetadata({
   };
 
   const errors = [];
-  try {
-    return await pumpfunUpload(args);
-  } catch (e) {
-    errors.push(`pumpfun: ${e.message}`);
+  const hasPinataJwt = Boolean(process.env.PINATA_JWT?.trim());
+  const attempts = hasPinataJwt
+    ? [
+        { tag: 'pinata', run: () => pinataUpload(args) },
+        { tag: 'pumpfun', run: () => pumpfunUpload(args) },
+      ]
+    : [
+        { tag: 'pumpfun', run: () => pumpfunUpload(args) },
+        { tag: 'pinata', run: () => pinataUpload(args) },
+      ];
+
+  for (const { tag, run } of attempts) {
+    try {
+      return await run();
+    } catch (e) {
+      errors.push(`${tag}: ${e.message}`);
+    }
   }
-  try {
-    return await pinataUpload(args);
-  } catch (e) {
-    errors.push(`pinata: ${e.message}`);
-  }
-  throw new Error(`metadata upload failed: ${errors.join(' | ')}`);
+  const hint = hasPinataJwt
+    ? ''
+    : ' Set PINATA_JWT in the worker .env (Pinata API JWT) so uploads use Pinata; pump.fun often blocks server IPs.';
+  throw new Error(`metadata upload failed: ${errors.join(' | ')}${hint}`);
 }
 
 // Backwards-compatible alias used by older imports.

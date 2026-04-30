@@ -1,13 +1,141 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
+import { apiUrl } from '../apiBase.js';
 
 const LOCK_TIERS = [
-  { days: 1, label: '1 day · 1.00×' },
-  { days: 3, label: '3 days · 1.25×' },
-  { days: 7, label: '7 days · 1.50×' },
-  { days: 14, label: '14 days · 2.00×' },
-  { days: 21, label: '21 days · 2.50×' },
-  { days: 30, label: '30 days · 3.00×' },
+  { days: 1, mult: '1.00×', color: '#94A3B8' },
+  { days: 3, mult: '1.25×', color: '#60A5FA' },
+  { days: 7, mult: '1.50×', color: '#35C5E0' },
+  { days: 14, mult: '2.00×', color: '#7C45F3' },
+  { days: 21, mult: '2.50×', color: '#A855F7' },
+  { days: 30, mult: '3.00×', color: '#EC4899' },
 ];
+
+const INP = {
+  width: '100%',
+  background: 'white',
+  border: '1.5px solid #E8E8E8',
+  borderRadius: 12,
+  padding: '12px 16px',
+  fontSize: 14,
+  fontFamily: "'Syne', sans-serif",
+  outline: 'none',
+  boxSizing: 'border-box',
+  color: '#0C0C0C',
+};
+
+function IconUpload({ size = 22, color = '#35C5E0' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden>
+      <path
+        d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"
+        stroke={color}
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function IconCheckCircle({ size = 32, color = 'white' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden>
+      <path
+        d="M22 11.08V12a10 10 0 1 1-5.93-9.14M22 4L12 14.01l-3-3"
+        stroke={color}
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function IconExternalLink({ size = 14, color = '#35C5E0' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden>
+      <path
+        d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3"
+        stroke={color}
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function IconLoader({ size = 18, color = 'white' }) {
+  return (
+    <svg
+      className="db-spin"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden
+    >
+      <path
+        d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"
+        stroke={color}
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function IconRocket({ size = 18, color = 'white' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden>
+      <path
+        d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09zM12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2zM9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"
+        stroke={color}
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+const PUMPFUN_IPFS_URL = 'https://pump.fun/api/ipfs';
+
+/**
+ * Pump.fun often returns 403 for /api/ipfs when the request comes from a server
+ * datacenter. The same upload from the user's browser (residential IP) may work.
+ * On failure, the launch API falls back to server-side Pinata / pump.
+ */
+async function tryClientPumpfunMetadata({ name, symbol, description, twitter, telegram, website, imageFile }) {
+  const form = new FormData();
+  form.append('file', imageFile);
+  form.append('name', name.trim());
+  form.append('symbol', symbol.trim().toUpperCase());
+  form.append('description', description.trim());
+  if (twitter.trim()) form.append('twitter', twitter.trim());
+  if (telegram.trim()) form.append('telegram', telegram.trim());
+  if (website.trim()) form.append('website', website.trim());
+  form.append('showName', 'true');
+  const res = await fetch(PUMPFUN_IPFS_URL, { method: 'POST', body: form });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`pump.fun /api/ipfs ${res.status}`);
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error('non-JSON');
+  }
+  const uri = json.metadataUri || json.metadata_uri || json.uri;
+  if (!uri || typeof uri !== 'string' || !uri.startsWith('https://')) {
+    throw new Error('missing metadataUri');
+  }
+  const rawImg = json.metadata?.image || json.image || '';
+  const imageUrl =
+    typeof rawImg === 'string' && (rawImg.startsWith('https://') || rawImg.startsWith('http://'))
+      ? rawImg
+      : '';
+  return { uri, imageUrl };
+}
 
 export default function LaunchView({ wallet, onLaunched }) {
   const [name, setName] = useState('');
@@ -25,6 +153,7 @@ export default function LaunchView({ wallet, onLaunched }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
+  const fileRef = useRef(null);
 
   const walletConnected = !!wallet?.publicKey;
   const buyAmount = Number(initialBuy || 0);
@@ -34,12 +163,8 @@ export default function LaunchView({ wallet, onLaunched }) {
   const onPickImage = (e) => {
     const f = e.target.files?.[0];
     setImageFile(f || null);
-    if (f) {
-      const url = URL.createObjectURL(f);
-      setImagePreview(url);
-    } else {
-      setImagePreview('');
-    }
+    if (f) setImagePreview(URL.createObjectURL(f));
+    else setImagePreview('');
   };
 
   const submit = async (e) => {
@@ -48,7 +173,23 @@ export default function LaunchView({ wallet, onLaunched }) {
     setError(null);
     setResult(null);
     try {
-      if (!imageFile) throw new Error('Please pick an image for the token.');
+      if (!imageFile) throw new Error('Please pick an image for the token');
+
+      let clientPin = null;
+      try {
+        clientPin = await tryClientPumpfunMetadata({
+          name,
+          symbol,
+          description,
+          twitter,
+          telegram,
+          website,
+          imageFile,
+        });
+      } catch {
+        /* CORS, 403, or offline — server pins with Pinata / pump */
+      }
+
       const fd = new FormData();
       fd.append('name', name.trim());
       fd.append('symbol', symbol.trim().toUpperCase());
@@ -63,250 +204,502 @@ export default function LaunchView({ wallet, onLaunched }) {
         fd.append('lockDays', String(lockDays));
       }
       fd.append('rewardMode', rewardMode);
-      fd.append('image', imageFile);
+      if (clientPin) {
+        fd.append('metadataUri', clientPin.uri);
+        if (clientPin.imageUrl) fd.append('metadataImageUrl', clientPin.imageUrl);
+      } else {
+        fd.append('image', imageFile);
+      }
 
-      const res = await fetch('/api/launch', { method: 'POST', body: fd });
+      const res = await fetch(apiUrl('/api/launch'), { method: 'POST', body: fd });
       const data = await res.json();
       if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
       setResult(data);
-      if (typeof onLaunched === 'function') {
-        setTimeout(() => onLaunched(data.stakeMint), 800);
+      const mint = data.stakeMint || data.mint;
+      if (typeof onLaunched === 'function' && mint) {
+        setTimeout(() => onLaunched(mint), 2000);
       }
-    } catch (e) {
-      setError(e.message || String(e));
+    } catch (err) {
+      setError(err.message || String(err));
     } finally {
       setSubmitting(false);
     }
   };
 
+  const launchedMint = result?.stakeMint || result?.mint;
+
+  if (result) {
+    return (
+      <div style={{ maxWidth: 520, margin: '0 auto', textAlign: 'center', padding: '24px 0 40px' }}>
+        <div
+          style={{
+            width: 72,
+            height: 72,
+            borderRadius: 24,
+            background: '#35C5E0',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            margin: '0 auto 24px',
+          }}
+        >
+          <IconCheckCircle size={32} color="white" />
+        </div>
+        <h2
+          style={{
+            fontWeight: 800,
+            fontSize: 32,
+            margin: '0 0 16px',
+            letterSpacing: '-1px',
+            fontFamily: "'Syne', sans-serif",
+          }}
+        >
+          Token launched!
+        </h2>
+        {launchedMint && (
+          <div style={{ background: '#F8F8F8', borderRadius: 12, padding: '12px 16px', marginBottom: 16 }}>
+            <p style={{ margin: 0, fontSize: 12, color: '#999', marginBottom: 4 }}>Mint address</p>
+            <p style={{ margin: 0, fontFamily: "'DM Mono', monospace", fontSize: 14, fontWeight: 700 }}>
+              {launchedMint.slice(0, 4)}…{launchedMint.slice(-4)}
+            </p>
+          </div>
+        )}
+        <p style={{ color: '#999', fontSize: 14, margin: '0 0 16px' }}>Opening your token…</p>
+        {launchedMint && (
+          <a
+            href={`https://pump.fun/${launchedMint}`}
+            target="_blank"
+            rel="noreferrer"
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              color: '#35C5E0',
+              fontWeight: 700,
+              fontSize: 14,
+              textDecoration: 'none',
+            }}
+          >
+            View on Pump.fun <IconExternalLink size={14} />
+          </a>
+        )}
+
+        <details
+          style={{
+            marginTop: 28,
+            textAlign: 'left',
+            background: '#FAFAFA',
+            borderRadius: 12,
+            border: '1px solid #E8E8E8',
+            padding: '12px 16px',
+          }}
+        >
+          <summary style={{ fontWeight: 700, fontSize: 13, cursor: 'pointer', fontFamily: "'Syne', sans-serif" }}>
+            Transaction details
+          </summary>
+          <div
+            style={{
+              marginTop: 12,
+              display: 'grid',
+              gap: 8,
+              wordBreak: 'break-all',
+              fontSize: 12,
+              fontFamily: "'DM Mono', monospace",
+              color: '#444',
+            }}
+          >
+            <div>
+              <span style={{ color: '#888' }}>Reward mode: </span>
+              <strong>{(result.token || result.pool)?.rewardMode === 'token' ? `$${symbol.toUpperCase() || 'TOKEN'}` : 'SOL'}</strong>
+            </div>
+            {launchedMint && (
+              <div>
+                <span style={{ color: '#888' }}>Mint: </span>
+                {launchedMint}
+              </div>
+            )}
+            {result.sigs?.create && (
+              <div>
+                <span style={{ color: '#888' }}>Create: </span>
+                {result.sigs.create}
+              </div>
+            )}
+            {result.sigs?.poolInit && (
+              <div>
+                <span style={{ color: '#888' }}>Staking init: </span>
+                {result.sigs.poolInit}
+              </div>
+            )}
+            {result.sigs?.rewardInit && (
+              <div>
+                <span style={{ color: '#888' }}>Reward: </span>
+                {result.sigs.rewardInit}
+              </div>
+            )}
+            {result.sigs?.autoStake && (
+              <div>
+                <span style={{ color: '#888' }}>Auto-stake: </span>
+                {result.sigs.autoStake}
+              </div>
+            )}
+            {result.autoStake?.error && (
+              <div style={{ color: '#C62828' }}>
+                Auto-stake skipped: {result.autoStake.error} — you can stake manually from the token page.
+              </div>
+            )}
+          </div>
+        </details>
+      </div>
+    );
+  }
+
+  const socialFields = [
+    { l: 'Twitter', v: twitter, s: setTwitter, p: '@handle or URL' },
+    { l: 'Telegram', v: telegram, s: setTelegram, p: 't.me/…' },
+    { l: 'Website', v: website, s: setWebsite, p: 'https://…' },
+  ];
+
   return (
-    <div className="panel">
-      <h2 className="section-title">launch a token</h2>
-      <p className="section-lead" style={{ marginBottom: 0 }}>
-        Stakrr launches your token on Pump.fun and opens a staking pool. The platform treasury is the
-        on-chain creator-fee receiver. Each cycle, 2% of claimed fees are retained and the rest is
-        distributed to stakers.
+    <div style={{ maxWidth: 640, margin: '0 auto' }}>
+      <h2
+        style={{
+          fontWeight: 800,
+          fontSize: 28,
+          margin: '0 0 4px',
+          letterSpacing: '-0.5px',
+          fontFamily: "'Syne', sans-serif",
+        }}
+      >
+        Launch a token
+      </h2>
+      <p style={{ color: '#888', fontSize: 14, margin: '0 0 32px', fontWeight: 500 }}>
+        Deploy to Pump.fun with built-in staking for holders.
       </p>
 
-      <form
-        onSubmit={submit}
-        className="form-grid form-grid--2"
-        style={{ marginTop: 24 }}
-      >
-        <div className="form-field">
-          <label className="form-label" htmlFor="launch-name">Name</label>
-          <input
-            id="launch-name"
-            className="input"
-            required
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            maxLength={32}
-          />
-        </div>
-        <div className="form-field">
-          <label className="form-label" htmlFor="launch-symbol">Ticker</label>
-          <input
-            id="launch-symbol"
-            className="input"
-            required
-            value={symbol}
-            onChange={(e) => setSymbol(e.target.value)}
-            maxLength={10}
-          />
-        </div>
-        <div className="form-field form-field--full">
-          <label className="form-label" htmlFor="launch-desc">Description</label>
-          <textarea
-            id="launch-desc"
-            className="textarea"
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-          />
-        </div>
-        <div className="form-field">
-          <label className="form-label" htmlFor="launch-twitter">Twitter</label>
-          <input
-            id="launch-twitter"
-            className="input"
-            value={twitter}
-            onChange={(e) => setTwitter(e.target.value)}
-            placeholder="https://x.com/..."
-          />
-        </div>
-        <div className="form-field">
-          <label className="form-label" htmlFor="launch-telegram">Telegram</label>
-          <input
-            id="launch-telegram"
-            className="input"
-            value={telegram}
-            onChange={(e) => setTelegram(e.target.value)}
-            placeholder="https://t.me/..."
-          />
-        </div>
-        <div className="form-field form-field--full">
-          <label className="form-label" htmlFor="launch-web">Website</label>
-          <input
-            id="launch-web"
-            className="input"
-            value={website}
-            onChange={(e) => setWebsite(e.target.value)}
-            placeholder="https://..."
-          />
-        </div>
-        <div className="form-field form-field--full">
-          <span className="form-label">Stakers earn rewards in</span>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12, marginTop: 6 }}>
-            <RewardOption
-              active={rewardMode === 'sol'}
-              onClick={() => setRewardMode('sol')}
-              title="SOL"
-              subtitle="Native SOL (auto-unwrapped from wSOL on claim)"
-              detail="Each cycle the worker claims creator fees, takes the 2% platform fee, wraps the rest to wSOL and deposits it as rewards. Stakers receive SOL when they claim."
-            />
-            <RewardOption
-              active={rewardMode === 'token'}
-              onClick={() => setRewardMode('token')}
-              title={`$${(symbol || 'TOKEN').toUpperCase() || 'TOKEN'}`}
-              subtitle="Buyback-and-distribute"
-              detail="Each cycle the worker claims creator fees, takes the 2% platform fee, swaps the rest to your token via Pump.fun, and deposits tokens as rewards."
-            />
-          </div>
-        </div>
-
-        <div className="form-field form-field--full">
-          <label className="form-label" htmlFor="launch-image">Token image (PNG / JPG / GIF / WEBP, max 5MB)</label>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+      <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+        <div>
+          <label style={{ display: 'block', fontWeight: 700, fontSize: 14, marginBottom: 8 }}>
+            Token image <span style={{ color: 'red' }}>*</span>
+          </label>
+          <div
+            role="button"
+            tabIndex={0}
+            onKeyDown={(ev) => {
+              if (ev.key === 'Enter' || ev.key === ' ') {
+                ev.preventDefault();
+                fileRef.current?.click();
+              }
+            }}
+            onClick={() => fileRef.current?.click()}
+            style={{
+              position: 'relative',
+              border: '2px dashed #E0E0E0',
+              borderRadius: 20,
+              padding: 40,
+              cursor: 'pointer',
+              textAlign: 'center',
+              background: imagePreview ? 'transparent' : '#FAFAFA',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: 12,
+            }}
+          >
+            {imagePreview ? (
+              <img
+                src={imagePreview}
+                alt="Token preview"
+                style={{ width: 96, height: 96, borderRadius: 20, objectFit: 'cover' }}
+              />
+            ) : (
+              <>
+                <div
+                  style={{
+                    width: 48,
+                    height: 48,
+                    borderRadius: 16,
+                    background: 'rgba(53,197,224,0.12)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                >
+                  <IconUpload size={22} />
+                </div>
+                <span style={{ fontSize: 14, color: '#999', fontWeight: 500 }}>Click to upload image</span>
+              </>
+            )}
             <input
-              id="launch-image"
+              ref={fileRef}
               type="file"
               accept="image/png,image/jpeg,image/gif,image/webp"
               onChange={onPickImage}
-              className="input"
-              style={{ flex: 1, minWidth: 200, padding: 10 }}
-              required
+              style={{ display: 'none' }}
             />
-            {imagePreview && (
-              <img
-                src={imagePreview}
-                alt=""
-                className="token-avatar"
-                style={{ width: 64, height: 64, borderRadius: 12 }}
-              />
-            )}
           </div>
         </div>
-        <div className="form-field">
-          <label className="form-label" htmlFor="launch-buy">Initial dev buy (SOL)</label>
-          <input
-            id="launch-buy"
-            className="input"
-            type="number"
-            min="0"
-            step="0.01"
-            value={initialBuy}
-            onChange={(e) => setInitialBuy(e.target.value)}
+
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12 }}>
+          <div>
+            <label style={{ display: 'block', fontWeight: 700, fontSize: 13, marginBottom: 6 }}>Name *</label>
+            <input
+              style={INP}
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              required
+              placeholder="My Token"
+              maxLength={32}
+            />
+          </div>
+          <div>
+            <label style={{ display: 'block', fontWeight: 700, fontSize: 13, marginBottom: 6 }}>Symbol *</label>
+            <input
+              style={{ ...INP, fontFamily: "'DM Mono', monospace", textTransform: 'uppercase' }}
+              type="text"
+              value={symbol}
+              onChange={(e) => setSymbol(e.target.value.toUpperCase())}
+              required
+              placeholder="TKN"
+              maxLength={10}
+            />
+          </div>
+        </div>
+
+        <div>
+          <label style={{ display: 'block', fontWeight: 700, fontSize: 13, marginBottom: 6 }}>Description</label>
+          <textarea
+            style={{ ...INP, resize: 'none' }}
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            rows={3}
+            placeholder="Describe your token…"
           />
         </div>
-        <div className="form-field">
-          <label className="form-label" htmlFor="launch-lock">Auto-stake lock</label>
-          <select
-            id="launch-lock"
-            className="select"
-            style={{ opacity: autoStakeActive ? 1 : 0.55 }}
-            value={lockDays}
-            onChange={(e) => setLockDays(Number(e.target.value))}
-            disabled={!autoStakeActive}
-          >
-            {LOCK_TIERS.map((t) => (
-              <option key={t.days} value={t.days}>{t.label}</option>
-            ))}
-          </select>
+
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
+            gap: 10,
+          }}
+        >
+          {socialFields.map((f) => (
+            <div key={f.l}>
+              <label
+                style={{
+                  display: 'block',
+                  fontSize: 11,
+                  fontWeight: 700,
+                  color: '#999',
+                  marginBottom: 6,
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em',
+                }}
+              >
+                {f.l}
+              </label>
+              <input style={INP} type="text" value={f.v} onChange={(e) => f.s(e.target.value)} placeholder={f.p} />
+            </div>
+          ))}
         </div>
 
-        <div className="form-field form-field--full">
-          <label
-            className={`auto-stake-box${canAutoStake ? '' : ' auto-stake-box--inactive'}`}
-            style={{ cursor: canAutoStake ? 'pointer' : 'not-allowed' }}
-            htmlFor="auto-stake-cb"
+        <div>
+          <label style={{ display: 'block', fontWeight: 700, fontSize: 13, marginBottom: 6 }}>Initial buy (SOL)</label>
+          <input
+            style={{ ...INP, fontFamily: "'DM Mono', monospace" }}
+            type="number"
+            value={initialBuy}
+            onChange={(e) => setInitialBuy(e.target.value)}
+            min={0}
+            step={0.01}
+            placeholder="0"
+          />
+        </div>
+
+        <div
+          style={{
+            border: '1.5px solid',
+            borderColor: autoStakeActive ? '#35C5E0' : '#E8E8E8',
+            borderRadius: 20,
+            padding: 20,
+            background: autoStakeActive ? 'rgba(53,197,224,0.04)' : 'white',
+            opacity: !canAutoStake ? 0.5 : 1,
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              marginBottom: autoStakeActive ? 16 : 0,
+            }}
           >
-            <input
-              id="auto-stake-cb"
-              type="checkbox"
-              checked={autoStake}
-              onChange={(e) => setAutoStake(e.target.checked)}
+            <div>
+              <p style={{ margin: 0, fontWeight: 700, fontSize: 15 }}>Auto-stake initial buy</p>
+              <p style={{ margin: '2px 0 0', fontSize: 13, color: '#999' }}>
+                {canAutoStake ? 'Stake tokens immediately on launch' : 'Connect wallet and set initial buy > 0'}
+              </p>
+            </div>
+            <button
+              type="button"
               disabled={!canAutoStake}
-              style={{ marginTop: 4 }}
-            />
-            <div style={{ display: 'grid', gap: 6 }}>
-              <div style={{ fontWeight: 700, fontSize: '0.9375rem' }}>
-                Atomically stake the dev buy on launch
-              </div>
-              <div className="muted" style={{ fontSize: '0.8125rem', lineHeight: 1.5 }}>
-                {!walletConnected
-                  ? 'Connect a wallet — the position will be owned by the connected wallet.'
-                  : buyAmount <= 0
-                    ? 'Enter an initial dev buy above to enable atomic auto-staking.'
-                    : `Treasury buys ${buyAmount} SOL of tokens during create, then immediately stakes for your wallet with the lock you pick.`}
-              </div>
-            </div>
-          </label>
-        </div>
-
-        <div className="form-field form-field--full" style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
-          <button type="submit" disabled={submitting} className="btn-primary">
-            {submitting ? 'Launching…' : 'Launch token + open pool'}
-          </button>
-          <span className="muted" style={{ fontSize: '0.8125rem' }}>
-            No platform launch fee · 2% of creator fees to platform
-          </span>
-        </div>
-      </form>
-
-      {error && (
-        <div className="alert alert--error" style={{ marginTop: 20 }}>
-          {error}
-        </div>
-      )}
-
-      {result && (
-        <div className="alert alert--success" style={{ marginTop: 20, display: 'grid', gap: 8, wordBreak: 'break-all' }}>
-          <div><strong>Token launched</strong></div>
-          <div>Mint: <code className="mono">{result.stakeMint}</code></div>
-          <div>
-            Reward mode:{' '}
-            <strong>{result.pool?.rewardMode === 'token' ? `$${symbol.toUpperCase()}` : 'SOL'}</strong>
+              onClick={() => setAutoStake((v) => !v)}
+              aria-pressed={autoStakeActive}
+              style={{
+                width: 44,
+                height: 24,
+                borderRadius: 100,
+                border: 'none',
+                cursor: canAutoStake ? 'pointer' : 'not-allowed',
+                background: autoStake && canAutoStake ? '#35C5E0' : '#E0E0E0',
+                position: 'relative',
+                transition: 'background 0.2s',
+                flexShrink: 0,
+              }}
+            >
+              <span
+                style={{
+                  position: 'absolute',
+                  top: 2,
+                  left: autoStake && canAutoStake ? 22 : 2,
+                  width: 20,
+                  height: 20,
+                  borderRadius: '50%',
+                  background: 'white',
+                  boxShadow: '0 1px 4px rgba(0,0,0,0.2)',
+                  transition: 'left 0.2s',
+                }}
+              />
+            </button>
           </div>
-          <div>Create: <code className="mono">{result.sigs?.create}</code></div>
-          <div>Pool init: <code className="mono">{result.sigs?.poolInit}</code></div>
-          <div>Reward: <code className="mono">{result.sigs?.rewardInit}</code></div>
-          {result.sigs?.autoStake && (
-            <div>Auto-stake: <code className="mono">{result.sigs.autoStake}</code></div>
-          )}
-          {result.autoStake?.error && (
-            <div style={{ color: 'var(--accent)' }}>
-              Auto-stake skipped: {result.autoStake.error} — you can stake manually from the pool page.
+
+          {autoStakeActive && (
+            <div>
+              <p
+                style={{
+                  fontSize: 11,
+                  fontWeight: 700,
+                  color: '#999',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em',
+                  marginBottom: 10,
+                }}
+              >
+                Lock duration
+              </p>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+                {LOCK_TIERS.map((t) => (
+                  <button
+                    key={t.days}
+                    type="button"
+                    onClick={() => setLockDays(t.days)}
+                    style={{
+                      border: '2px solid',
+                      borderColor: lockDays === t.days ? t.color : '#E8E8E8',
+                      borderRadius: 12,
+                      padding: '10px 8px',
+                      textAlign: 'center',
+                      cursor: 'pointer',
+                      background: lockDays === t.days ? t.color : 'white',
+                      color: lockDays === t.days ? 'white' : '#555',
+                      fontFamily: "'Syne', sans-serif",
+                      transition: 'all 0.15s',
+                    }}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 700 }}>{t.days === 1 ? '1 day' : `${t.days} days`}</div>
+                    <div style={{ fontSize: 13, fontFamily: "'DM Mono', monospace" }}>{t.mult}</div>
+                  </button>
+                ))}
+              </div>
             </div>
           )}
         </div>
-      )}
-    </div>
-  );
-}
 
-function RewardOption({ active, onClick, title, subtitle, detail }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`reward-option${active ? ' reward-option--active' : ''}`}
-    >
-      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
-        <span className="reward-option__title">{title}</span>
-        <span className="reward-option__tag">{active ? 'Selected' : 'Tap to select'}</span>
-      </div>
-      <div className="muted" style={{ fontSize: '0.8125rem' }}>{subtitle}</div>
-      <div className="muted" style={{ fontSize: '0.8125rem', lineHeight: 1.5, marginTop: 4 }}>{detail}</div>
-    </button>
+        <div>
+          <label style={{ display: 'block', fontWeight: 700, fontSize: 13, marginBottom: 8 }}>Reward mode</label>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            {['sol', 'token'].map((m) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => setRewardMode(m)}
+                style={{
+                  flex: '1 1 200px',
+                  padding: '12px',
+                  borderRadius: 14,
+                  border: '2px solid',
+                  borderColor: rewardMode === m ? '#35C5E0' : '#E8E8E8',
+                  background: rewardMode === m ? '#35C5E0' : 'white',
+                  color: rewardMode === m ? 'white' : '#555',
+                  fontWeight: 700,
+                  fontSize: 14,
+                  cursor: 'pointer',
+                  fontFamily: "'Syne', sans-serif",
+                }}
+              >
+                {m === 'sol' ? 'SOL rewards' : 'Token rewards'}
+              </button>
+            ))}
+          </div>
+          <p style={{ margin: '8px 0 0', fontSize: 12, color: '#999', lineHeight: 1.45 }}>
+            {rewardMode === 'sol'
+              ? 'Stakers claim native SOL from creator fees (after the 2% platform share).'
+              : 'Each cycle swaps remaining fees to your token for staker rewards.'}
+          </p>
+        </div>
+
+        {error && (
+          <div
+            style={{
+              background: '#FFF0F0',
+              border: '1px solid #FFCDD2',
+              borderRadius: 12,
+              padding: 12,
+              fontSize: 13,
+              fontFamily: "'DM Mono', monospace",
+              color: '#C62828',
+            }}
+          >
+            {error}
+          </div>
+        )}
+
+        <button
+          type="submit"
+          disabled={submitting}
+          style={{
+            width: '100%',
+            padding: '16px',
+            background: '#0C0C0C',
+            color: 'white',
+            border: 'none',
+            borderRadius: 16,
+            fontWeight: 800,
+            fontSize: 16,
+            cursor: submitting ? 'not-allowed' : 'pointer',
+            opacity: submitting ? 0.6 : 1,
+            fontFamily: "'Syne', sans-serif",
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 8,
+          }}
+        >
+          {submitting ? (
+            <>
+              <IconLoader /> Launching…
+            </>
+          ) : (
+            <>
+              <IconRocket /> Launch token
+            </>
+          )}
+        </button>
+        <p style={{ margin: 0, textAlign: 'center', fontSize: 12, color: '#999' }}>
+          No platform launch fee · 2% of creator fees to platform
+        </p>
+      </form>
+    </div>
   );
 }

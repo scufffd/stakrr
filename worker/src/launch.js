@@ -9,6 +9,7 @@ import {
   Transaction,
   sendAndConfirmTransaction,
 } from '@solana/web3.js';
+import bs58 from 'bs58';
 import {
   getAccount,
   getAssociatedTokenAddressSync,
@@ -26,6 +27,7 @@ import {
   stakeForIx,
 } from './stake-program.js';
 import { upsertPool, recordEvent } from './registry.js';
+import { popMintKeypairFromPool } from './vanity-mints.js';
 
 function log(message, extra = {}) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), message, ...extra }));
@@ -240,14 +242,23 @@ export async function launchToken({
   // Persist the resolved image URL so the pool page can render it.
   const persistedMetadata = { ...metadata, image: resolvedImage || metadata.image || null };
 
-  // 2) Build the create-token transaction via PumpDev. PumpDev generates the
-  //    mint keypair for us and returns it; we sign with treasury + mint.
+  // 2) Build the create-token transaction via PumpDev (optional vanity mint from
+  //    VANITY_MINT_POOL_FILE + VANITY_MINT_SUFFIX — see vanity-mints.js / PumpDev `mintKeypair`).
+  let mintKeypairSecretB58;
+  if (config.vanityMintPoolFile && config.vanityMintSuffix?.trim()) {
+    const vk = popMintKeypairFromPool(config.vanityMintPoolFile, config.vanityMintSuffix.trim());
+    if (vk) {
+      mintKeypairSecretB58 = bs58.encode(vk.secretKey);
+      log('launch: vanity mint from pool', { mint: vk.publicKey.toBase58() });
+    }
+  }
   const { tx: createTx, mint, mintKeypair } = await buildCreateTokenTx({
     publicKey: treasury.publicKey.toBase58(),
     name: metadata.name,
     symbol: metadata.symbol,
     uri: metadataUri,
     buyAmountSol: Number(initialBuySol) || 0,
+    mintKeypairSecretB58: mintKeypairSecretB58 || null,
   });
   createTx.sign([treasury, mintKeypair]);
   const createSig = await connection.sendRawTransaction(createTx.serialize(), {
@@ -347,5 +358,6 @@ export async function launchToken({
     },
     autoStake: autoStakeRes,
     pool,
+    token: pool,
   };
 }
