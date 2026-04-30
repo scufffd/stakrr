@@ -25,7 +25,13 @@ export default function DirectoryView({ onSelectPool }) {
 
   return (
     <div>
-      <h2 className="section-title">Active pools</h2>
+      <p className="sky-pullquote">
+        <span className="sky-pullquote__lead">We </span>
+        <span className="sky-pullquote__rest">
+          route creator fees back to the wallets that chose to believe — not to the void between clicks.
+        </span>
+      </p>
+      <h2 className="section-title">active pools</h2>
       <p className="section-lead">
         Every Stakrr token has a public staking pool. Lock to earn up to 3× weight on the token&apos;s
         creator fees, paid out as SOL or the token itself.

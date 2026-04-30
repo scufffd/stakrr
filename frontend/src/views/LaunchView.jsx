@@ -81,7 +81,7 @@ export default function LaunchView({ wallet, onLaunched }) {
 
   return (
     <div className="panel">
-      <h2 className="section-title">Launch a token</h2>
+      <h2 className="section-title">launch a token</h2>
       <p className="section-lead" style={{ marginBottom: 0 }}>
         Stakrr launches your token on Pump.fun and opens a staking pool. The platform treasury is the
         on-chain creator-fee receiver. Each cycle, 2% of claimed fees are retained and the rest is
@@ -228,8 +228,10 @@ export default function LaunchView({ wallet, onLaunched }) {
           <label
             className={`auto-stake-box${canAutoStake ? '' : ' auto-stake-box--inactive'}`}
             style={{ cursor: canAutoStake ? 'pointer' : 'not-allowed' }}
+            htmlFor="auto-stake-cb"
           >
             <input
+              id="auto-stake-cb"
               type="checkbox"
               checked={autoStake}
               onChange={(e) => setAutoStake(e.target.checked)}
