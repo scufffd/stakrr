@@ -1,0 +1,30 @@
+{
+  "name": "stakrr-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Stakrr — Pump.fun proof-of-belief launchpad worker (claim, fee split, wSOL distribute)",
+  "main": "src/server.js",
+  "scripts": {
+    "loop": "node scripts/run-loop.js",
+    "cycle": "node scripts/run-cycle.js",
+    "serve": "node src/server.js",
+    "register-pool": "node scripts/register-pool.js",
+    "list-pools": "node scripts/list-pools.js",
+    "init-pool": "node scripts/init-pool.js",
+    "check": "node --check src/config.js && node --check src/registry.js && node --check src/pumpdev.js && node --check src/wsol.js && node --check src/stake-program.js && node --check src/launch.js && node --check src/claim-and-distribute.js && node --check src/run-loop.js && node --check src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.31.1",
+    "@solana/spl-token": "^0.3.9",
+    "@solana/web3.js": "^1.95.8",
+    "bn.js": "^5.2.1",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2"
+  }
+}

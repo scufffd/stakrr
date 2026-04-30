@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+*.log
+.DS_Store
+
+# local state / registry / keypairs
+worker/data/
+worker/keys/
+*.pem
+*.key
+secret*.json
+admin*.json
+treasury*.json
