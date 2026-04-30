@@ -1,4 +1,7 @@
 import React, { useState, useRef } from 'react';
+import { Buffer } from 'buffer';
+import { Transaction, VersionedTransaction } from '@solana/web3.js';
+import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { apiUrl } from '../apiBase.js';
 
 const LOCK_TIERS = [
@@ -137,7 +140,10 @@ async function tryClientPumpfunMetadata({ name, symbol, description, twitter, te
   return { uri, imageUrl };
 }
 
-export default function LaunchView({ wallet, onLaunched }) {
+export default function LaunchView({ onLaunched }) {
+  const { connection } = useConnection();
+  const wallet = useWallet();
+  const { publicKey, signTransaction, signAllTransactions } = wallet;
   const [name, setName] = useState('');
   const [symbol, setSymbol] = useState('');
   const [description, setDescription] = useState('');
@@ -155,7 +161,7 @@ export default function LaunchView({ wallet, onLaunched }) {
   const [result, setResult] = useState(null);
   const fileRef = useRef(null);
 
-  const walletConnected = !!wallet?.publicKey;
+  const walletConnected = !!publicKey;
   const buyAmount = Number(initialBuy || 0);
   const canAutoStake = walletConnected && buyAmount > 0;
   const autoStakeActive = canAutoStake && autoStake;
@@ -173,6 +179,9 @@ export default function LaunchView({ wallet, onLaunched }) {
     setError(null);
     setResult(null);
     try {
+      if (!publicKey || !signTransaction || !signAllTransactions) {
+        throw new Error('Connect your Solana wallet — you sign and pay all launch transactions');
+      }
       if (!imageFile) throw new Error('Please pick an image for the token');
 
       let clientPin = null;
@@ -198,7 +207,7 @@ export default function LaunchView({ wallet, onLaunched }) {
       if (telegram.trim()) fd.append('telegram', telegram.trim());
       if (website.trim()) fd.append('website', website.trim());
       fd.append('initialBuySol', String(Number(initialBuy || 0)));
-      if (wallet?.publicKey?.toBase58) fd.append('creatorWallet', wallet.publicKey.toBase58());
+      fd.append('creatorWallet', publicKey.toBase58());
       if (autoStakeActive) {
         fd.append('autoStake', 'true');
         fd.append('lockDays', String(lockDays));
@@ -211,9 +220,139 @@ export default function LaunchView({ wallet, onLaunched }) {
         fd.append('image', imageFile);
       }
 
-      const res = await fetch(apiUrl('/api/launch'), { method: 'POST', body: fd });
-      const data = await res.json();
-      if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      const prepRes = await fetch(apiUrl('/api/launch/prepare'), { method: 'POST', body: fd });
+      const prep = await prepRes.json();
+      if (!prepRes.ok) throw new Error(prep.error || `prepare failed (${prepRes.status})`);
+
+      // 1-click bundle: ask the wallet to sign create + lock-fees + pool-init
+      // in a single Phantom approval dialog. Sending is sequential afterwards
+      // (Pump create must land first so the BondingCurve account exists for
+      // lock-fees, and the staking pool init wants the mint to exist). The
+      // three blockhashes are independent (~150 slot validity each) which is
+      // plenty given the worst-case land-time of all three is well under a
+      // minute on mainnet.
+      const createTx = VersionedTransaction.deserialize(Buffer.from(prep.createTxBase64, 'base64'));
+      const lockTx = prep.lockFeesEnabled && prep.lockFeesTxBase64
+        ? Transaction.from(Buffer.from(prep.lockFeesTxBase64, 'base64'))
+        : null;
+      const poolTx = Transaction.from(Buffer.from(prep.poolRewardTxBase64, 'base64'));
+      const toSign = [createTx, lockTx, poolTx].filter(Boolean);
+      const signed = await signAllTransactions(toSign);
+      let cursor = 0;
+      const signedCreate = signed[cursor++];
+      const signedLock = lockTx ? signed[cursor++] : null;
+      const signedPool = signed[cursor++];
+
+      const createSig = await connection.sendRawTransaction(signedCreate.serialize(), {
+        skipPreflight: false,
+        maxRetries: 3,
+      });
+      const bhCreate = await connection.getLatestBlockhash('confirmed');
+      await connection.confirmTransaction(
+        { signature: createSig, blockhash: bhCreate.blockhash, lastValidBlockHeight: bhCreate.lastValidBlockHeight },
+        'confirmed',
+      );
+
+      let lockFeesSig = null;
+      if (signedLock) {
+        try {
+          lockFeesSig = await connection.sendRawTransaction(signedLock.serialize(), {
+            skipPreflight: false,
+            maxRetries: 3,
+          });
+          const bhLock = await connection.getLatestBlockhash('confirmed');
+          await connection.confirmTransaction(
+            { signature: lockFeesSig, blockhash: bhLock.blockhash, lastValidBlockHeight: bhLock.lastValidBlockHeight },
+            'confirmed',
+          );
+        } catch (err) {
+          // Don't hard-fail the whole launch — surface a warning so the user
+          // knows fees are not yet locked and can retry from the token page.
+          // The pool tx still goes through; an unlocked token just keeps the
+          // deployer wallet as BC.creator (worker will warn).
+          console.warn('[stakrr] lock-fees send failed (continuing):', err);
+        }
+      }
+
+      const rm = prep.rewardMode || rewardMode;
+      const poolSig = await connection.sendRawTransaction(signedPool.serialize(), {
+        skipPreflight: false,
+        maxRetries: 3,
+      });
+      const bhPool = await connection.getLatestBlockhash('confirmed');
+      await connection.confirmTransaction(
+        { signature: poolSig, blockhash: bhPool.blockhash, lastValidBlockHeight: bhPool.lastValidBlockHeight },
+        'confirmed',
+      );
+
+      let autoStakeSig = null;
+      if (autoStakeActive) {
+        const nonce = Date.now();
+        let lastAsErr = null;
+        for (let j = 0; j < 12; j++) {
+          try {
+            const asRes = await fetch(apiUrl('/api/launch/auto-stake-tx'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                creatorWallet: publicKey.toBase58(),
+                mint: prep.mint,
+                rewardMode: rm,
+                lockDays,
+                nonce,
+              }),
+            });
+            const asJson = await asRes.json();
+            if (!asRes.ok || asJson.error) {
+              lastAsErr = asJson.error || `HTTP ${asRes.status}`;
+              await new Promise((r) => setTimeout(r, 800));
+              continue;
+            }
+            const asTx = Transaction.from(Buffer.from(asJson.autoStakeTxBase64, 'base64'));
+            const signedAs = await signTransaction(asTx);
+            autoStakeSig = await connection.sendRawTransaction(signedAs.serialize(), {
+              skipPreflight: false,
+              maxRetries: 3,
+            });
+            const bhAs = await connection.getLatestBlockhash('confirmed');
+            await connection.confirmTransaction(
+              {
+                signature: autoStakeSig,
+                blockhash: bhAs.blockhash,
+                lastValidBlockHeight: bhAs.lastValidBlockHeight,
+              },
+              'confirmed',
+            );
+            break;
+          } catch (err) {
+            lastAsErr = err.message || String(err);
+            await new Promise((r) => setTimeout(r, 800));
+          }
+        }
+        if (!autoStakeSig) throw new Error(lastAsErr || 'Auto-stake failed — you can stake manually from the pool page');
+      }
+
+      const finRes = await fetch(apiUrl('/api/launch/finalize'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          createSig,
+          lockFeesSig,
+          poolRewardSig: poolSig,
+          autoStakeSig,
+          mint: prep.mint,
+          creatorWallet: publicKey.toBase58(),
+          rewardMode: rm,
+          persistedMetadata: prep.persistedMetadata,
+          metadataUri: prep.metadataUri,
+          metadataSource: prep.metadataSource,
+          initialBuySol: prep.initialBuySol ?? Number(initialBuy || 0),
+          autoStake: autoStakeActive,
+          lockDays,
+        }),
+      });
+      const data = await finRes.json();
+      if (!finRes.ok || data.error) throw new Error(data.error || `HTTP ${finRes.status}`);
       setResult(data);
       const mint = data.stakeMint || data.mint;
       if (typeof onLaunched === 'function' && mint) {
@@ -322,6 +461,20 @@ export default function LaunchView({ wallet, onLaunched }) {
               <div>
                 <span style={{ color: '#888' }}>Create: </span>
                 {result.sigs.create}
+              </div>
+            )}
+            {result.sigs?.lockFees && (
+              <div>
+                <span style={{ color: '#888' }}>Fee lock: </span>
+                {result.sigs.lockFees}
+              </div>
+            )}
+            {result.feeLock?.shareholders?.[0]?.address && (
+              <div>
+                <span style={{ color: '#888' }}>Fees → </span>
+                {result.feeLock.shareholders[0].address}
+                {' '}
+                ({(result.feeLock.shareholders[0].shareBps / 100).toFixed(0)}%)
               </div>
             )}
             {result.sigs?.poolInit && (
@@ -667,7 +820,7 @@ export default function LaunchView({ wallet, onLaunched }) {
 
         <button
           type="submit"
-          disabled={submitting}
+          disabled={submitting || !walletConnected}
           style={{
             width: '100%',
             padding: '16px',
@@ -697,7 +850,7 @@ export default function LaunchView({ wallet, onLaunched }) {
           )}
         </button>
         <p style={{ margin: 0, textAlign: 'center', fontSize: 12, color: '#999' }}>
-          No platform launch fee · 2% of creator fees to platform
+          One Phantom approval covers create + fee lock + staking pool · 100% of creator royalties route on-chain to the Stakrr staking pool via Pump's <code style={{ fontFamily: "'DM Mono', monospace" }}>pump_fees</code> program · Fee lock is verifiable on Solscan
         </p>
       </form>
     </div>

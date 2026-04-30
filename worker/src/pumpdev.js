@@ -2,16 +2,20 @@
 // Docs: https://github.com/pumpdev3/pumpdev.io  /  https://pumpdev.io/welcome
 //
 // Endpoints we use:
-//   POST /api/create        -> create a pump.fun token (client-signed)
-//   POST /api/claim-account -> claim accumulated creator fees (client-signed)
+//   POST /api/create           -> create a pump.fun token (client-signed)
+//   POST /api/claim-account    -> claim accumulated creator fees (client-signed)
+//   POST /api/claim-distribute -> distribute fee-sharing payouts (client-signed; mint required)
+//   POST /api/trade-local      -> bonding-curve buy/sell (client-signed)
 //
 // Notes:
 // - `/api/create` returns JSON `{ mint, mintSecretKey, transaction }` where
 //   `transaction` is a base58-encoded VersionedTransaction. Caller signs with
-//   the creator (treasury) + the returned mint keypair, then sends via our RPC.
+//   the creator wallet + the returned mint keypair, then sends via RPC.
 // - `/api/claim-account` returns a raw serialized VersionedTransaction in the
 //   response body (Uint8Array via arrayBuffer()). Caller signs with the creator
 //   wallet and sends.
+// - `/api/claim-distribute` returns a raw serialized VersionedTransaction (same as claim-account).
+//   Body requires `publicKey` + `mint` for fee-sharing distribution. See https://pumpdev.io/claim-distribute
 // - PumpDev does NOT host metadata for `/api/create`; the caller must pre-upload
 //   the metadata JSON and pass the resulting `uri`. We use pump.fun/api/ipfs
 //   in `pumpfun-ipfs.js` for that step.
@@ -40,7 +44,7 @@ function authHeaders(extra = {}) {
  * }>}
  */
 export async function buildCreateTokenTx({
-  publicKey,         // base58 creator pubkey (treasury)
+  publicKey,         // base58 pubkey of wallet that signs + pays the create tx
   name,
   symbol,
   uri,               // pre-uploaded metadata URI
@@ -56,6 +60,7 @@ export async function buildCreateTokenTx({
   if (!uri) throw new Error('buildCreateTokenTx: uri required (upload metadata first)');
 
   const body = {
+    ...config.pumpdev.createExtra,
     publicKey,
     name,
     symbol,
@@ -156,6 +161,34 @@ export async function buildBuyTokenTx({ publicKey, mint, solAmount, slippage = 5
     priorityFee,
     pool,
   });
+}
+
+/**
+ * Build a **claim-distribute** transaction — settles Pump fee-sharing: distributes
+ * accumulated creator fees to all shareholders. Permissionless on-chain; the
+ * returned tx is still signed by `publicKey` as PumpDev builds it.
+ *
+ * See: https://pumpdev.io/claim-distribute
+ *
+ * @returns {Promise<VersionedTransaction>}
+ */
+export async function buildClaimDistributeTx({ publicKey, mint }) {
+  if (!publicKey) throw new Error('buildClaimDistributeTx: publicKey required');
+  if (!mint) throw new Error('buildClaimDistributeTx: mint required (stake mint / pump token)');
+  const mintStr = typeof mint === 'string' ? mint : mint.toBase58();
+  const body = { publicKey, mint: mintStr };
+
+  const res = await fetch(endpoint('/api/claim-distribute'), {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`PumpDev /api/claim-distribute HTTP ${res.status}: ${text.slice(0, 400)}`);
+  }
+  const buf = new Uint8Array(await res.arrayBuffer());
+  return VersionedTransaction.deserialize(buf);
 }
 
 /**

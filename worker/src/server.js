@@ -1,6 +1,19 @@
 // Stakrr backend API. Exposes a tiny JSON surface for the frontend:
 //
-//   POST /api/launch                  -> launch a Pump.fun token + staking pool
+//   POST /api/launch/prepare          -> metadata + partial-signed Pump create tx
+//                                        + unsigned pump_fees lock-fees tx
+//                                        + unsigned pool init + reward tx
+//                                        (all three intended for one
+//                                         signAllTransactions Phantom prompt)
+//   POST /api/launch/lock-fees-tx     -> standalone unsigned pump_fees lock tx
+//                                        (used to retro-lock previously launched
+//                                         tokens that skipped the fee lock)
+//   POST /api/launch/pool-tx          -> standalone unsigned pool init + reward tx
+//                                        (kept for parity / debugging)
+//   POST /api/launch/auto-stake-tx    -> optional unsigned auto-stake tx (separate
+//                                        prompt because the amount depends on the
+//                                        actual ATA balance after the dev buy lands)
+//   POST /api/launch/finalize         -> verify on-chain + registry (JSON)
 //   GET  /api/tokens                  -> list active tokens (registry; preferred)
 //   GET  /api/tokens/:mint            -> single token (registry)
 //   GET  /api/tokens/:mint/public     -> merged registry + on-chain view (preferred)
@@ -18,7 +31,14 @@ import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { config, authoritySigner } from './config.js';
 import { getPool, listPools } from './registry.js';
 import { fetchPool, fetchRewardMint, fetchActivePositions } from './stake-program.js';
-import { launchToken } from './launch.js';
+import {
+  prepareCreatorLaunch,
+  buildLockFeesTxBase64,
+  buildUnsignedPoolRewardTxBase64,
+  buildCreatorAutoStakeTxBase64,
+  finalizeCreatorLaunch,
+  finalizeLockFeesOnly,
+} from './launch.js';
 import { buildWalletSummary } from './wallet-summary.js';
 
 const app = express();
@@ -189,12 +209,11 @@ app.get('/api/pools/:mint/public', (req, res, next) => {
 //   metadataUri: https URL from pump.fun/api/ipfs (browser upload) or any https IPFS URL
 //   metadataImageUrl: optional resolved image URL for the registry when skipping `image`
 //
-// MVP: no signed-wallet check required because the platform treasury is the
-// only signer that matters on-chain. We will add wallet-signed nonce auth and
-// a launch fee check before opening fully self-serve in production.
-app.post('/api/launch', upload.single('image'), async (req, res) => {
+// Creator wallet pays all launch SOL; treasury is not charged. Flow: prepare →
+// signAllTransactions(create + lock + pool) in one Phantom prompt → send each in
+// order with confirm-between → optional auto-stake-tx (separate prompt) → finalize.
+app.post('/api/launch/prepare', upload.single('image'), async (req, res) => {
   try {
-    // multer + multipart: scalar fields are strings on req.body, file on req.file.
     const body = req.body || {};
     let metadataUri;
     try {
@@ -215,30 +234,157 @@ app.post('/api/launch', upload.single('image'), async (req, res) => {
     if (!metadata.name || !metadata.symbol) {
       return res.status(400).json({ ok: false, error: 'name and symbol required' });
     }
+    if (!body.creatorWallet?.trim()) {
+      return res.status(400).json({ ok: false, error: 'creatorWallet required (connect wallet)' });
+    }
     if (!metadataUri && !req.file?.buffer) {
       return res.status(400).json({
         ok: false,
         error: 'Token image required (or pin metadata from the browser / pass metadataUri).',
       });
     }
-    const autoStake = body.autoStake === 'true' || body.autoStake === true || body.autoStake === '1';
     const rewardMode = body.rewardMode === 'token' ? 'token' : 'sol';
-    const out = await launchToken({
+    const out = await prepareCreatorLaunch({
       metadata,
       uri: metadataUri || undefined,
       initialBuySol: Number(body.initialBuySol || 0),
-      creatorWallet: body.creatorWallet || null,
+      creatorWallet: body.creatorWallet.trim(),
       fileBuffer: req.file?.buffer || null,
       fileContentType: req.file?.mimetype || null,
-      autoStake,
-      lockDays: Number(body.lockDays || 7),
       rewardMode,
     });
-    res.json({ ok: true, ...out });
+    res.json(out);
   } catch (e) {
     console.error(JSON.stringify({
       ts: new Date().toISOString(),
-      message: 'launch failed',
+      message: 'launch prepare failed',
+      error: e.message,
+      stack: e.stack?.split('\n').slice(0, 8),
+    }));
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Pump fee lock — runs after /api/launch/prepare's create tx is confirmed.
+// Migrates BondingCurve.creator from the deployer to a FeeSharingConfig PDA so
+// 100% of creator royalties route to PLATFORM_TREASURY (or LOCK_FEES_RECIPIENT).
+// Disabled-by-config returns `{ ok: true, locked: false }` and the client skips.
+app.post('/api/launch/lock-fees-tx', async (req, res) => {
+  try {
+    const { creatorWallet, mint } = req.body || {};
+    if (!creatorWallet?.trim() || !mint?.trim()) {
+      return res.status(400).json({ ok: false, error: 'creatorWallet and mint required' });
+    }
+    const out = await buildLockFeesTxBase64({
+      creatorWallet: creatorWallet.trim(),
+      mint: mint.trim(),
+    });
+    res.json(out);
+  } catch (e) {
+    console.error(JSON.stringify({
+      ts: new Date().toISOString(),
+      message: 'launch lock-fees failed',
+      error: e.message,
+    }));
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/launch/pool-tx', async (req, res) => {
+  try {
+    const { creatorWallet, mint, rewardMode } = req.body || {};
+    if (!creatorWallet?.trim() || !mint?.trim()) {
+      return res.status(400).json({ ok: false, error: 'creatorWallet and mint required' });
+    }
+    const rm = rewardMode === 'token' ? 'token' : 'sol';
+    const out = await buildUnsignedPoolRewardTxBase64({
+      creatorWallet: creatorWallet.trim(),
+      mint: mint.trim(),
+      rewardMode: rm,
+    });
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/launch/auto-stake-tx', async (req, res) => {
+  try {
+    const { creatorWallet, mint, rewardMode, lockDays, nonce } = req.body || {};
+    if (!creatorWallet?.trim() || !mint?.trim() || nonce == null || nonce === '') {
+      return res.status(400).json({ ok: false, error: 'creatorWallet, mint, and nonce required' });
+    }
+    const rm = rewardMode === 'token' ? 'token' : 'sol';
+    const out = await buildCreatorAutoStakeTxBase64({
+      creatorWallet: creatorWallet.trim(),
+      mint: mint.trim(),
+      rewardMode: rm,
+      lockDays: Number(lockDays) || 7,
+      nonce,
+    });
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Retro-lock recovery: client signs+sends the lock-fees tx for an already-
+// launched mint, then calls this to update the registry. Used for tokens
+// launched before the pump_fees account-ordering fix shipped (e.g. IDK).
+app.post('/api/launch/lock-fees-finalize', async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (!b.mint?.trim() || !b.creatorWallet?.trim() || !b.lockFeesSig?.trim()) {
+      return res.status(400).json({
+        ok: false,
+        error: 'mint, creatorWallet, lockFeesSig required',
+      });
+    }
+    const out = await finalizeLockFeesOnly({
+      mint: b.mint.trim(),
+      creatorWallet: b.creatorWallet.trim(),
+      lockFeesSig: b.lockFeesSig.trim(),
+    });
+    res.json(out);
+  } catch (e) {
+    console.error(JSON.stringify({
+      ts: new Date().toISOString(),
+      message: 'launch lock-fees-finalize failed',
+      error: e.message,
+    }));
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/launch/finalize', async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (!b.createSig || !b.poolRewardSig || !b.mint || !b.creatorWallet?.trim()) {
+      return res.status(400).json({
+        ok: false,
+        error: 'createSig, poolRewardSig, mint, creatorWallet required',
+      });
+    }
+    const out = await finalizeCreatorLaunch({
+      createSig: b.createSig,
+      lockFeesSig: b.lockFeesSig || null,
+      poolRewardSig: b.poolRewardSig,
+      autoStakeSig: b.autoStakeSig || null,
+      mint: b.mint.trim(),
+      creatorWallet: b.creatorWallet.trim(),
+      rewardMode: b.rewardMode === 'token' ? 'token' : 'sol',
+      persistedMetadata: b.persistedMetadata || {},
+      metadataUri: b.metadataUri || null,
+      metadataSource: b.metadataSource || 'caller',
+      initialBuySol: Number(b.initialBuySol || 0),
+      autoStake: !!(b.autoStake === true || b.autoStake === 'true' || b.autoStake === '1'),
+      lockDays: Number(b.lockDays || 7),
+    });
+    res.json(out);
+  } catch (e) {
+    console.error(JSON.stringify({
+      ts: new Date().toISOString(),
+      message: 'launch finalize failed',
       error: e.message,
       stack: e.stack?.split('\n').slice(0, 8),
     }));

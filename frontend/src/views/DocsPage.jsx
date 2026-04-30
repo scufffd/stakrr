@@ -23,6 +23,30 @@ export default function DocsPage() {
       </section>
 
       <section style={{ marginBottom: 32 }}>
+        <h3 style={{ fontSize: 17, fontWeight: 800, margin: '0 0 10px' }}>Fee lock & 1-click launch</h3>
+        <p style={{ color: '#444', lineHeight: 1.65, fontSize: 15, margin: 0 }}>
+          Every Stakrr launch bundles three transactions into a single Phantom approval via
+          {' '}
+          <code style={{ fontFamily: 'DM Mono, monospace' }}>signAllTransactions</code>:
+          {' '}
+          (1) Pump.fun create + dev buy, (2) <code style={{ fontFamily: 'DM Mono, monospace' }}>pump_fees</code> lock-fees, and (3) Stakrr pool init + reward-mint registration.
+          The lock-fees tx calls <code style={{ fontFamily: 'DM Mono, monospace' }}>create_fee_sharing_config</code>
+          {' '} + {' '}
+          <code style={{ fontFamily: 'DM Mono, monospace' }}>update_fee_shares</code> against
+          {' '}
+          <code style={{ fontFamily: 'DM Mono, monospace', background: '#f4f4f4', padding: '2px 6px', borderRadius: 6 }}>pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ</code>,
+          migrating the on-chain <code style={{ fontFamily: 'DM Mono, monospace' }}>BondingCurve.creator</code> from the deployer wallet to a
+          {' '}
+          <code style={{ fontFamily: 'DM Mono, monospace' }}>FeeSharingConfig</code> PDA seeded by
+          {' '}
+          <code style={{ fontFamily: 'DM Mono, monospace' }}>["sharing-config", mint]</code>.
+          From that moment on, 100% of creator royalties accrue to the Stakrr staking pool — verifiable on-chain by inspecting the
+          {' '}
+          <code style={{ fontFamily: 'DM Mono, monospace' }}>FeeSharingConfig</code> account on Solscan.
+        </p>
+      </section>
+
+      <section style={{ marginBottom: 32 }}>
         <h3 style={{ fontSize: 17, fontWeight: 800, margin: '0 0 10px' }}>Launch & metadata</h3>
         <p style={{ color: '#444', lineHeight: 1.65, fontSize: 15, margin: 0 }}>
           The app tries to pin metadata from <strong>your browser</strong> to pump.fun first. If that fails (403, VPN,
@@ -49,7 +73,10 @@ export default function DocsPage() {
         <p style={{ color: '#444', lineHeight: 1.65, fontSize: 15, margin: 0 }}>
           <code style={{ fontFamily: 'DM Mono, monospace', background: '#f4f4f4', padding: '2px 6px', borderRadius: 6 }}>GET /api/tokens</code>,{' '}
           <code style={{ fontFamily: 'DM Mono, monospace', background: '#f4f4f4', padding: '2px 6px', borderRadius: 6 }}>GET /api/tokens/:mint/public</code>,{' '}
-          <code style={{ fontFamily: 'DM Mono, monospace', background: '#f4f4f4', padding: '2px 6px', borderRadius: 6 }}>POST /api/launch</code>,{' '}
+          <code style={{ fontFamily: 'DM Mono, monospace', background: '#f4f4f4', padding: '2px 6px', borderRadius: 6 }}>POST /api/launch/prepare</code> (returns create + lock-fees + pool txs together),{' '}
+          <code style={{ fontFamily: 'DM Mono, monospace', background: '#f4f4f4', padding: '2px 6px', borderRadius: 6 }}>POST /api/launch/lock-fees-finalize</code> (retro-lock for unlocked tokens),{' '}
+          <code style={{ fontFamily: 'DM Mono, monospace', background: '#f4f4f4', padding: '2px 6px', borderRadius: 6 }}>POST /api/launch/auto-stake-tx</code>,{' '}
+          <code style={{ fontFamily: 'DM Mono, monospace', background: '#f4f4f4', padding: '2px 6px', borderRadius: 6 }}>POST /api/launch/finalize</code>,{' '}
           <code style={{ fontFamily: 'DM Mono, monospace', background: '#f4f4f4', padding: '2px 6px', borderRadius: 6 }}>GET /api/wallet/:pubkey/summary</code>.
           Legacy <code style={{ fontFamily: 'DM Mono, monospace' }}>/api/pools</code> routes remain for compatibility.
         </p>

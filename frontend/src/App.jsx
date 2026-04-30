@@ -202,7 +202,7 @@ export default function App() {
               minHeight: '55vh',
             }}
           >
-            {tab === 'launch' && <LaunchView wallet={wallet} onLaunched={onSelectToken} />}
+            {tab === 'launch' && <LaunchView onLaunched={onSelectToken} />}
             {tab === 'token' && selectedMint && <PoolView mint={selectedMint} onBack={goHome} />}
             {tab === 'profile' && <UserDashboardView wallet={wallet} onSelectToken={onSelectToken} />}
             {tab === 'docs' && <DocsPage />}

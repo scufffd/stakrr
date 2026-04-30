@@ -35,7 +35,7 @@ async function main() {
   const onchain = await fetchPool({ connection, signer: authority, stakeMint });
   if (!onchain) {
     console.error(`No StakePool exists on the program for mint ${mintStr}.`);
-    console.error(`Initialize it first via /api/launch (or run init-pool).`);
+    console.error(`Initialize it first via the launch flow (POST /api/launch/prepare … finalize) or run init-pool.`);
     process.exit(2);
   }
 

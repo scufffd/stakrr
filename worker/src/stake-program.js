@@ -81,12 +81,48 @@ export async function detectTokenProgram(connection, mint) {
   throw new Error(`Mint ${mint.toBase58()} is not SPL / Token-2022`);
 }
 
+/**
+ * Same as `detectTokenProgram` but returns a fallback when the mint isn't on
+ * chain yet. Used by the launch flow to pre-build the pool tx in parallel
+ * with the Pump create tx (so we can bundle them into a single Phantom
+ * prompt).
+ *
+ * IMPORTANT: pump.fun bonding-curve tokens are owned by **Token-2022**
+ * (TokenzQd…) — verifiable on any pump mint. Callers that pre-build pool
+ * txs for fresh pump mints MUST pass `fallback = TOKEN_2022_PROGRAM_ID`,
+ * otherwise the resulting `stakeVault` ATA will be derived under the
+ * wrong token program and the InitializePool ix fails simulation with
+ * "incorrect program id for instruction" (the ATA program tries to call
+ * GetAccountDataSize on the mint via classic SPL Token, which doesn't own
+ * it). Existing mints always get the real owner check.
+ */
+export async function detectTokenProgramOr(connection, mint, fallback = TOKEN_PROGRAM_ID) {
+  const info = await connection.getAccountInfo(mint, 'confirmed');
+  if (!info) return fallback;
+  if (info.owner.equals(TOKEN_2022_PROGRAM_ID)) return TOKEN_2022_PROGRAM_ID;
+  if (info.owner.equals(TOKEN_PROGRAM_ID)) return TOKEN_PROGRAM_ID;
+  throw new Error(`Mint ${mint.toBase58()} is not SPL / Token-2022`);
+}
+
 function keypairWallet(keypair) {
   return {
     publicKey: keypair.publicKey,
     signTransaction: async (tx) => { tx.partialSign(keypair); return tx; },
     signAllTransactions: async (txs) => txs.map((tx) => { tx.partialSign(keypair); return tx; }),
   };
+}
+
+function readOnlyWallet() {
+  return {
+    publicKey: config.programId,
+    signTransaction: async (tx) => tx,
+    signAllTransactions: async (txs) => txs,
+  };
+}
+
+/** @param {import('@solana/web3.js').Keypair | PublicKey} k */
+export function pubkeyOf(k) {
+  return k instanceof PublicKey ? k : k.publicKey;
 }
 
 export function loadProgram(connection, signerKeypair) {
@@ -97,17 +133,35 @@ export function loadProgram(connection, signerKeypair) {
   return new Program(loadIdl(), provider);
 }
 
+/** Program handle for account reads and unsigned ix builds (no real signer). */
+export function loadProgramReadOnly(connection) {
+  const provider = new AnchorProvider(connection, readOnlyWallet(), {
+    commitment: 'confirmed',
+    preflightCommitment: 'confirmed',
+  });
+  return new Program(loadIdl(), provider);
+}
+
 // --- Instruction builders ---------------------------------------------------
 
-export async function initializePoolIx({ connection, authority, stakeMint }) {
-  const program = loadProgram(connection, authority);
-  const tokenProgram = await detectTokenProgram(connection, stakeMint);
+export async function initializePoolIx({
+  connection,
+  authority,
+  stakeMint,
+  allowMissingMint = false,
+  fallbackTokenProgram = TOKEN_2022_PROGRAM_ID,
+}) {
+  const program = loadProgramReadOnly(connection);
+  const authorityPk = pubkeyOf(authority);
+  const tokenProgram = allowMissingMint
+    ? await detectTokenProgramOr(connection, stakeMint, fallbackTokenProgram)
+    : await detectTokenProgram(connection, stakeMint);
   const pool = findPoolPda(stakeMint);
   const stakeVault = getAssociatedTokenAddressSync(stakeMint, pool, true, tokenProgram);
   const ix = await program.methods
     .initializePool()
     .accounts({
-      authority: authority.publicKey,
+      authority: authorityPk,
       stakeMint,
       pool,
       stakeVault,
@@ -120,9 +174,19 @@ export async function initializePoolIx({ connection, authority, stakeMint }) {
   return { ix, pool, stakeVault, tokenProgram };
 }
 
-export async function addRewardMintIx({ connection, authority, stakeMint, rewardMint }) {
-  const program = loadProgram(connection, authority);
-  const tokenProgram = await detectTokenProgram(connection, rewardMint);
+export async function addRewardMintIx({
+  connection,
+  authority,
+  stakeMint,
+  rewardMint,
+  allowMissingMint = false,
+  fallbackTokenProgram = TOKEN_2022_PROGRAM_ID,
+}) {
+  const program = loadProgramReadOnly(connection);
+  const authorityPk = pubkeyOf(authority);
+  const tokenProgram = allowMissingMint
+    ? await detectTokenProgramOr(connection, rewardMint, fallbackTokenProgram)
+    : await detectTokenProgram(connection, rewardMint);
   const pool = findPoolPda(stakeMint);
   const rewardMintPda = findRewardMintPda(pool, rewardMint);
   const rewardVault = getAssociatedTokenAddressSync(rewardMint, pool, true, tokenProgram);
@@ -130,7 +194,7 @@ export async function addRewardMintIx({ connection, authority, stakeMint, reward
     .addRewardMint()
     .accounts({
       pool,
-      authority: authority.publicKey,
+      authority: authorityPk,
       rewardTokenMint: rewardMint,
       rewardMint: rewardMintPda,
       rewardVault,
@@ -144,12 +208,13 @@ export async function addRewardMintIx({ connection, authority, stakeMint, reward
 }
 
 export async function depositRewardsIx({ connection, funder, stakeMint, rewardMint, amountLamports }) {
-  const program = loadProgram(connection, funder);
+  const program = loadProgramReadOnly(connection);
+  const funderPk = pubkeyOf(funder);
   const tokenProgram = await detectTokenProgram(connection, rewardMint);
   const pool = findPoolPda(stakeMint);
   const rewardMintPda = findRewardMintPda(pool, rewardMint);
   const vault = getAssociatedTokenAddressSync(rewardMint, pool, true, tokenProgram);
-  const funderAta = getAssociatedTokenAddressSync(rewardMint, funder.publicKey, false, tokenProgram);
+  const funderAta = getAssociatedTokenAddressSync(rewardMint, funderPk, false, tokenProgram);
   const ix = await program.methods
     .depositRewards(new BN(amountLamports.toString()))
     .accounts({
@@ -157,7 +222,7 @@ export async function depositRewardsIx({ connection, funder, stakeMint, rewardMi
       rewardMint: rewardMintPda,
       mint: rewardMint,
       vault,
-      funder: funder.publicKey,
+      funder: funderPk,
       funderTokenAccount: funderAta,
       tokenProgram,
     })
@@ -172,7 +237,7 @@ export async function depositRewardsIx({ connection, funder, stakeMint, rewardMi
  */
 export async function stakeForIx({
   connection,
-  payer,           // Keypair (signer) — treasury
+  payer,           // Keypair | PublicKey — pays + signs stake_for
   stakeMint,
   beneficiary,     // PublicKey — wallet that will own the position
   amountRaw,       // bigint | string | number — raw token units
@@ -182,11 +247,12 @@ export async function stakeForIx({
   if (!VALID_LOCK_DAYS.has(Number(lockDays))) {
     throw new Error(`Invalid lock tier: ${lockDays}`);
   }
-  const program = loadProgram(connection, payer);
+  const program = loadProgramReadOnly(connection);
+  const payerPk = pubkeyOf(payer);
   const tokenProgram = await detectTokenProgram(connection, stakeMint);
   const pool = findPoolPda(stakeMint);
   const stakeVault = getAssociatedTokenAddressSync(stakeMint, pool, true, tokenProgram);
-  const payerTokenAccount = getAssociatedTokenAddressSync(stakeMint, payer.publicKey, false, tokenProgram);
+  const payerTokenAccount = getAssociatedTokenAddressSync(stakeMint, payerPk, false, tokenProgram);
   const position = findPositionPda(pool, beneficiary, nonce);
   const nonceBn = BN.isBN(nonce) ? nonce : new BN(nonce);
   const ix = await program.methods
@@ -195,7 +261,7 @@ export async function stakeForIx({
       pool,
       stakeMint,
       stakeVault,
-      payer: payer.publicKey,
+      payer: payerPk,
       payerTokenAccount,
       position,
       tokenProgram,
@@ -212,12 +278,13 @@ export async function stakeForIx({
  */
 export async function primeCheckpointIx({
   connection,
-  payer,           // Keypair — pays rent / signs
+  payer,           // Keypair | PublicKey — pays rent / signs
   stakeMint,
   position,
   rewardTokenMint,
 }) {
-  const program = loadProgram(connection, payer);
+  const program = loadProgramReadOnly(connection);
+  const payerPk = pubkeyOf(payer);
   const pool = findPoolPda(stakeMint);
   const rewardMintPda = findRewardMintPda(pool, rewardTokenMint);
   const checkpoint = findCheckpointPda(position, rewardMintPda);
@@ -228,7 +295,7 @@ export async function primeCheckpointIx({
       rewardMint: rewardMintPda,
       position,
       checkpoint,
-      payer: payer.publicKey,
+      payer: payerPk,
       systemProgram: SystemProgram.programId,
       rent: SYSVAR_RENT_PUBKEY,
     })
@@ -236,21 +303,21 @@ export async function primeCheckpointIx({
   return { ix, checkpoint, rewardMintPda };
 }
 
-export async function fetchPool({ connection, signer, stakeMint }) {
-  const program = loadProgram(connection, signer);
+export async function fetchPool({ connection, signer: _signerIgnored, stakeMint }) {
+  const program = loadProgramReadOnly(connection);
   const pool = findPoolPda(stakeMint);
   return program.account.stakePool.fetchNullable(pool);
 }
 
-export async function fetchRewardMint({ connection, signer, stakeMint, rewardMint }) {
-  const program = loadProgram(connection, signer);
+export async function fetchRewardMint({ connection, signer: _signerIgnored, stakeMint, rewardMint }) {
+  const program = loadProgramReadOnly(connection);
   const pool = findPoolPda(stakeMint);
   const rewardMintPda = findRewardMintPda(pool, rewardMint);
   return program.account.rewardMint.fetchNullable(rewardMintPda);
 }
 
-export async function fetchActivePositions({ connection, signer, stakeMint }) {
-  const program = loadProgram(connection, signer);
+export async function fetchActivePositions({ connection, signer: _signerIgnored, stakeMint }) {
+  const program = loadProgramReadOnly(connection);
   const pool = findPoolPda(stakeMint);
   // Position layout: [discriminator(8)][bump(1)][pool(32)] -> filter offset 9.
   const all = await program.account.stakePosition.all([

@@ -9,19 +9,19 @@ Anyone can launch a token via Pump.fun and instantly get a public staking pool w
 ## How it works
 
 1. Creator launches a token through Stakrr
-   - Stakrr calls the Pump.fun create endpoint via [PumpDev](https://pumpdev.io/)
-   - The platform treasury wallet is set as the on-chain creator-fee receiver
-   - Stakrr then calls `initialize_pool` on the staking program for the new mint
-   - `add_reward_mint(wSOL)` is registered so the pool can pay rewards in wrapped SOL
+   - The connected wallet pays for **everything** — Pump.fun create, the pump_fees lock, the staking pool init. The platform treasury is never charged.
+   - The frontend calls `POST /api/launch/prepare`, which returns three unsigned transactions: (a) Pump.fun create + dev buy, (b) `pump_fees create_fee_sharing_config + update_fee_shares`, (c) Stakrr `initialize_pool + add_reward_mint`.
+   - The wallet adapter calls `signAllTransactions(...)` once → Phantom shows a **single approval dialog** listing all three txs ("1-click launch"). The frontend then sends them sequentially with confirm-between.
+   - The lock-fees tx migrates the on-chain `BondingCurve.creator` from the deployer to a `FeeSharingConfig` PDA (seeded by `["sharing-config", mint]` under `pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ`). 100% of creator royalties from that point forward route to the configured recipient — by default, `LOCK_FEES_RECIPIENT` (which falls back to the platform treasury). The deployer cannot redirect them.
+   - On `finalize`, the worker verifies the `FeeSharingConfig` matches the expected recipient and persists `feeLock` metadata to the registry.
+   - Optional auto-stake of the dev buy is a separate prompt (its amount depends on the actual ATA balance after the Pump buy lands).
 2. Holders stake the new token
-   - Standard pob-index-stake flow (lock tiers, multipliers, claims)
+   - Standard pob-index-stake flow (lock tiers, multipliers, claims).
 3. Creator fees auto-route to stakers
-   - Worker periodically claims accumulated creator fees from Pump.fun
-   - 2% platform fee is sent to the platform treasury
-   - 98% is wrapped to wSOL and deposited as rewards into the pool
-   - Worker pushes rewards to active stakers via `claim_push`
+   - Worker periodically calls Pump's `distribute_creator_fees` for each fee-locked pool — fees are routed by the `pump_fees` program to the configured shareholders (treasury). For older non-locked pools, the worker still falls back to PumpDev `claim-account`.
+   - 2% platform fee stays with the treasury; the rest is wrapped to wSOL (or swapped to the launched token if the pool is in `token` reward mode) and deposited as rewards via `deposit_rewards` + `claim_push`.
 4. Stakers claim rewards
-   - wSOL is auto-unwrapped to native SOL on payout (or claimed as wSOL by their wallet)
+   - wSOL is auto-unwrapped to native SOL on payout (or claimed as wSOL by their wallet).
 
 ## Architecture
 
@@ -29,15 +29,16 @@ Anyone can launch a token via Pump.fun and instantly get a public staking pool w
 [Creator]
    │ launch token
    ▼
-[Stakrr Frontend] ───► [PumpDev API] ───► [Pump.fun Token]
-   │
-   │ init pool + add wSOL reward
+[Stakrr Frontend] ─signAllTransactions──► [Pump.fun create]
+   │ (1 Phantom prompt, 3 txs)            [pump_fees lock-fees]
+   │                                      [Stakrr init pool + reward]
    ▼
 [pob-index-stake program]
    ▲
-   │ deposit_rewards (wSOL), claim_push
+   │ deposit_rewards (wSOL or token), claim_push
    │
-[Stakrr Worker] ◄── claim creator fees ◄── [Platform Treasury]
+[Stakrr Worker] ◄── distribute_creator_fees ◄── [pump_fees FeeSharingConfig PDA]
+                                                 (100% → treasury, immutable on-chain)
 ```
 
 ## Repo layout
@@ -66,12 +67,14 @@ See `worker/.env.example` for required environment variables.
 
 Key env vars:
 
-- `PLATFORM_TREASURY_PRIVATE_KEY` — pays for token creates, becomes the Pump.fun creator-fee receiver
-- `PLATFORM_AUTHORITY_PRIVATE_KEY` — owns each `StakePool` (passes as `authority` on `initialize_pool`)
-- `PUMPDEV_API_KEY` — Pump.fun integration
+- `PLATFORM_TREASURY_PRIVATE_KEY` — receives the 2% platform fee + (by default) 100% of creator royalties via the `pump_fees` `FeeSharingConfig` PDA. Does **not** pay for any launches.
+- `PLATFORM_AUTHORITY_PRIVATE_KEY` — worker-side signer for `claim_push`, reward deposits, etc. Each `StakePool` authority is the launching wallet (creator-funded), not this key.
+- `PUMPDEV_API_KEY` — Pump.fun integration (still used for metadata / fallback claim path)
 - `STAKE_PROGRAM_ID` — `65YrGaBL5ukm4SVcsEBoUgnqTrNXy2pDiPKeQKjSexVA`
 - `WSOL_MINT` — `So11111111111111111111111111111111111111112`
 - `PLATFORM_FEE_BPS` — defaults to `200` (2%)
+- `LOCK_FEES_ENABLED` — `true` (default) wires every new launch through the `pump_fees` lock so creator royalties cannot be redirected away from the staking pool
+- `LOCK_FEES_RECIPIENT` — pubkey that receives 100% of creator royalties (defaults to the treasury)
 
 ## Progress tracker
 
@@ -86,6 +89,9 @@ Each phase is committed and pushed; this section is the source of truth for "wha
 - [x] Phase 3d — Token page template (header, stat strip, two-column body, pump.fun buy link)
 - [x] Phase 3e — Reward-mode picker on launch: stakers earn either **SOL** (current default — fees are wrapped to wSOL and deposited as rewards, auto-unwrapped on claim) or **the launched token** (buyback-and-distribute — worker swaps claimed fees to the token via Pump.fun and deposits them as rewards)
 - [x] Phase 3f — DexScreener pre-claim probe: each cycle queries the token's DexScreener pair and skips PumpDev `claim-account` calls when no fresh creator-fee volume has accrued since the last successful claim. Saves ~0.0026 SOL per skipped no-op claim and avoids "transaction already processed" loops on quiet pools.
+- [x] Phase 3g — Creator-funded launches: connected wallet pays all on-chain SOL (Pump create, dev buy, fee lock, pool init), treasury is never charged. `assertLaunchBalances` preflights wallet balance with actionable error messages.
+- [x] Phase 3h — pump_fees lock-fees integration: every launch migrates `BondingCurve.creator` from the deployer to a `FeeSharingConfig` PDA, immutably routing 100% of creator royalties to `LOCK_FEES_RECIPIENT` (treasury by default). Worker uses Pump's `distribute_creator_fees` for locked pools and falls back to PumpDev `claim-account` for legacy un-locked pools.
+- [x] Phase 3i — 1-click bundled launch: `signAllTransactions` signs Pump create + lock-fees + pool init in a single Phantom prompt. `/api/launch/lock-fees-finalize` exposes a retro-lock path for tokens that launched before the lock shipped.
 - [ ] Phase 4 — Hosting (DO server, separate pm2 namespace, nginx vhost), domain selection
 - [ ] Phase 5 — Faith integration (announce launches, scan pools)
 

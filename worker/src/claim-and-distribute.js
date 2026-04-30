@@ -1,6 +1,9 @@
-// Per-pool: claim creator fees from Pump.fun, take platform fee, wrap remaining
-// SOL into wSOL, deposit_rewards into the wSOL reward vault, then push claims
-// to active stakers via claim_push.
+// Per-pool: for Stakrr-locked tokens (BondingCurve.creator = FeeSharingConfig PDA),
+// PumpDev /api/claim-distribute settles the share vaults to all configured
+// recipients (treasury gets 100%); the legacy /api/claim-account is then a no-op
+// and we skip it. For un-locked legacy tokens we still call /api/claim-account
+// against the treasury wallet. After settlement: split platform / stakers, wrap,
+// deposit_rewards, then claim_push when the pool authority is the platform.
 
 import {
   ComputeBudgetProgram,
@@ -18,7 +21,7 @@ import {
 } from '@solana/spl-token';
 import { config, authoritySigner } from './config.js';
 import { wrapSolIxs } from './wsol.js';
-import { buildClaimCreatorFeesTx, buildBuyTokenTx } from './pumpdev.js';
+import { buildClaimCreatorFeesTx, buildClaimDistributeTx, buildBuyTokenTx } from './pumpdev.js';
 import { shouldAttemptClaim } from './dexscreener.js';
 import {
   depositRewardsIx,
@@ -47,28 +50,54 @@ async function getSolBalance(connection, pubkey) {
   return BigInt(await connection.getBalance(pubkey, 'confirmed'));
 }
 
-async function claimCreatorFees(connection, treasury, { mint } = {}) {
+async function claimCreatorFees(connection, treasury, { mint, feeLocked = false } = {}) {
   const beforeLamports = await getSolBalance(connection, treasury.publicKey);
   let signature = null;
+  let distributeSig = null;
   try {
-    const vt = await buildClaimCreatorFeesTx({
-      publicKey: treasury.publicKey.toBase58(),
-      mint, // required if fee-sharing is configured for this token
-    });
-    vt.sign([treasury]);
-    signature = await connection.sendRawTransaction(vt.serialize(), { skipPreflight: false });
-    await connection.confirmTransaction(signature, 'confirmed');
+    // Fee-sharing tokens: settle vault → shareholders first (PumpDev claim-distribute).
+    // https://pumpdev.io/claim-distribute — harmless to skip if mint has no share config.
+    if (mint) {
+      try {
+        const dist = await buildClaimDistributeTx({
+          publicKey: treasury.publicKey.toBase58(),
+          mint,
+        });
+        dist.sign([treasury]);
+        distributeSig = await connection.sendRawTransaction(dist.serialize(), {
+          skipPreflight: false,
+          maxRetries: 2,
+        });
+        await connection.confirmTransaction(distributeSig, 'confirmed');
+        log('claim: claim-distribute ok', { mint, sig: distributeSig });
+      } catch (e) {
+        log('claim: claim-distribute skipped', { mint, error: e.message });
+      }
+    }
+
+    // Locked tokens have no per-creator vault to claim from — the BC creator is
+    // the FeeSharingConfig PDA, and claim-distribute already routed to
+    // shareholders. Skip the legacy /api/claim-account call entirely.
+    if (!feeLocked) {
+      const vt = await buildClaimCreatorFeesTx({
+        publicKey: treasury.publicKey.toBase58(),
+        mint,
+      });
+      vt.sign([treasury]);
+      signature = await connection.sendRawTransaction(vt.serialize(), { skipPreflight: false });
+      await connection.confirmTransaction(signature, 'confirmed');
+    }
   } catch (e) {
     log('claim: pumpdev claim failed', { error: e.message });
-    return { claimedLamports: 0n, signature: null };
+    return { claimedLamports: 0n, signature: null, distributeSig };
   }
   const afterLamports = await getSolBalance(connection, treasury.publicKey);
   const delta = afterLamports - beforeLamports;
   // Subtract a tx-fee floor; if delta is negative or tiny, treat as zero.
   if (delta < 5_000n) {
-    return { claimedLamports: 0n, signature };
+    return { claimedLamports: 0n, signature, distributeSig };
   }
-  return { claimedLamports: delta, signature };
+  return { claimedLamports: delta, signature, distributeSig };
 }
 
 function splitFees(claimedLamports) {
@@ -322,6 +351,22 @@ export async function runPoolCycle({ pool }) {
   const treasury = config.treasuryKeypair;
   const authority = authoritySigner();
 
+  // Locked tokens route fees via FeeSharingConfig → claim-distribute settles
+  // straight to the configured shareholders, so the pumpFeeClaimer mismatch
+  // warning is irrelevant here.
+  if (
+    !pool.feeLock
+    && pool.launchFunding !== 'creator'
+    && pool.pumpFeeClaimer
+    && pool.pumpFeeClaimer !== treasury.publicKey.toBase58()
+  ) {
+    log('cycle: WARNING pumpFeeClaimer in registry differs from PLATFORM_TREASURY — worker still signs claims with treasury', {
+      stakeMint: pool.stakeMint,
+      pumpFeeClaimer: pool.pumpFeeClaimer,
+      treasury: treasury.publicKey.toBase58(),
+    });
+  }
+
   const onchain = await fetchPool({ connection, signer: authority, stakeMint });
   if (!onchain) {
     log('cycle: pool not initialized', { stakeMint: pool.stakeMint });
@@ -386,16 +431,19 @@ export async function runPoolCycle({ pool }) {
   }
 
   // 2) Claim creator fees. We pass the pool's stakeMint so PumpDev uses the
-  //    correct claim instruction when fee-sharing is configured.
-  const { claimedLamports, signature: claimSig } = await claimCreatorFees(
+  //    correct claim instruction when fee-sharing is configured. Locked tokens
+  //    rely entirely on claim-distribute (the BC creator is a PDA, not the
+  //    treasury) so we skip the legacy claim-account call for them.
+  const { claimedLamports, signature: claimSig, distributeSig } = await claimCreatorFees(
     connection,
     treasury,
-    { mint: pool.stakeMint },
+    { mint: pool.stakeMint, feeLocked: !!pool.feeLock },
   );
   log('cycle: claimed', {
     stakeMint: pool.stakeMint,
     claimedLamports: claimedLamports.toString(),
     claimSig,
+    distributeSig,
   });
   if (claimedLamports > 0n) {
     updatePoolFields(pool.stakeMint, { lastClaimedAt: new Date().toISOString() });
@@ -451,11 +499,20 @@ export async function runPoolCycle({ pool }) {
     }
   }
 
-  // 3) Push to stakers (only if we deposited).
+  // 3) Push to stakers (only if we deposited and platform owns the pool — claim_push signs as authority).
   let pushResult = { pushed: 0, skipped: 0, txSigs: [] };
   if (depositSig) {
-    pushResult = await pushClaimsToActiveStakers({ connection, stakeMint, rewardMint });
-    log('cycle: pushed claims', { stakeMint: pool.stakeMint, ...pushResult });
+    const poolAuthorityMatches = onchain.authority.equals(authority.publicKey);
+    if (poolAuthorityMatches) {
+      pushResult = await pushClaimsToActiveStakers({ connection, stakeMint, rewardMint });
+      log('cycle: pushed claims', { stakeMint: pool.stakeMint, ...pushResult });
+    } else {
+      log('cycle: skipping claim_push (pool authority is not platform authority; stakers claim from UI)', {
+        stakeMint: pool.stakeMint,
+        poolAuthority: onchain.authority.toBase58(),
+        workerAuthority: authority.publicKey.toBase58(),
+      });
+    }
   }
 
   // 4) Update metrics. We bookkeep SOL-denominated metrics regardless (so the
@@ -481,6 +538,7 @@ export async function runPoolCycle({ pool }) {
     rewardsDepositedRaw,
     rewardsDepositedLabel,
     claimSig,
+    distributeSig,
     buySig,
     depositSig,
     pushedClaims: pushResult.pushed,
@@ -494,6 +552,7 @@ export async function runPoolCycle({ pool }) {
     platformFeeLamports: platform.toString(),
     rewardsDepositedRaw,
     claimSig,
+    distributeSig,
     buySig,
     depositSig,
     pushedClaims: pushResult.pushed,

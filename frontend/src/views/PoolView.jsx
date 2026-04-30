@@ -212,6 +212,13 @@ export default function PoolView({ mint, onBack }) {
                   value={token.rewardMode === 'token' ? `$${meta.symbol || 'TKN'} (buyback)` : 'SOL (wSOL → SOL on claim)'}
                 />
                 <DetailRow label="Reward mint" value={token.rewardMint} mono />
+                {token.pumpFeeClaimer && (
+                  <DetailRow
+                    label="Creator fee wallet"
+                    value={token.pumpFeeClaimer}
+                    mono
+                  />
+                )}
                 <DetailRow label="Platform fee" value={`${(token.platformFeeBps || 200) / 100}%`} />
                 {token.rewardMode === 'token' ? (
                   <>

@@ -31,6 +31,21 @@ export function parseKeypair(value, label) {
   return Keypair.fromSecretKey(bs58.decode(trimmed));
 }
 
+function jsonObjectEnv(key) {
+  const raw = optional(key, '').trim();
+  if (!raw) return {};
+  try {
+    const o = JSON.parse(raw);
+    if (o == null || typeof o !== 'object' || Array.isArray(o)) {
+      throw new Error(`${key} must be a JSON object`);
+    }
+    return o;
+  } catch (e) {
+    if (e.message?.includes('must be a JSON')) throw e;
+    throw new Error(`${key}: invalid JSON (${e.message})`);
+  }
+}
+
 export const config = {
   rpcUrl: required('RPC_URL'),
   stakeRpcUrl: optional('STAKE_RPC_URL', '') || required('RPC_URL'),
@@ -46,11 +61,25 @@ export const config = {
   pumpdev: {
     base: optional('PUMPDEV_API_BASE', 'https://pumpdev.io'),
     apiKey: optional('PUMPDEV_API_KEY', ''),
+    /** Merged into POST /api/create (e.g. Pump fee-share fields). See PumpDev docs / support. */
+    createExtra: jsonObjectEnv('PUMPDEV_CREATE_EXTRA_JSON'),
   },
 
   platformFeeBps: intEnv('PLATFORM_FEE_BPS', 200),
   launchFeeLamports: intEnv('LAUNCH_FEE_LAMPORTS', 0),
   minDistributeLamports: intEnv('MIN_DISTRIBUTE_LAMPORTS', 2_000_000),
+
+  // Pump fee-share lock (see pump-fees.js). When `lockFees.enabled` is true,
+  // every Stakrr launch runs `pump_fees::create_fee_sharing_config` +
+  // `update_fee_shares` after the Pump create, migrating the on-chain
+  // BondingCurve.creator from the deployer wallet to a FeeSharingConfig PDA.
+  // 100% of creator royalties then route to PLATFORM_TREASURY by default;
+  // override via LOCK_FEES_RECIPIENT to send to a different address (e.g. a
+  // Stakrr DAO treasury).
+  lockFees: {
+    enabled: (optional('LOCK_FEES_ENABLED', 'true').toLowerCase() !== 'false'),
+    recipient: optional('LOCK_FEES_RECIPIENT', '').trim() || null,
+  },
 
   loopIntervalMs: intEnv('LOOP_INTERVAL_MS', 600_000),
   priorityFeeMicroLamports: intEnv('PRIORITY_FEE_MICROLAMPORTS', 10_000),
