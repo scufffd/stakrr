@@ -122,15 +122,22 @@ export default function App() {
   const isHome = tab === 'home';
 
   // Pull live worker config so the AdminPresaleView can verify the
-  // connected wallet matches the configured admin (real auth is the
-  // x-admin-wallet header on the API; this is just a UX guard).
-  const [adminWallet, setAdminWallet] = useState(null);
+  // connected wallet matches one of the configured admins (real auth is
+  // the x-admin-wallet header on the API; this is just a UX guard).
+  // The worker exposes both `adminWallet` (legacy single-string) and
+  // `adminWallets` (string[]); we prefer the list and fall back if absent.
+  const [adminWallets, setAdminWallets] = useState([]);
   useEffect(() => {
     let cancelled = false;
     fetch(apiUrl('/api/info'))
       .then((r) => (r.ok ? r.json() : null))
       .then((j) => {
-        if (!cancelled && j?.ok) setAdminWallet(j.adminWallet || null);
+        if (cancelled || !j?.ok) return;
+        if (Array.isArray(j.adminWallets) && j.adminWallets.length > 0) {
+          setAdminWallets(j.adminWallets);
+        } else if (j.adminWallet) {
+          setAdminWallets([j.adminWallet]);
+        }
       })
       .catch(() => {});
     return () => { cancelled = true; };
@@ -201,7 +208,7 @@ export default function App() {
             {tab === 'profile' && <UserDashboardView wallet={wallet} onSelectToken={onSelectToken} />}
             {tab === 'docs' && <DocsPage />}
             {tab === 'admin-presale' && (
-              <AdminPresaleView adminWallet={adminWallet} />
+              <AdminPresaleView adminWallets={adminWallets} />
             )}
           </div>
 

@@ -109,6 +109,7 @@ app.get('/api/info', (req, res) => {
     feeRecipient: config.lockFees.recipient || config.treasuryKeypair.publicKey.toBase58(),
     platformFeeVault: config.platformFeeVault?.toBase58() || null,
     adminWallet: config.adminWallet?.toBase58() || null,
+    adminWallets: config.adminWallets.map((p) => p.toBase58()),
     lockFeesEnabled: config.lockFees.enabled,
     platformFeeBps: config.platformFeeBps,
     minDistributeLamports: config.minDistributeLamports,
@@ -128,11 +129,12 @@ app.get('/api/info', (req, res) => {
  * scanning for presale contributors via our infra.
  */
 function requireAdmin(req, res, next) {
-  if (!config.adminWallet) {
+  if (config.adminWallets.length === 0) {
     return res.status(503).json({ ok: false, error: 'admin endpoints disabled (ADMIN_WALLET unset)' });
   }
   const header = (req.get('x-admin-wallet') || '').trim();
-  if (!header || header !== config.adminWallet.toBase58()) {
+  const allowed = new Set(config.adminWallets.map((p) => p.toBase58()));
+  if (!header || !allowed.has(header)) {
     return res.status(403).json({ ok: false, error: 'admin auth required' });
   }
   return next();

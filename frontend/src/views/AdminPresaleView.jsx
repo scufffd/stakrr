@@ -87,7 +87,7 @@ async function waitForDevBuyBag({ connection, mint, owner, attempts = 12, delayM
   return { decimals: mi.decimals, ataBalanceRaw: '0', programId: programId.toBase58() };
 }
 
-export default function AdminPresaleView({ adminWallet }) {
+export default function AdminPresaleView({ adminWallets = [] }) {
   const wallet = useWallet();
   const { connection } = useConnection();
 
@@ -112,9 +112,9 @@ export default function AdminPresaleView({ adminWallet }) {
   const chainStartedRef = useRef(false);
 
   const isAdmin = useMemo(() => {
-    if (!adminWallet || !wallet.publicKey) return false;
-    return wallet.publicKey.toBase58() === adminWallet;
-  }, [adminWallet, wallet.publicKey]);
+    if (!adminWallets.length || !wallet.publicKey) return false;
+    return adminWallets.includes(wallet.publicKey.toBase58());
+  }, [adminWallets, wallet.publicKey]);
 
   function appendLog(msg, level = 'info') {
     setPhaseLog((prev) => [...prev, { when: Date.now(), msg, level }]);
@@ -292,7 +292,7 @@ export default function AdminPresaleView({ adminWallet }) {
       </div>
     );
   }
-  if (!adminWallet) {
+  if (adminWallets.length === 0) {
     return (
       <div style={{ maxWidth: 640, margin: '0 auto', textAlign: 'center', color: ERR, padding: '40px 0' }}>
         <h2 style={{ fontWeight: 800, fontSize: 24, marginBottom: 12, color: INK }}>Admin · launch + presale auto-stake</h2>
@@ -305,8 +305,13 @@ export default function AdminPresaleView({ adminWallet }) {
       <div style={{ maxWidth: 640, margin: '0 auto', textAlign: 'center', color: ERR, padding: '40px 0' }}>
         <h2 style={{ fontWeight: 800, fontSize: 24, marginBottom: 12, color: INK }}>Admin · launch + presale auto-stake</h2>
         <p>
-          Connected wallet is not the configured admin. Required:{' '}
-          <code style={{ fontFamily: 'DM Mono, monospace' }}>{shortPk(adminWallet)}</code>
+          Connected wallet is not in the admin list. Allowed admin{adminWallets.length === 1 ? '' : 's'}:{' '}
+          {adminWallets.map((w, i) => (
+            <React.Fragment key={w}>
+              {i > 0 && ', '}
+              <code style={{ fontFamily: 'DM Mono, monospace' }}>{shortPk(w)}</code>
+            </React.Fragment>
+          ))}
         </p>
       </div>
     );

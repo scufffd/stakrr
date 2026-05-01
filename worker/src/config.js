@@ -105,16 +105,29 @@ export const config = {
   })(),
 
   /**
-   * Wallet allowed to use admin-only API endpoints (e.g. presale auto-stake).
-   * When unset, those endpoints reject all requests. Verified by checking
-   * the `x-admin-wallet` header against this pubkey *and* requiring a
-   * recent (≤60s) signed nonce so we don't trust a header alone.
+   * `ADMIN_WALLET` is comma-separated to support multiple admin operators
+   * (e.g. founder + ops alt). Each entry must be a valid base58 pubkey.
+   * Backward-compatible: a single wallet still parses correctly.
+   *
+   * `adminWallet` (singular, first entry) is kept for any code/UI that
+   * still treats the admin as a single value; new code should iterate
+   * `adminWallets` to allow N admins.
    */
-  adminWallet: (() => {
-    const v = optional('ADMIN_WALLET', '').trim();
-    if (!v) return null;
-    try { return new PublicKey(v); } catch { throw new Error(`ADMIN_WALLET is not a valid pubkey: ${v}`); }
+  adminWallets: (() => {
+    const raw = optional('ADMIN_WALLET', '').trim();
+    if (!raw) return [];
+    return raw
+      .split(/[,\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((v) => {
+        try { return new PublicKey(v); }
+        catch { throw new Error(`ADMIN_WALLET entry is not a valid pubkey: ${v}`); }
+      });
   })(),
+  get adminWallet() {
+    return this.adminWallets[0] || null;
+  },
 
   // Pump fee-share lock (see pump-fees.js). When `lockFees.enabled` is true,
   // every Stakrr launch runs `pump_fees::create_fee_sharing_config` +
