@@ -1,5 +1,5 @@
-import { Connection, PublicKey } from '@solana/web3.js';
-import { config, authoritySigner } from './config.js';
+import { PublicKey } from '@solana/web3.js';
+import { authoritySigner, getConnection } from './config.js';
 import { listPools, readRecentEvents } from './registry.js';
 import { fetchOwnerPositionsInPool } from './stake-program.js';
 
@@ -38,7 +38,7 @@ export async function buildWalletSummary(walletB58) {
       createdAt: p.createdAt,
     }));
 
-  const connection = new Connection(config.stakeRpcUrl, 'confirmed');
+  const connection = getConnection();
   const authority = authoritySigner();
 
   const staked = [];

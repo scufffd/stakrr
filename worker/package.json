@@ -12,7 +12,8 @@
     "register-pool": "node scripts/register-pool.js",
     "list-pools": "node scripts/list-pools.js",
     "init-pool": "node scripts/init-pool.js",
-    "check": "node --check src/config.js && node --check src/registry.js && node --check src/pumpdev.js && node --check src/pumpfun-ipfs.js && node --check src/pump-fees.js && node --check src/wsol.js && node --check src/stake-program.js && node --check src/vanity-mints.js && node --check src/wallet-summary.js && node --check src/launch.js && node --check src/claim-and-distribute.js && node --check src/run-loop.js && node --check src/server.js"
+    "prune-vanity": "node scripts/prune-vanity.js",
+    "check": "node --check src/config.js && node --check src/registry.js && node --check src/pumpdev.js && node --check src/pumpfun-ipfs.js && node --check src/pump-fees.js && node --check src/wsol.js && node --check src/stake-program.js && node --check src/vanity-mints.js && node --check src/wallet-summary.js && node --check src/launch.js && node --check src/claim-and-distribute.js && node --check src/run-loop.js && node --check src/server.js && node --check src/rpc-multiplex.js"
   },
   "engines": {
     "node": ">=18"

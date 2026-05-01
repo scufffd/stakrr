@@ -8,13 +8,13 @@
 
 import {
   ComputeBudgetProgram,
-  Connection,
+  Keypair,
   PublicKey,
   Transaction,
 } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { getAccount, getAssociatedTokenAddressSync } from '@solana/spl-token';
-import { config } from './config.js';
+import { config, getConnection } from './config.js';
 import { buildCreateTokenTx } from './pumpdev.js';
 import { uploadMetadata } from './pumpfun-ipfs.js';
 import {
@@ -33,7 +33,7 @@ import {
 } from './stake-program.js';
 import { buildLockFeesIxs } from './pump-fees.js';
 import { getPool, upsertPool, recordEvent } from './registry.js';
-import { popMintKeypairFromPool } from './vanity-mints.js';
+import { popUnusedMintKeypairFromPool } from './vanity-mints.js';
 
 function log(message, extra = {}) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), message, ...extra }));
@@ -124,6 +124,49 @@ export async function prepareCreatorLaunch({
     throw new Error(`invalid rewardMode '${rewardMode}'`);
   }
 
+  // Allocate the vanity mint FIRST (before metadata upload) so we can
+  // auto-populate `website` with https://stakrr.xyz/token/<mint> when the
+  // deployer leaves it blank. Each launch then has a real landing page even
+  // for projects that never make a website. Pre-pinned client-side metadata
+  // (`uri` arg) is honored as-is — no retroactive rewrites.
+  const connection = getConnection();
+  let mintKeypairSecretB58;
+  let preallocatedVanity = null;
+  if (config.vanityMintPoolFile && config.vanityMintSuffix?.trim()) {
+    const result = await popUnusedMintKeypairFromPool(
+      config.vanityMintPoolFile,
+      config.vanityMintSuffix.trim(),
+      connection,
+    );
+    if (result?.keypair) {
+      preallocatedVanity = result.keypair;
+      mintKeypairSecretB58 = bs58.encode(result.keypair.secretKey);
+      log('launch:prepare vanity mint from pool', {
+        mint: result.keypair.publicKey.toBase58(),
+        prunedUsed: result.pruned,
+      });
+    }
+  }
+
+  // Predicted mint address: vanity (preallocated above) or a freshly-generated
+  // ephemeral keypair from PumpDev if we don't have a vanity in stock. We
+  // generate the ephemeral one here too so we can know the mint before
+  // building createTx, then pass it via `mintKeypairSecretB58`.
+  let predictedMintB58;
+  if (preallocatedVanity) {
+    predictedMintB58 = preallocatedVanity.publicKey.toBase58();
+  } else {
+    const ephemeral = Keypair.generate();
+    mintKeypairSecretB58 = bs58.encode(ephemeral.secretKey);
+    predictedMintB58 = ephemeral.publicKey.toBase58();
+  }
+
+  // Default the deployer's `website` to a Stakrr per-token landing page when
+  // they didn't supply one. This way Pump.fun's tile / DexScreener / wallets
+  // all surface a "click for staking & token info" link by default.
+  const websiteForMetadata = metadata.website?.trim()
+    || `${config.publicBaseUrl}/token/${predictedMintB58}`;
+
   let metadataUri = uri || null;
   let metadataSource = uri ? 'caller' : null;
   let resolvedImage = metadata.image || null;
@@ -134,7 +177,7 @@ export async function prepareCreatorLaunch({
       description: metadata.description,
       twitter: metadata.twitter,
       telegram: metadata.telegram,
-      website: metadata.website,
+      website: websiteForMetadata,
       imageUrl: metadata.image,
       fileBuffer,
       fileContentType,
@@ -142,19 +185,19 @@ export async function prepareCreatorLaunch({
     metadataUri = upload.metadataUri;
     metadataSource = upload.source;
     if (upload.imageUri) resolvedImage = upload.imageUri;
-    log('launch:prepare metadata uploaded', { uri: metadataUri, source: metadataSource });
+    log('launch:prepare metadata uploaded', {
+      uri: metadataUri,
+      source: metadataSource,
+      websiteUsed: websiteForMetadata,
+      websiteWasDefault: !metadata.website?.trim(),
+    });
   }
 
-  const persistedMetadata = { ...metadata, image: resolvedImage || metadata.image || null };
-
-  let mintKeypairSecretB58;
-  if (config.vanityMintPoolFile && config.vanityMintSuffix?.trim()) {
-    const vk = popMintKeypairFromPool(config.vanityMintPoolFile, config.vanityMintSuffix.trim());
-    if (vk) {
-      mintKeypairSecretB58 = bs58.encode(vk.secretKey);
-      log('launch:prepare vanity mint from pool', { mint: vk.publicKey.toBase58() });
-    }
-  }
+  const persistedMetadata = {
+    ...metadata,
+    website: metadata.website?.trim() || websiteForMetadata,
+    image: resolvedImage || metadata.image || null,
+  };
 
   const { tx: createTx, mint, mintKeypair } = await buildCreateTokenTx({
     publicKey: creatorPk.toBase58(),
@@ -162,7 +205,7 @@ export async function prepareCreatorLaunch({
     symbol: metadata.symbol,
     uri: metadataUri,
     buyAmountSol: Number(initialBuySol) || 0,
-    mintKeypairSecretB58: mintKeypairSecretB58 || null,
+    mintKeypairSecretB58,
   });
   assertPumpCreateRequiresCreatorSigner(createTx, creatorPk);
   // VersionedTransaction has sign(), not partialSign() (see @solana/web3.js).
@@ -171,6 +214,13 @@ export async function prepareCreatorLaunch({
   const createTxBase64 = Buffer.from(createTx.serialize()).toString('base64');
   const mintPk = mintKeypair.publicKey;
   const mintStr = mintPk.toBase58();
+  // Sanity: PumpDev should always use the keypair we provided; if it didn't,
+  // our pre-pinned metadata `website` would point at the wrong mint.
+  if (mintStr !== predictedMintB58) {
+    throw new Error(
+      `predicted mint ${predictedMintB58} != actual mint ${mintStr} from PumpDev — refusing launch (metadata website would be wrong)`,
+    );
+  }
 
   log('launch:prepare pump create tx built', {
     creator: creatorPk.toBase58(),
@@ -181,7 +231,7 @@ export async function prepareCreatorLaunch({
   // Build lockFeesTx + poolRewardTx in parallel against the freshly-known
   // mint pubkey. Both are pure PDA derivations from `mint` and don't require
   // the mint account to exist on chain yet, so this is safe to do here.
-  const connection = new Connection(config.stakeRpcUrl, 'confirmed');
+  // Reuses the `connection` opened earlier for the vanity-pool prune call.
   const stakeMint = mintPk;
   const rewardMint = rewardMode === 'token' ? stakeMint : config.wsolMint;
 
@@ -284,7 +334,7 @@ export async function buildLockFeesTxBase64({ creatorWallet, mint }) {
   if (!config.lockFees.enabled) {
     return { ok: true, locked: false, reason: 'lock_fees_disabled' };
   }
-  const connection = new Connection(config.stakeRpcUrl, 'confirmed');
+  const connection = getConnection();
   let creatorPk;
   let mintPk;
   try {
@@ -352,7 +402,7 @@ export async function buildUnsignedPoolRewardTxBase64({
   mint,
   rewardMode,
 }) {
-  const connection = new Connection(config.stakeRpcUrl, 'confirmed');
+  const connection = getConnection();
   const creatorPk = new PublicKey(creatorWallet.trim());
   const stakeMint = new PublicKey(mint.trim());
   const rewardMint = rewardMode === 'token' ? stakeMint : config.wsolMint;
@@ -396,7 +446,7 @@ export async function buildCreatorAutoStakeTxBase64({
   rewardMode,
   nonce,
 }) {
-  const connection = new Connection(config.stakeRpcUrl, 'confirmed');
+  const connection = getConnection();
   const creatorPk = new PublicKey(creatorWallet.trim());
   const stakeMint = new PublicKey(mint.trim());
   const rewardMint = rewardMode === 'token' ? stakeMint : config.wsolMint;
@@ -481,7 +531,7 @@ export async function finalizeCreatorLaunch({
     throw new Error('invalid mint or creatorWallet');
   }
   const rewardMint = rewardMode === 'token' ? stakeMint : config.wsolMint;
-  const connection = new Connection(config.stakeRpcUrl, 'confirmed');
+  const connection = getConnection();
 
   await confirmSucceeded(connection, createSig, 'create');
   await confirmSucceeded(connection, poolRewardSig, 'pool+reward');
@@ -640,7 +690,7 @@ export async function finalizeLockFeesOnly({ mint, creatorWallet, lockFeesSig })
   } catch {
     throw new Error('invalid mint or creatorWallet');
   }
-  const connection = new Connection(config.stakeRpcUrl, 'confirmed');
+  const connection = getConnection();
   await confirmSucceeded(connection, lockFeesSig.trim(), 'lock-fees');
   const cfg = await fetchFeeSharingConfig(connection, stakeMint);
   if (!cfg) {

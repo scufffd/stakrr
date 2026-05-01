@@ -7,7 +7,6 @@
 
 import {
   ComputeBudgetProgram,
-  Connection,
   PublicKey,
   SystemProgram,
   Transaction,
@@ -19,7 +18,7 @@ import {
   getAccount,
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token';
-import { config, authoritySigner } from './config.js';
+import { config, authoritySigner, getConnection } from './config.js';
 import { wrapSolIxs } from './wsol.js';
 import { buildClaimCreatorFeesTx, buildClaimDistributeTx, buildBuyTokenTx } from './pumpdev.js';
 import { shouldAttemptClaim } from './dexscreener.js';
@@ -347,7 +346,7 @@ export async function runPoolCycle({ pool }) {
   const rewardMint = rewardMode === 'token'
     ? stakeMint
     : new PublicKey(pool.rewardMint || config.wsolMint.toBase58());
-  const connection = new Connection(config.stakeRpcUrl, 'confirmed');
+  const connection = getConnection();
   const treasury = config.treasuryKeypair;
   const authority = authoritySigner();
 

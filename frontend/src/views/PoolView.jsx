@@ -22,6 +22,25 @@ function fmtSol(lamportsStr, digits = 4) {
   }
 }
 
+/**
+ * Idempotent set/update for a meta tag in the document head. Used by the
+ * per-token route to swap title + og:* tags when a token loads.
+ *
+ * `property` controls whether to use `name="…"` (description) or
+ * `property="…"` (og:* per OGP spec). We always create on first call,
+ * then patch the content attribute on subsequent updates.
+ */
+function setMeta(name, content, isProperty = false) {
+  const attr = isProperty ? 'property' : 'name';
+  let tag = document.head.querySelector(`meta[${attr}="${name}"]`);
+  if (!tag) {
+    tag = document.createElement('meta');
+    tag.setAttribute(attr, name);
+    document.head.appendChild(tag);
+  }
+  tag.setAttribute('content', content);
+}
+
 function fmtRaw(rawStr, decimals = 6) {
   if (!rawStr || rawStr === '0') return '0';
   try {
@@ -63,6 +82,29 @@ export default function PoolView({ mint, onBack }) {
 
   const meta = token?.metadata || {};
   const pumpfunUrl = useMemo(() => `https://pump.fun/${token?.stakeMint || ''}`, [token]);
+
+  // Update document title and og: meta tags so the per-token URL has a useful
+  // tab title and (for clients that read these — Telegram, Discord, Slack)
+  // nicer link previews. Reset back on unmount so navigating away doesn't
+  // leave a stale title.
+  useEffect(() => {
+    if (!token) return undefined;
+    const prevTitle = document.title;
+    const sym = meta.symbol || 'token';
+    const name = meta.name || mint.slice(0, 6);
+    const desc = meta.description?.slice(0, 200)
+      || `Stake $${sym} on Stakrr — earn a share of pump.fun creator fees.`;
+    document.title = `$${sym} ${name} — Stakrr`;
+    setMeta('description', desc);
+    setMeta('og:title', `$${sym} ${name} on Stakrr`, true);
+    setMeta('og:description', desc, true);
+    if (meta.image) setMeta('og:image', meta.image, true);
+    setMeta('og:url', window.location.href, true);
+    setMeta('og:type', 'website', true);
+    return () => {
+      document.title = prevTitle;
+    };
+  }, [token, meta.symbol, meta.name, meta.description, meta.image, mint]);
 
   const copy = (text) => {
     if (!text) return;

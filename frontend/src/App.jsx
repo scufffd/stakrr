@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback } from 'react';
 import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
 import { useWallet } from '@solana/wallet-adapter-react';
 import LaunchView from './views/LaunchView.jsx';
@@ -8,6 +8,7 @@ import DocsPage from './views/DocsPage.jsx';
 import HomePage from './components/designBoost/HomePage.jsx';
 import BluebirdMark from './components/designBoost/BluebirdMark.jsx';
 import Cloud, { CloudStrip } from './components/designBoost/Cloud.jsx';
+import { useRouter } from './lib/router.js';
 
 const SKY = '#35C5E0';
 const INK = '#0C0C0C';
@@ -105,38 +106,15 @@ function innerHeroTitle(tab) {
 
 export default function App() {
   const wallet = useWallet();
-  const [tab, setTab] = useState('home');
-  const [selectedMint, setSelectedMint] = useState(null);
+  const { route, navigate } = useRouter();
+  const tab = route.tab;
+  const selectedMint = route.mint;
 
-  const onSelectToken = useCallback((mint) => {
-    setSelectedMint(mint);
-    setTab('token');
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }, []);
-
-  const goHome = useCallback(() => {
-    setTab('home');
-    setSelectedMint(null);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }, []);
-
-  const goLaunch = useCallback(() => {
-    setTab('launch');
-    setSelectedMint(null);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }, []);
-
-  const goProfile = useCallback(() => {
-    setTab('profile');
-    setSelectedMint(null);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }, []);
-
-  const goDocs = useCallback(() => {
-    setTab('docs');
-    setSelectedMint(null);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }, []);
+  const onSelectToken = useCallback((mint) => navigate({ tab: 'token', mint }), [navigate]);
+  const goHome = useCallback(() => navigate({ tab: 'home' }), [navigate]);
+  const goLaunch = useCallback(() => navigate({ tab: 'launch' }), [navigate]);
+  const goProfile = useCallback(() => navigate({ tab: 'profile' }), [navigate]);
+  const goDocs = useCallback(() => navigate({ tab: 'docs' }), [navigate]);
 
   const isHome = tab === 'home';
 

@@ -184,19 +184,26 @@ export default function LaunchView({ onLaunched }) {
       }
       if (!imageFile) throw new Error('Please pick an image for the token');
 
+      // When the deployer leaves website blank we *want* the worker to pin
+      // metadata so it can substitute https://stakrr.xyz/token/<mint> as the
+      // website. Pre-pinning in the browser would lock in an empty website
+      // before the worker knows the mint. So: only pre-pin when the user
+      // explicitly typed a website URL.
       let clientPin = null;
-      try {
-        clientPin = await tryClientPumpfunMetadata({
-          name,
-          symbol,
-          description,
-          twitter,
-          telegram,
-          website,
-          imageFile,
-        });
-      } catch {
-        /* CORS, 403, or offline — server pins with Pinata / pump */
+      if (website.trim()) {
+        try {
+          clientPin = await tryClientPumpfunMetadata({
+            name,
+            symbol,
+            description,
+            twitter,
+            telegram,
+            website,
+            imageFile,
+          });
+        } catch {
+          /* CORS, 403, or offline — server pins with Pinata / pump */
+        }
       }
 
       const fd = new FormData();
@@ -509,7 +516,7 @@ export default function LaunchView({ onLaunched }) {
   const socialFields = [
     { l: 'Twitter', v: twitter, s: setTwitter, p: '@handle or URL' },
     { l: 'Telegram', v: telegram, s: setTelegram, p: 't.me/…' },
-    { l: 'Website', v: website, s: setWebsite, p: 'https://…' },
+    { l: 'Website', v: website, s: setWebsite, p: 'leave blank → stakrr.xyz/token/…' },
   ];
 
   return (

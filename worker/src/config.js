@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
+import { buildResilientConnection } from './rpc-multiplex.js';
 
 function required(key) {
   const v = process.env[key];
@@ -46,9 +47,28 @@ function jsonObjectEnv(key) {
   }
 }
 
+function csvEnv(key) {
+  return optional(key, '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 export const config = {
   rpcUrl: required('RPC_URL'),
   stakeRpcUrl: optional('STAKE_RPC_URL', '') || required('RPC_URL'),
+  /**
+   * Comma-separated public RPC URLs that the worker (and frontend, mirrored via
+   * VITE_RPC_URL_FALLBACKS) will fail over to when the primary returns 429,
+   * 401/403, 5xx, or a network error. Used for non-Helius-specific calls
+   * (getAccountInfo, getMultipleAccountsInfo, getLatestBlockhash, etc.) so a
+   * Helius quota outage doesn't take Stakrr down.
+   *
+   * Sensible defaults for mainnet: api.mainnet-beta.solana.com,
+   * solana-rpc.publicnode.com, solana.drpc.org. Override with your own paid
+   * fallback if you have one (Triton One, QuickNode, etc.).
+   */
+   rpcUrlFallbacks: csvEnv('RPC_URL_FALLBACKS'),
 
   programId: new PublicKey(optional('STAKE_PROGRAM_ID', '65YrGaBL5ukm4SVcsEBoUgnqTrNXy2pDiPKeQKjSexVA')),
   wsolMint: new PublicKey(optional('WSOL_MINT', 'So11111111111111111111111111111111111111112')),
@@ -95,10 +115,34 @@ export const config = {
   /** Public key must end with this base58 substring (e.g. STK, pump). */
   vanityMintSuffix: optional('VANITY_MINT_SUFFIX', 'STK'),
 
+  /**
+   * Public origin Stakrr is served from. Used as the fallback `website` field
+   * in Pump.fun token metadata when the deployer leaves website blank — we
+   * point it at https://<base>/token/<mint> so every launch has a real
+   * landing page even if the project never makes a website.
+   */
+  publicBaseUrl: optional('PUBLIC_BASE_URL', 'https://stakrr.xyz').replace(/\/$/, ''),
+
   rpcAccountCacheTtlMs: intEnv('POB_RPC_ACCOUNT_CACHE_TTL_MS', 21_600_000),
 };
 
 // Treasury doubles as authority unless an explicit authority keypair is set.
 export function authoritySigner() {
   return config.authorityKeypair || config.treasuryKeypair;
+}
+
+/**
+ * The single chokepoint for building a `Connection` in the worker. Always
+ * use this — it wires up RPC fallbacks transparently so a Helius outage
+ * doesn't kill the claim loop or the launch flow.
+ *
+ * `commitment` defaults to 'confirmed' (matches what every call site used
+ * before this refactor).
+ */
+export function getConnection(commitment = 'confirmed') {
+  return buildResilientConnection(
+    config.stakeRpcUrl,
+    config.rpcUrlFallbacks,
+    { commitment },
+  );
 }

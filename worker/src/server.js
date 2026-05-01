@@ -27,8 +27,8 @@
 
 import express from 'express';
 import multer from 'multer';
-import { Connection, Keypair, PublicKey } from '@solana/web3.js';
-import { config, authoritySigner } from './config.js';
+import { PublicKey } from '@solana/web3.js';
+import { config, authoritySigner, getConnection } from './config.js';
 import { getPool, listPools } from './registry.js';
 import { fetchPool, fetchRewardMint, fetchActivePositions } from './stake-program.js';
 import {
@@ -40,6 +40,7 @@ import {
   finalizeLockFeesOnly,
 } from './launch.js';
 import { buildWalletSummary } from './wallet-summary.js';
+import { getVanityPoolStats } from './vanity-mints.js';
 
 const app = express();
 app.use(express.json({ limit: '32kb' }));
@@ -83,6 +84,29 @@ app.use((req, res, next) => {
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
+});
+
+/**
+ * Pre-ground vanity mint pool inventory. Read-only. Used by the launch UI
+ * (badge "✦ vanity 'pump' mint" when stock available) and by ops dashboards.
+ *
+ * `?onchain=1` performs an on-chain check against the first 50 candidates
+ * to refine `knownAvailable` / `knownUsed`. Off by default (cheap call).
+ */
+app.get('/api/vanity-pool/stats', async (req, res) => {
+  try {
+    const wantsOnchain = req.query.onchain === '1' || req.query.onchain === 'true';
+    const conn = wantsOnchain ? getConnection() : null;
+    const stats = await getVanityPoolStats(
+      config.vanityMintPoolFile,
+      config.vanityMintSuffix,
+      conn,
+      wantsOnchain ? 50 : 0,
+    );
+    res.json({ ok: true, ...stats });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 app.get('/api/wallet/:pubkey/summary', async (req, res) => {
@@ -131,7 +155,7 @@ async function buildPublicTokenView(mint) {
   const pool = getPool(mint);
   if (!pool) return null;
   const stakeMint = new PublicKey(pool.stakeMint);
-  const connection = new Connection(config.stakeRpcUrl, 'confirmed');
+  const connection = getConnection();
   const authority = authoritySigner();
   const onchain = await fetchPool({ connection, signer: authority, stakeMint });
   if (!onchain) {
