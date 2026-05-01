@@ -40,6 +40,19 @@ const IX_UPDATE_FEE_SHARES = Buffer.from([189, 13, 136, 99, 187, 164, 237, 35]);
 // build the same instruction natively and skip PumpDev's 0.0025 SOL
 // commission per cycle. The instruction takes no data args.
 const IX_BC_DISTRIBUTE_CREATOR_FEES = Buffer.from([0xa5, 0x72, 0x67, 0x00, 0x79, 0xce, 0xf7, 0x51]);
+// `transfer_creator_fees_to_pump` lives on the **Pump AMM** program (not BC).
+// After a token graduates from the bonding curve to the AMM, all post-grad
+// creator fees accrue as **WSOL** in the AMM-side `coin_creator_vault_ata`,
+// not the BC-side native SOL `creator-vault`. This permissionless ix moves
+// that WSOL → BC creator vault as native lamports, where our existing
+// `DistributeCreatorFees` can then settle them to the share table.
+//
+// Without this bridge we silently leak post-grad fees: the worker's BC
+// `DistributeCreatorFees` call succeeds with a 0-lamport payout because the
+// BC vault is empty, while real volume is piling up unclaimed in the AMM
+// vault. Spotted on yks7qy…pump (12.7 SOL stranded after 30 min). Discriminator
+// vendored from official pump_amm IDL (instructions[].name=transfer_creator_fees_to_pump).
+const IX_AMM_TRANSFER_CREATOR_FEES_TO_PUMP = Buffer.from([139, 52, 134, 85, 228, 229, 108, 241]);
 
 // Anchor account discriminator for FeeSharingConfig (vendored from official IDL via:
 // `jq '.accounts[] | select(.name == "FeeSharingConfig")' pump_fees.json`).
@@ -361,5 +374,54 @@ export function buildBondingCurveDistributeFeesIx({ payer, mint }) {
     programId: PUMP_BC_PROGRAM_ID,
     keys,
     data: Buffer.from(IX_BC_DISTRIBUTE_CREATOR_FEES),
+  });
+}
+
+/**
+ * Build the **AMM-side** bridge ix that drains the post-graduation creator
+ * fees from the AMM `coin_creator_vault_ata` (WSOL) into the BC
+ * `pump_creator_vault` (native SOL). Permissionless — no signer required.
+ *
+ * Pair this with `buildBondingCurveDistributeFeesIx` in the same tx so that
+ * (1) AMM fees → BC vault (2) BC vault → shareholders happens atomically per
+ * cycle. Safe to call when the AMM vault is empty: the program no-ops on a
+ * zero balance (verified via simulation, see worker/scripts/sim_amm_bridge.mjs).
+ *
+ * Account order (validated against pump_amm IDL `transfer_creator_fees_to_pump`):
+ *   [0] wsol_mint               — System wsol mint constant
+ *   [1] token_program           — SPL Token program
+ *   [2] system_program          — System program
+ *   [3] associated_token_program
+ *   [4] coin_creator            — = FeeSharingConfig PDA when locked (BC.creator)
+ *   [5] coin_creator_vault_authority  PDA["creator_vault", coin_creator] under PUMP_AMM, mut
+ *   [6] coin_creator_vault_ata        ATA(wsol, coin_creator_vault_authority), mut
+ *   [7] pump_creator_vault            PDA["creator-vault", coin_creator] under PUMP_BC, mut
+ *   [8] event_authority         PDA["__event_authority"] under PUMP_AMM
+ *   [9] program                 PUMP_AMM (self-ref required by Anchor)
+ */
+export function buildAmmTransferCreatorFeesToPumpIx({ mint }) {
+  const sharingConfig = findFeeSharingConfigPda(mint);
+  const coinCreatorVaultAuthority = findCoinCreatorVaultAuthorityPda(sharingConfig);
+  const coinCreatorVaultAta = findAtaPda(WSOL_MINT, coinCreatorVaultAuthority);
+  const pumpCreatorVault = findPumpCreatorVaultPda(sharingConfig);
+  const ammEventAuthority = findAmmEventAuthorityPda();
+
+  const keys = [
+    { pubkey: WSOL_MINT,                     isSigner: false, isWritable: false },
+    { pubkey: TOKEN_PROGRAM_ID,              isSigner: false, isWritable: false },
+    { pubkey: SystemProgram.programId,       isSigner: false, isWritable: false },
+    { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID,   isSigner: false, isWritable: false },
+    { pubkey: sharingConfig,                 isSigner: false, isWritable: false },
+    { pubkey: coinCreatorVaultAuthority,     isSigner: false, isWritable: true  },
+    { pubkey: coinCreatorVaultAta,           isSigner: false, isWritable: true  },
+    { pubkey: pumpCreatorVault,              isSigner: false, isWritable: true  },
+    { pubkey: ammEventAuthority,             isSigner: false, isWritable: false },
+    { pubkey: PUMP_AMM_PROGRAM_ID,           isSigner: false, isWritable: false },
+  ];
+
+  return new TransactionInstruction({
+    programId: PUMP_AMM_PROGRAM_ID,
+    keys,
+    data: Buffer.from(IX_AMM_TRANSFER_CREATOR_FEES_TO_PUMP),
   });
 }

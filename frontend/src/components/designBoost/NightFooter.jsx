@@ -6,6 +6,140 @@ const NIGHT_CLOUD = '#162035';
 const NIGHT_CLOUD_EDGE = '#1E2D48';
 const CYAN = '#35C5E0';
 const GITHUB_URL = import.meta.env.VITE_GITHUB_URL || 'https://github.com/scufffd/stakrr';
+// Official $STAKRR token CA. Override via VITE_STAKRR_CA so future
+// re-launches (or testnet builds) can swap without a code change.
+const STAKRR_CA = import.meta.env.VITE_STAKRR_CA || 'yks7qyAPonTPAkiRXaGsKHinGNcpyQZK12HseDApump';
+const STAKRR_TOKEN_PATH = `/token/${STAKRR_CA}`;
+const STAKRR_SOLSCAN = `https://solscan.io/token/${STAKRR_CA}`;
+const STAKRR_PUMP = `https://pump.fun/coin/${STAKRR_CA}`;
+
+function ContractAddressPill() {
+  const [copied, setCopied] = React.useState(false);
+  const onCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(STAKRR_CA);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1400);
+    } catch {
+      // Older browsers / iOS Safari without permission — fall back to a
+      // textarea selection so the user can still ⌘C.
+      const ta = document.createElement('textarea');
+      ta.value = STAKRR_CA;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch {}
+      document.body.removeChild(ta);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1400);
+    }
+  };
+
+  return (
+    <div
+      className="db-night-footer-ca"
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        gap: 10,
+        margin: '60px auto 0',
+        padding: '20px 24px',
+        maxWidth: 720,
+        background: 'rgba(53,197,224,0.04)',
+        border: '1px solid rgba(53,197,224,0.18)',
+        borderRadius: 18,
+        backdropFilter: 'blur(8px)',
+      }}
+    >
+      <span
+        style={{
+          fontSize: 10.5,
+          fontWeight: 800,
+          color: 'rgba(53,197,224,0.85)',
+          letterSpacing: '0.18em',
+          textTransform: 'uppercase',
+          fontFamily: "'Syne', sans-serif",
+        }}
+      >
+        $STAKRR · official token contract
+      </span>
+      <button
+        type="button"
+        onClick={onCopy}
+        title="Click to copy"
+        style={{
+          all: 'unset',
+          cursor: 'pointer',
+          fontFamily: "'DM Mono', monospace",
+          fontSize: 14,
+          fontWeight: 700,
+          color: 'white',
+          padding: '6px 14px',
+          borderRadius: 10,
+          background: 'rgba(255,255,255,0.04)',
+          border: '1px solid rgba(255,255,255,0.08)',
+          wordBreak: 'break-all',
+          textAlign: 'center',
+          maxWidth: '100%',
+          boxSizing: 'border-box',
+        }}
+      >
+        {STAKRR_CA}
+      </button>
+      <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', justifyContent: 'center', marginTop: 4 }}>
+        <button
+          type="button"
+          onClick={onCopy}
+          style={{
+            ...socialLink,
+            background: 'none',
+            border: 'none',
+            cursor: 'pointer',
+            color: copied ? CYAN : 'rgba(255,255,255,0.55)',
+            padding: 0,
+          }}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            {copied ? (
+              <polyline points="20 6 9 17 4 12" />
+            ) : (
+              <>
+                <rect x="9" y="9" width="13" height="13" rx="2" />
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+              </>
+            )}
+          </svg>
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+        <a href={STAKRR_TOKEN_PATH} style={socialLink}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <rect x="3" y="3" width="7" height="7" />
+            <rect x="14" y="3" width="7" height="7" />
+            <rect x="14" y="14" width="7" height="7" />
+            <rect x="3" y="14" width="7" height="7" />
+          </svg>
+          Stake on Stakrr
+        </a>
+        <a href={STAKRR_SOLSCAN} target="_blank" rel="noreferrer" style={socialLink}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+            <polyline points="15 3 21 3 21 9" />
+            <line x1="10" y1="14" x2="21" y2="3" />
+          </svg>
+          Solscan
+        </a>
+        <a href={STAKRR_PUMP} target="_blank" rel="noreferrer" style={socialLink}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+            <polyline points="15 3 21 3 21 9" />
+            <line x1="10" y1="14" x2="21" y2="3" />
+          </svg>
+          Pump.fun
+        </a>
+      </div>
+    </div>
+  );
+}
 
 function DarkCloud({ width = 280, style = {}, className = '' }) {
   const uid = useId().replace(/:/g, '');
@@ -332,9 +466,11 @@ export default function NightFooter({ onLaunch }) {
           </div>
         </div>
 
+        <ContractAddressPill />
+
         <div
           style={{
-            marginTop: 80,
+            marginTop: 40,
             paddingTop: 24,
             borderTop: '1px solid rgba(255,255,255,0.08)',
             display: 'flex',

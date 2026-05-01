@@ -12,7 +12,13 @@ import {
   Transaction,
 } from '@solana/web3.js';
 import { confirmSignature, signAndPollConfirm } from './confirm.js';
-import { buildBondingCurveDistributeFeesIx } from './pump-fees.js';
+import {
+  buildAmmTransferCreatorFeesToPumpIx,
+  buildBondingCurveDistributeFeesIx,
+  findCoinCreatorVaultAuthorityPda,
+  findFeeSharingConfigPda,
+  WSOL_MINT,
+} from './pump-fees.js';
 import {
   createAssociatedTokenAccountIdempotentInstruction,
   getAccount,
@@ -49,6 +55,29 @@ async function getSolBalance(connection, pubkey) {
   return BigInt(await connection.getBalance(pubkey, 'confirmed'));
 }
 
+/**
+ * Read the AMM coin_creator_vault WSOL ATA balance for `mint`. Returns 0n
+ * when the ATA hasn't been allocated yet (pre-graduation, or a graduated
+ * token that hasn't accumulated any AMM-side creator fees). Failure-safe:
+ * any RPC error returns 0n so we fall back to BC-only distribute rather
+ * than skipping the cycle.
+ *
+ * Used by the claim loop to decide whether to bundle the AMM→BC bridge ix.
+ */
+async function readAmmVaultWsolBalance(connection, mintPk) {
+  try {
+    const sharingConfig = findFeeSharingConfigPda(mintPk);
+    const cvAuth = findCoinCreatorVaultAuthorityPda(sharingConfig);
+    const cvAta = getAssociatedTokenAddressSync(WSOL_MINT, cvAuth, true);
+    const info = await connection.getAccountInfo(cvAta, 'confirmed');
+    if (!info || info.data.length < 72) return 0n;
+    // SPL token account layout: amount lives at byte offset 64 (u64 LE).
+    return info.data.readBigUInt64LE(64);
+  } catch {
+    return 0n;
+  }
+}
+
 async function claimCreatorFees(connection, treasury, { mint, feeLocked = false } = {}) {
   const beforeLamports = await getSolBalance(connection, treasury.publicKey);
   let signature = null;
@@ -68,20 +97,47 @@ async function claimCreatorFees(connection, treasury, { mint, feeLocked = false 
     if (mint && feeLocked) {
       try {
         const mintPk = new PublicKey(mint);
-        const ix = buildBondingCurveDistributeFeesIx({
+        // Atomic post-grad bridge: pump_amm `transfer_creator_fees_to_pump`
+        // moves any AMM-side WSOL fees → BC creator vault as native lamports
+        // first, then BC `DistributeCreatorFees` settles the entire vault to
+        // the share table. We only include the bridge when the AMM vault
+        // actually has non-trivial WSOL — otherwise the bridge's idempotent
+        // ATA-create would waste ~0.002 SOL of rent on pre-grad tokens that
+        // never have an AMM creator vault to drain. Threshold matches the
+        // legacy claim threshold so we don't bother with dust either.
+        // Discovered after yks7qy…pump silently leaked 13.1 SOL post-grad
+        // before this fix (the BC vault returned 0-lamport claims while
+        // real volume piled up in the untouched AMM vault).
+        const ammVaultBalance = await readAmmVaultWsolBalance(connection, mintPk);
+        const includeBridge = ammVaultBalance >= BigInt(config.minDistributeLamports || 0);
+        if (ammVaultBalance > 0n) {
+          log('claim: amm vault state', {
+            mint,
+            ammVaultLamports: ammVaultBalance.toString(),
+            bridge: includeBridge ? 'include' : 'skip-below-threshold',
+          });
+        }
+
+        const distributeIx = buildBondingCurveDistributeFeesIx({
           payer: treasury.publicKey,
           mint: mintPk,
         });
         const tx = new Transaction();
+        if (includeBridge) {
+          tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }));
+        }
         const fee = priorityFeeIx();
         if (fee) tx.add(fee);
-        tx.add(ix);
+        if (includeBridge) {
+          tx.add(buildAmmTransferCreatorFeesToPumpIx({ mint: mintPk }));
+        }
+        tx.add(distributeIx);
         distributeSig = await signAndPollConfirm(connection, tx, [treasury], {
           commitment: 'confirmed',
-          label: 'native-distribute',
+          label: includeBridge ? 'amm-bridge+native-distribute' : 'native-distribute',
         });
         distributePath = 'native';
-        log('claim: native distribute ok', { mint, sig: distributeSig });
+        log('claim: native distribute ok', { mint, sig: distributeSig, bridged: includeBridge });
       } catch (eNative) {
         log('claim: native distribute failed, falling back to pumpdev', {
           mint,
