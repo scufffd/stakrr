@@ -33,6 +33,63 @@ function fmtSol(rawStr) {
   return fmtAmount(rawStr, 9);
 }
 
+// Compact "1.23M" / "456.7K" / "789" formatter for display-only numbers.
+function fmtCompact(n) {
+  if (n == null || isNaN(n)) return '—';
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+  if (abs >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+  if (abs >= 1e3) return `${(n / 1e3).toFixed(2)}K`;
+  return n.toLocaleString(undefined, { maximumFractionDigits: 4 });
+}
+
+/**
+ * Inline disclosure shown wherever the user is about to stake. Explains
+ * that re-staking creates a fresh position alongside any existing ones,
+ * with its own lock timer. The "Why?" <details> gives the rationale —
+ * each stake = its own lock = independently unstakeable.
+ *
+ * Reused in LaunchView's auto-stake card and AdminPresaleView's launch
+ * step so the message is identical everywhere staking happens.
+ */
+function NewPositionNotice({ existingCount = 0, contextLabel = 'staking' }) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        gap: 10,
+        alignItems: 'flex-start',
+        padding: '10px 12px',
+        background: '#F0F9FF',
+        border: '1px solid #BAE6FD',
+        borderRadius: 10,
+        fontSize: 12.5,
+        color: '#075985',
+        lineHeight: 1.5,
+      }}
+    >
+      <span aria-hidden style={{ fontSize: 14, lineHeight: 1, flexShrink: 0, marginTop: 1 }}>i</span>
+      <div>
+        <strong>{contextLabel} creates a new position</strong> with its own lock timer.
+        {existingCount > 0 && (
+          <> You currently have {existingCount} active position{existingCount === 1 ? '' : 's'} — this adds another.</>
+        )}{' '}
+        <details style={{ display: 'inline' }}>
+          <summary style={{ display: 'inline', cursor: 'pointer', textDecoration: 'underline', color: '#0369A1' }}>
+            Why?
+          </summary>
+          <span style={{ display: 'block', marginTop: 6, color: '#0369A1' }}>
+            Each stake locks tokens with its own timer — re-staking never extends an existing lock,
+            so a 7-day stake added to a 30-day stake stays as two separate positions you can
+            unstake independently when each lock ends. This prevents anyone from gaming the
+            multiplier by topping up a long-locked position with new tokens.
+          </span>
+        </details>
+      </div>
+    </div>
+  );
+}
+
 export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol', rewardMintB58 }) {
   const { client, ready, wallet, connection, stakeMint, stakeTokenProgram } = useStakePoolClient(stakeMintB58);
   const walletState = useWallet();
@@ -48,6 +105,7 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
 
   const [pool, setPool] = useState(null);
   const [decimals, setDecimals] = useState(null);
+  const [supplyRaw, setSupplyRaw] = useState(null);
   const [userBalanceRaw, setUserBalanceRaw] = useState('0');
   const [positions, setPositions] = useState([]);
   const [refreshTick, setRefreshTick] = useState(0);
@@ -86,11 +144,15 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
         }
         if (cancelled) return;
         setPool(p);
-        // mint decimals
+        // mint decimals + circulating supply (raw units of `decimals`)
         const mintInfo = await connection.getParsedAccountInfo(stakeMint);
         if (cancelled) return;
         const dec = mintInfo?.value?.data?.parsed?.info?.decimals ?? 9;
         setDecimals(dec);
+        // Pump-launched mints typically report supply in two places — Anchor
+        // exposes `supply` as a string of raw atoms (no decimals applied).
+        const sup = mintInfo?.value?.data?.parsed?.info?.supply;
+        setSupplyRaw(sup ? String(sup) : null);
         // user wallet balance
         try {
           const ata = getAssociatedTokenAddressSync(stakeMint, wallet.publicKey, false, stakeTokenProgram);
@@ -270,10 +332,65 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
 
   const balanceFmt = decimals != null ? fmtAmount(userBalanceRaw, decimals) : '—';
 
+  // Total staked across the pool, expressed as raw atoms (BN.toString())
+  // and as a percentage of circulating supply. `pool.totalStaked` is the
+  // canonical truth — counts every active position regardless of owner.
+  const totalStakedRawStr = pool?.totalStaked?.toString?.() || '0';
+  const totalStakedNum = decimals != null ? Number(totalStakedRawStr) / 10 ** decimals : null;
+  const supplyNum = decimals != null && supplyRaw ? Number(supplyRaw) / 10 ** decimals : null;
+  // Use BigInt for the percentage to preserve precision on 1B-supply tokens.
+  let pctOfSupply = null;
+  try {
+    if (supplyRaw && BigInt(supplyRaw) > 0n) {
+      pctOfSupply = Number((BigInt(totalStakedRawStr) * 1_000_000n) / BigInt(supplyRaw)) / 10_000;
+    }
+  } catch { /* totalStaked or supply not a valid bigint */ }
+
   return (
     <div style={{ display: 'grid', gap: 16 }}>
       <div className="panel panel--tight">
         <h3 className="section-title" style={{ fontSize: '1.25rem', marginBottom: 8 }}>Stake {tickerLabel}</h3>
+
+        {/* Pool stats — total staked + share of circulating supply */}
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+            gap: 10,
+            margin: '0 0 14px',
+            padding: '10px 12px',
+            background: '#FAFAFA',
+            border: '1px solid #EEE',
+            borderRadius: 10,
+          }}
+        >
+          <div>
+            <div style={{ fontSize: 10.5, fontWeight: 700, color: '#888', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+              Total staked
+            </div>
+            <div style={{ fontSize: 16, fontWeight: 800, marginTop: 2 }}>
+              {totalStakedNum != null ? fmtCompact(totalStakedNum) : '—'}{' '}
+              <span style={{ fontSize: 11, fontWeight: 600, color: '#888' }}>{symbol ? `$${symbol}` : ''}</span>
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 10.5, fontWeight: 700, color: '#888', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+              % of supply
+            </div>
+            <div style={{ fontSize: 16, fontWeight: 800, marginTop: 2, color: pctOfSupply != null ? '#0C0C0C' : '#888' }}>
+              {pctOfSupply != null ? `${pctOfSupply.toFixed(2)}%` : '—'}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 10.5, fontWeight: 700, color: '#888', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+              Supply
+            </div>
+            <div style={{ fontSize: 16, fontWeight: 800, marginTop: 2, color: supplyNum != null ? '#0C0C0C' : '#888' }}>
+              {supplyNum != null ? fmtCompact(supplyNum) : '—'}
+            </div>
+          </div>
+        </div>
+
         <p className="muted" style={{ fontSize: '0.875rem', margin: '0 0 12px' }}>
           Your balance: <strong>{balanceFmt} {symbol ? `$${symbol}` : ''}</strong>
         </p>
@@ -312,6 +429,7 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
               ))}
             </select>
           </div>
+          <NewPositionNotice existingCount={positions.length} contextLabel="Staking" />
           <button type="submit" disabled={busy} className="btn-primary" style={{ justifySelf: 'start' }}>
             {busy ? 'Submitting…' : `Stake ${tickerLabel}`}
           </button>

@@ -827,6 +827,39 @@ export default function LaunchView({
                   </button>
                 ))}
               </div>
+              <div
+                style={{
+                  marginTop: 12,
+                  display: 'flex',
+                  gap: 10,
+                  alignItems: 'flex-start',
+                  padding: '10px 12px',
+                  background: '#F0F9FF',
+                  border: '1px solid #BAE6FD',
+                  borderRadius: 10,
+                  fontSize: 12.5,
+                  color: '#075985',
+                  lineHeight: 1.5,
+                }}
+              >
+                <span aria-hidden style={{ fontSize: 14, lineHeight: 1, flexShrink: 0, marginTop: 1 }}>i</span>
+                <div>
+                  <strong>Auto-stake creates a new position</strong> with its own lock timer. You can
+                  stake again later from the token page — every stake stays as a separate, independently
+                  unstakeable position.{' '}
+                  <details style={{ display: 'inline' }}>
+                    <summary style={{ display: 'inline', cursor: 'pointer', textDecoration: 'underline', color: '#0369A1' }}>
+                      Why?
+                    </summary>
+                    <span style={{ display: 'block', marginTop: 6, color: '#0369A1' }}>
+                      Each stake locks tokens with its own timer — re-staking never extends an existing lock,
+                      so a 7-day stake added to a 30-day stake stays as two separate positions you can
+                      unstake independently when each lock ends. This prevents anyone from gaming the
+                      multiplier by topping up a long-locked position with new tokens.
+                    </span>
+                  </details>
+                </div>
+              </div>
             </div>
           )}
         </div>

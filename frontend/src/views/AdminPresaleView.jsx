@@ -420,10 +420,44 @@ export default function AdminPresaleView({ adminWallet }) {
         <p style={{ fontSize: 11, fontWeight: 700, color: MUTED, letterSpacing: '0.1em', textTransform: 'uppercase', margin: '0 0 12px' }}>
           Step 2 · Launch the token
         </p>
-        <p style={{ fontSize: 13, color: SUB, margin: '0 0 18px' }}>
+        <p style={{ fontSize: 13, color: SUB, margin: '0 0 14px' }}>
           Set <strong>Initial buy</strong> &gt; 0 — that&apos;s the bag distributed to presale contributors.
           Auto-stake-for-deployer is disabled in this mode (the entire bag goes to presalers).
         </p>
+        <div
+          style={{
+            display: 'flex',
+            gap: 10,
+            alignItems: 'flex-start',
+            padding: '10px 12px',
+            background: '#F0F9FF',
+            border: '1px solid #BAE6FD',
+            borderRadius: 10,
+            fontSize: 12.5,
+            color: '#075985',
+            lineHeight: 1.5,
+            margin: '0 0 18px',
+          }}
+        >
+          <span aria-hidden style={{ fontSize: 14, lineHeight: 1, flexShrink: 0, marginTop: 1 }}>i</span>
+          <div>
+            <strong>Each contributor receives a new position</strong> with its own lock timer
+            (default {lockDays} day{lockDays === 1 ? '' : 's'}). Contributors can stake more tokens
+            themselves later from the token page — every stake stays as an independently
+            unstakeable position alongside what we auto-stake here.{' '}
+            <details style={{ display: 'inline' }}>
+              <summary style={{ display: 'inline', cursor: 'pointer', textDecoration: 'underline', color: '#0369A1' }}>
+                Why?
+              </summary>
+              <span style={{ display: 'block', marginTop: 6, color: '#0369A1' }}>
+                Each stake locks tokens with its own timer — re-staking never extends an existing lock,
+                so this auto-stake doesn&apos;t collide with any positions a contributor already holds.
+                Their new presale position will sit alongside any prior ones, each with its own
+                independent unlock date.
+              </span>
+            </details>
+          </div>
+        </div>
         <LaunchView
           inline
           forceAutoStakeOff
