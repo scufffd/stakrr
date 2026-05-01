@@ -171,10 +171,15 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
         setPositions(owned);
         // Reward mints registered on the pool — used to surface the
         // "stake mint isn't a reward line" backfill prompt for the deployer.
+        // The on-chain field is `mint` (see RewardMint struct in IDL); calling
+        // `.tokenMint` returns undefined and the catch below would silently
+        // pin every pool to "not registered" forever. Caught after a real
+        // user hit unstake_early on yks7qy…pump and the banner that should
+        // have blocked them on a stale bundle missed firing entirely.
         try {
           const rms = await client.fetchAllRewardMints();
           if (cancelled) return;
-          setRewardTokenMints(rms.map((r) => r.account.tokenMint.toBase58()));
+          setRewardTokenMints(rms.map((r) => r.account.mint.toBase58()));
         } catch {
           if (!cancelled) setRewardTokenMints([]);
         }
