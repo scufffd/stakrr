@@ -13,7 +13,7 @@ import { useRouter } from './lib/router.js';
 const SKY = '#35C5E0';
 const INK = '#0C0C0C';
 const WHITE = '#FFFFFF';
-const GITHUB = import.meta.env.VITE_GITHUB_URL || 'https://github.com/scufffd';
+const GITHUB = import.meta.env.VITE_GITHUB_URL || 'https://github.com/scufffd/stakrr';
 
 function NavPill({ active, onClick, children }) {
   return (

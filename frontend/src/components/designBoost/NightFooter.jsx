@@ -5,7 +5,7 @@ const NIGHT = '#0D1829';
 const NIGHT_CLOUD = '#162035';
 const NIGHT_CLOUD_EDGE = '#1E2D48';
 const CYAN = '#35C5E0';
-const GITHUB_URL = import.meta.env.VITE_GITHUB_URL || 'https://github.com/scufffd';
+const GITHUB_URL = import.meta.env.VITE_GITHUB_URL || 'https://github.com/scufffd/stakrr';
 
 function DarkCloud({ width = 280, style = {}, className = '' }) {
   const uid = useId().replace(/:/g, '');

@@ -87,6 +87,33 @@ app.get('/api/health', (req, res) => {
 });
 
 /**
+ * Public, read-only configuration surface for docs / status pages.
+ *
+ * Exposes the on-chain identifiers users need to verify Stakrr's
+ * non-custodial claims for themselves (treasury wallet, stake program,
+ * pump_fees program) plus the fee-economics parameters. We deliberately
+ * avoid leaking anything secret.
+ */
+app.get('/api/info', (req, res) => {
+  res.json({
+    ok: true,
+    network: 'mainnet-beta',
+    programs: {
+      stake: config.programId.toBase58(),
+      pumpFees: 'pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ',
+      pumpBondingCurve: '6EF8rrecthR5Dkzon8NwuZ78hRvfCKubJ14M5uBEwF6P',
+    },
+    treasury: config.treasuryKeypair.publicKey.toBase58(),
+    feeRecipient: config.lockFees.recipient || config.treasuryKeypair.publicKey.toBase58(),
+    lockFeesEnabled: config.lockFees.enabled,
+    platformFeeBps: config.platformFeeBps,
+    minDistributeLamports: config.minDistributeLamports,
+    loopIntervalMs: config.loopIntervalMs,
+    repo: process.env.PUBLIC_REPO_URL || 'https://github.com/scufffd/stakrr',
+  });
+});
+
+/**
  * Pre-ground vanity mint pool inventory. Read-only. Used by the launch UI
  * (badge "✦ vanity 'pump' mint" when stock available) and by ops dashboards.
  *
