@@ -34,10 +34,12 @@ export const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZb
 // Anchor instruction discriminators (vendored from official IDL).
 const IX_CREATE_FEE_SHARING_CONFIG = Buffer.from([195, 78, 86, 76, 111, 52, 251, 213]);
 const IX_UPDATE_FEE_SHARES = Buffer.from([189, 13, 136, 99, 187, 164, 237, 35]);
-// distribute_creator_fees discriminator confirmed via mainnet tx 2ksJ594Y… (j7 lock).
-// Used by the worker to settle creator-fee splits. Not yet implemented here:
-// the worker keeps using PumpDev /api/claim-distribute as the entry point until
-// we stop depending on PumpDev for that path.
+// `DistributeCreatorFees` lives on the Pump BC program (not pump_fees). We
+// reverse-engineered the discriminator from a real on-chain settlement
+// (mainnet tx 4tpemzFM… — PumpDev's /api/claim-distribute call), so we can
+// build the same instruction natively and skip PumpDev's 0.0025 SOL
+// commission per cycle. The instruction takes no data args.
+const IX_BC_DISTRIBUTE_CREATOR_FEES = Buffer.from([0xa5, 0x72, 0x67, 0x00, 0x79, 0xce, 0xf7, 0x51]);
 
 // Anchor account discriminator for FeeSharingConfig (vendored from official IDL via:
 // `jq '.accounts[] | select(.name == "FeeSharingConfig")' pump_fees.json`).
@@ -310,4 +312,54 @@ export async function buildLockFeesUnsignedTx({
   tx.recentBlockhash = blockhash;
   tx.feePayer = deployer;
   return { tx, blockhash, lastValidBlockHeight };
+}
+
+/**
+ * Build the Pump BC `DistributeCreatorFees` instruction natively. This is the
+ * same instruction PumpDev's `/api/claim-distribute` invokes for fee-shared
+ * tokens — but PumpDev tacks on an extra `SystemProgram::Transfer` of
+ * 2,500,000 lamports to their tip wallet (`3qc8Hun2xNJxQXDB26C8JBtHaY1sKKrCuK9SxERAHGEk`)
+ * as a flat commission. Building it ourselves saves that 0.0025 SOL per cycle
+ * across every locked token.
+ *
+ * The instruction takes no data args — the BC program reads share % from the
+ * FeeSharingConfig PDA and pays each shareholder via SystemProgram CPIs from
+ * the creator-vault PDA's lamport balance.
+ *
+ * Account order (validated against on-chain tx 4tpemzFM…, see
+ * `scripts/derive-distribute-accounts.mjs` history):
+ *   [0] mint                — input
+ *   [1] bonding_curve PDA   — `["bonding-curve", mint]` under PUMP_BC, writable (mut state)
+ *   [2] sharing_config PDA  — `["sharing-config", mint]` under pump_fees, writable (read state, lamport pay)
+ *   [3] creator_vault PDA   — `["creator-vault", sharing_config]` under PUMP_BC, writable (lamport source)
+ *   [4] system_program
+ *   [5] event_authority     — `["__event_authority"]` under PUMP_BC
+ *   [6] PUMP_BC program     — self-reference (Anchor convention)
+ *   [7] payer/signer        — pays tx fee; receives nothing in our case
+ *
+ * @param {{ payer: PublicKey, mint: PublicKey }} args
+ * @returns {TransactionInstruction}
+ */
+export function buildBondingCurveDistributeFeesIx({ payer, mint }) {
+  const sharingConfig = findFeeSharingConfigPda(mint);
+  const bondingCurve  = findBondingCurvePda(mint);
+  const creatorVault  = findPumpCreatorVaultPda(sharingConfig);
+  const eventAuth     = findPumpEventAuthorityPda();
+
+  const keys = [
+    { pubkey: mint,                       isSigner: false, isWritable: false },
+    { pubkey: bondingCurve,               isSigner: false, isWritable: true  },
+    { pubkey: sharingConfig,              isSigner: false, isWritable: true  },
+    { pubkey: creatorVault,               isSigner: false, isWritable: true  },
+    { pubkey: SystemProgram.programId,    isSigner: false, isWritable: false },
+    { pubkey: eventAuth,                  isSigner: false, isWritable: false },
+    { pubkey: PUMP_BC_PROGRAM_ID,         isSigner: false, isWritable: false },
+    { pubkey: payer,                      isSigner: true,  isWritable: true  },
+  ];
+
+  return new TransactionInstruction({
+    programId: PUMP_BC_PROGRAM_ID,
+    keys,
+    data: Buffer.from(IX_BC_DISTRIBUTE_CREATOR_FEES),
+  });
 }

@@ -88,12 +88,32 @@ export async function buildCreateTokenTx({
   if (json.error) {
     throw new Error(`PumpDev /api/create error: ${json.error}`);
   }
-  if (!json.mint || !json.mintSecretKey || !json.transaction) {
+  if (!json.transaction) {
     throw new Error(`PumpDev /api/create missing fields: ${text.slice(0, 200)}`);
   }
-  const mintKeypair = Keypair.fromSecretKey(bs58.decode(json.mintSecretKey));
+  // PumpDev only returns `mint`/`mintSecretKey` when it generated the mint
+  // itself. When we pass our own `mintKeypair` (vanity/ephemeral), the
+  // response shrinks to `{ transaction }` — we already know the keypair, so
+  // reconstruct it locally instead of requiring the echo.
+  let mintKeypair;
+  let mint = json.mint || null;
+  if (mintKeypairSecretB58) {
+    mintKeypair = Keypair.fromSecretKey(bs58.decode(mintKeypairSecretB58));
+    const localMint = mintKeypair.publicKey.toBase58();
+    if (mint && mint !== localMint) {
+      throw new Error(
+        `PumpDev /api/create mint mismatch: server=${mint} local=${localMint}`,
+      );
+    }
+    mint = localMint;
+  } else {
+    if (!json.mint || !json.mintSecretKey) {
+      throw new Error(`PumpDev /api/create missing mint fields: ${text.slice(0, 200)}`);
+    }
+    mintKeypair = Keypair.fromSecretKey(bs58.decode(json.mintSecretKey));
+  }
   const tx = VersionedTransaction.deserialize(bs58.decode(json.transaction));
-  return { tx, mint: json.mint, mintKeypair };
+  return { tx, mint, mintKeypair };
 }
 
 /**

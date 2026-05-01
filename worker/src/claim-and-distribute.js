@@ -10,9 +10,9 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
-  TransactionInstruction,
-  sendAndConfirmTransaction,
 } from '@solana/web3.js';
+import { confirmSignature, signAndPollConfirm } from './confirm.js';
+import { buildBondingCurveDistributeFeesIx } from './pump-fees.js';
 import {
   createAssociatedTokenAccountIdempotentInstruction,
   getAccount,
@@ -53,10 +53,60 @@ async function claimCreatorFees(connection, treasury, { mint, feeLocked = false 
   const beforeLamports = await getSolBalance(connection, treasury.publicKey);
   let signature = null;
   let distributeSig = null;
+  let distributePath = null; // 'native' | 'pumpdev' | null
   try {
-    // Fee-sharing tokens: settle vault → shareholders first (PumpDev claim-distribute).
-    // https://pumpdev.io/claim-distribute — harmless to skip if mint has no share config.
-    if (mint) {
+    // Fee-sharing tokens: settle vault → shareholders first.
+    //
+    // Preferred path: build Pump BC's `DistributeCreatorFees` ix natively. We
+    // own the discriminator + account layout (see pump-fees.js comments), and
+    // it's a pure on-chain settlement — no PumpDev tip wallet involved. Saves
+    // ~0.0025 SOL per cycle vs PumpDev's `/api/claim-distribute`.
+    //
+    // Fallback path: PumpDev's hosted endpoint (https://pumpdev.io/claim-distribute).
+    // Used only if the native ix simulation/send fails (program upgrade, account
+    // layout change, etc.) so we don't paint ourselves into a corner.
+    if (mint && feeLocked) {
+      try {
+        const mintPk = new PublicKey(mint);
+        const ix = buildBondingCurveDistributeFeesIx({
+          payer: treasury.publicKey,
+          mint: mintPk,
+        });
+        const tx = new Transaction();
+        const fee = priorityFeeIx();
+        if (fee) tx.add(fee);
+        tx.add(ix);
+        distributeSig = await signAndPollConfirm(connection, tx, [treasury], {
+          commitment: 'confirmed',
+          label: 'native-distribute',
+        });
+        distributePath = 'native';
+        log('claim: native distribute ok', { mint, sig: distributeSig });
+      } catch (eNative) {
+        log('claim: native distribute failed, falling back to pumpdev', {
+          mint,
+          error: eNative.message,
+        });
+        try {
+          const dist = await buildClaimDistributeTx({
+            publicKey: treasury.publicKey.toBase58(),
+            mint,
+          });
+          dist.sign([treasury]);
+          distributeSig = await connection.sendRawTransaction(dist.serialize(), {
+            skipPreflight: false,
+            maxRetries: 3,
+          });
+          await confirmSignature(connection, distributeSig, { commitment: 'confirmed', label: 'pumpdev-distribute' });
+          distributePath = 'pumpdev';
+          log('claim: pumpdev distribute ok', { mint, sig: distributeSig });
+        } catch (ePumpdev) {
+          log('claim: both distribute paths failed', { mint, native: eNative.message, pumpdev: ePumpdev.message });
+        }
+      }
+    } else if (mint) {
+      // Non-locked legacy token still needs PumpDev (their hosted endpoint
+      // also handles the `claim_account` flow for unshared creator-vaults).
       try {
         const dist = await buildClaimDistributeTx({
           publicKey: treasury.publicKey.toBase58(),
@@ -65,12 +115,13 @@ async function claimCreatorFees(connection, treasury, { mint, feeLocked = false 
         dist.sign([treasury]);
         distributeSig = await connection.sendRawTransaction(dist.serialize(), {
           skipPreflight: false,
-          maxRetries: 2,
+          maxRetries: 3,
         });
-        await connection.confirmTransaction(distributeSig, 'confirmed');
-        log('claim: claim-distribute ok', { mint, sig: distributeSig });
+        await confirmSignature(connection, distributeSig, { commitment: 'confirmed', label: 'pumpdev-distribute' });
+        distributePath = 'pumpdev';
+        log('claim: pumpdev distribute ok', { mint, sig: distributeSig });
       } catch (e) {
-        log('claim: claim-distribute skipped', { mint, error: e.message });
+        log('claim: pumpdev distribute skipped', { mint, error: e.message });
       }
     }
 
@@ -83,20 +134,20 @@ async function claimCreatorFees(connection, treasury, { mint, feeLocked = false 
         mint,
       });
       vt.sign([treasury]);
-      signature = await connection.sendRawTransaction(vt.serialize(), { skipPreflight: false });
-      await connection.confirmTransaction(signature, 'confirmed');
+      signature = await connection.sendRawTransaction(vt.serialize(), { skipPreflight: false, maxRetries: 3 });
+      await confirmSignature(connection, signature, { commitment: 'confirmed', label: 'claim-account' });
     }
   } catch (e) {
     log('claim: pumpdev claim failed', { error: e.message });
-    return { claimedLamports: 0n, signature: null, distributeSig };
+    return { claimedLamports: 0n, signature: null, distributeSig, distributePath };
   }
   const afterLamports = await getSolBalance(connection, treasury.publicKey);
   const delta = afterLamports - beforeLamports;
   // Subtract a tx-fee floor; if delta is negative or tiny, treat as zero.
   if (delta < 5_000n) {
-    return { claimedLamports: 0n, signature, distributeSig };
+    return { claimedLamports: 0n, signature, distributeSig, distributePath };
   }
-  return { claimedLamports: delta, signature, distributeSig };
+  return { claimedLamports: delta, signature, distributeSig, distributePath };
 }
 
 function splitFees(claimedLamports) {
@@ -128,9 +179,9 @@ async function depositSolAsWsolToPool({ connection, treasury, stakeMint, lamport
   for (const ix of wrap.ixs) tx.add(ix);
   tx.add(dep.ix);
 
-  const signature = await sendAndConfirmTransaction(connection, tx, [treasury], {
+  const signature = await signAndPollConfirm(connection, tx, [treasury], {
     commitment: 'confirmed',
-    preflightCommitment: 'confirmed',
+    label: 'deposit_rewards(wsol)',
   });
   return signature;
 }
@@ -171,8 +222,8 @@ async function depositTokensToPool({ connection, treasury, stakeMint, lamports }
     pool: 'auto',
   });
   buyTx.sign([treasury]);
-  const buySig = await connection.sendRawTransaction(buyTx.serialize(), { skipPreflight: false });
-  await connection.confirmTransaction(buySig, 'confirmed');
+  const buySig = await connection.sendRawTransaction(buyTx.serialize(), { skipPreflight: false, maxRetries: 3 });
+  await confirmSignature(connection, buySig, { commitment: 'confirmed', label: 'pump-buy' });
 
   // 2) Compute how many tokens we actually got, with a tiny retry to allow
   //    the ATA balance to settle on the RPC.
@@ -202,9 +253,9 @@ async function depositTokensToPool({ connection, treasury, stakeMint, lamports }
   const fee = priorityFeeIx();
   if (fee) tx.add(fee);
   tx.add(dep.ix);
-  const depositSig = await sendAndConfirmTransaction(connection, tx, [treasury], {
+  const depositSig = await signAndPollConfirm(connection, tx, [treasury], {
     commitment: 'confirmed',
-    preflightCommitment: 'confirmed',
+    label: 'deposit_rewards(token)',
   });
   return { buySig, depositSig, depositedRaw: acquiredRaw.toString() };
 }
@@ -328,9 +379,9 @@ async function pushClaimsToActiveStakers({ connection, stakeMint, rewardMint }) 
   const sigs = [];
   for (const tx of txs) {
     try {
-      const s = await sendAndConfirmTransaction(connection, tx, [authority], {
+      const s = await signAndPollConfirm(connection, tx, [authority], {
         commitment: 'confirmed',
-        preflightCommitment: 'confirmed',
+        label: 'claim_push',
       });
       sigs.push(s);
     } catch (e) {
@@ -433,7 +484,7 @@ export async function runPoolCycle({ pool }) {
   //    correct claim instruction when fee-sharing is configured. Locked tokens
   //    rely entirely on claim-distribute (the BC creator is a PDA, not the
   //    treasury) so we skip the legacy claim-account call for them.
-  const { claimedLamports, signature: claimSig, distributeSig } = await claimCreatorFees(
+  const { claimedLamports, signature: claimSig, distributeSig, distributePath } = await claimCreatorFees(
     connection,
     treasury,
     { mint: pool.stakeMint, feeLocked: !!pool.feeLock },
@@ -443,6 +494,7 @@ export async function runPoolCycle({ pool }) {
     claimedLamports: claimedLamports.toString(),
     claimSig,
     distributeSig,
+    distributePath,
   });
   if (claimedLamports > 0n) {
     updatePoolFields(pool.stakeMint, { lastClaimedAt: new Date().toISOString() });
