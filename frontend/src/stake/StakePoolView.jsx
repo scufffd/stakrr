@@ -11,6 +11,7 @@ import BN from 'bn.js';
 import { LOCK_TIERS } from '../staking-sdk/index.js';
 import { claimPositionRewards } from './claimPosition.js';
 import { useStakePoolClient } from './useStakePoolClient.js';
+import { confirmWithFallback } from '../lib/confirm.js';
 
 const WSOL = new PublicKey('So11111111111111111111111111111111111111112');
 
@@ -119,8 +120,8 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
     tx.recentBlockhash = blockhash;
     for (const ix of ixs) tx.add(ix);
     const signed = await walletState.signTransaction(tx);
-    const sig = await connection.sendRawTransaction(signed.serialize(), { skipPreflight: false });
-    await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
+    const sig = await connection.sendRawTransaction(signed.serialize(), { skipPreflight: false, maxRetries: 3 });
+    await confirmWithFallback(connection, sig, { blockhash, lastValidBlockHeight }, { commitment: 'confirmed' });
     return sig;
   }, [walletState, connection, wallet]);
 

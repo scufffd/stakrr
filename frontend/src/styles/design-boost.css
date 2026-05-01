@@ -13,6 +13,8 @@ body,
 #root {
   background: var(--db-sky) !important;
   color: var(--db-ink) !important;
+  overflow-x: hidden;
+  max-width: 100vw;
 }
 
 .design-boost-shell {
@@ -334,5 +336,177 @@ body,
     padding: 32px 48px !important;
     flex-direction: row !important;
     align-items: center !important;
+  }
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * Marketing homepage — mobile-first responsive shell.
+ *
+ * The original markup uses fixed inline styles tuned for desktop:
+ *   padding: '0 48px'   → blows past viewport on phones
+ *   fontSize: 'clamp(72px, 13vw, 155px)' → 72px MIN forces overflow at <480px
+ *   letter-spacing: -4px → magnifies overflow when text shrinks
+ *
+ * These classes override the inline styles via `!important` so the JSX can
+ * keep using inline styles for everything that ISN'T size/padding-sensitive.
+ * Sizes use mobile-first clamps with min ≈ 32-40px so text always fits a
+ * 320px viewport.
+ * ─────────────────────────────────────────────────────────────────────────── */
+.db-home-hero-pad {
+  padding-left: 16px !important;
+  padding-right: 16px !important;
+}
+
+.db-home-section-pad {
+  padding-left: 16px !important;
+  padding-right: 16px !important;
+  padding-top: 72px !important;
+  padding-bottom: 72px !important;
+}
+
+.db-home-section-pad-tall {
+  padding-left: 16px !important;
+  padding-right: 16px !important;
+  padding-top: 96px !important;
+  padding-bottom: 96px !important;
+}
+
+.db-home-section-pad-callout {
+  padding-left: 16px !important;
+  padding-right: 16px !important;
+  padding-top: 96px !important;
+  padding-bottom: 120px !important;
+}
+
+@media (min-width: 768px) {
+  .db-home-hero-pad {
+    padding-left: 48px !important;
+    padding-right: 48px !important;
+  }
+
+  .db-home-section-pad {
+    padding-left: 48px !important;
+    padding-right: 48px !important;
+    padding-top: 120px !important;
+    padding-bottom: 120px !important;
+  }
+
+  .db-home-section-pad-tall {
+    padding-left: 48px !important;
+    padding-right: 48px !important;
+    padding-top: 140px !important;
+    padding-bottom: 140px !important;
+  }
+
+  .db-home-section-pad-callout {
+    padding-left: 48px !important;
+    padding-right: 48px !important;
+    padding-top: 140px !important;
+    padding-bottom: 160px !important;
+  }
+}
+
+/* Headline scales: lower minimums so text fits a 320px viewport. */
+.db-home-h1 {
+  font-size: clamp(40px, 13vw, 155px) !important;
+  letter-spacing: -0.025em !important; /* relative letter-spacing scales with text */
+  line-height: 0.88 !important;
+}
+
+.db-home-h2-big {
+  font-size: clamp(36px, 9vw, 110px) !important;
+  letter-spacing: -0.025em !important;
+  line-height: 0.9 !important;
+}
+
+.db-home-h2-med {
+  font-size: clamp(30px, 7vw, 80px) !important;
+  letter-spacing: -0.02em !important;
+  line-height: 0.92 !important;
+}
+
+.db-home-h2-small {
+  font-size: clamp(30px, 6vw, 72px) !important;
+  letter-spacing: -0.02em !important;
+  line-height: 0.92 !important;
+}
+
+.db-home-num-huge {
+  font-size: clamp(80px, 22vw, 260px) !important;
+  letter-spacing: -0.03em !important;
+  line-height: 0.82 !important;
+}
+
+/* Floating callout card — hide on phones (it overlaps the hero headline) */
+.db-home-hero-card {
+  display: block;
+}
+
+@media (max-width: 600px) {
+  .db-home-hero-card {
+    display: none !important;
+  }
+}
+
+/* Hero section: shorten on mobile so headlines stack readably */
+@media (max-width: 600px) {
+  .db-home-hero-section {
+    min-height: 92vh !important;
+  }
+}
+
+/* Inner pages — hero h1 (Launch / Stake / Profile / Docs titles) */
+.db-inner-hero-h1 {
+  font-size: clamp(32px, 9vw, 110px) !important;
+  letter-spacing: -0.025em !important;
+  line-height: 0.92 !important;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+
+/* Night footer (final dark section) */
+.db-night-footer-section {
+  padding: 100px 16px 120px !important;
+}
+
+.db-night-footer-h2 {
+  font-size: clamp(40px, 10vw, 120px) !important;
+  letter-spacing: -0.025em !important;
+  line-height: 0.92 !important;
+}
+
+.db-night-footer-grid {
+  grid-template-columns: 1fr !important;
+  gap: 32px !important;
+}
+
+@media (min-width: 768px) {
+  .db-night-footer-section {
+    padding: 160px 48px 200px !important;
+  }
+  .db-night-footer-grid {
+    grid-template-columns: 1fr 1fr 1fr !important;
+    gap: 40px !important;
+  }
+}
+
+/* Long Solana addresses (e.g. mint pubkeys) wrap on phones instead of
+ * pushing the layout off-screen. We scope to monospace font usage so
+ * normal copy isn't affected. */
+@media (max-width: 600px) {
+  [style*="DM Mono"],
+  code,
+  pre {
+    word-break: break-all;
+    overflow-wrap: anywhere;
+  }
+}
+
+/* Ensure flex/grid children can shrink below their content's intrinsic
+ * width on phones (fixes overflow when long addresses sit in flex rows). */
+@media (max-width: 600px) {
+  .db-content-shell *,
+  .db-inner-hero * {
+    min-width: 0;
   }
 }

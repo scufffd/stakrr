@@ -153,11 +153,9 @@ export default function App() {
                 style={{ margin: '0 auto 10px', display: 'block' }}
               />
               <h1
+                className="db-inner-hero-h1"
                 style={{
                   fontWeight: 800,
-                  fontSize: 'clamp(44px, 9vw, 110px)',
-                  lineHeight: 0.88,
-                  letterSpacing: '-3px',
                   color: INK,
                   margin: 0,
                   fontFamily: "'Syne', sans-serif",

@@ -88,6 +88,7 @@ export default function HomePage({ onSelectToken, onLaunch, navSlot }) {
   return (
     <div style={{ fontFamily: "'Syne', sans-serif", background: SKY }}>
       <section
+        className="db-home-hero-section"
         style={{
           position: 'relative',
           height: '100vh',
@@ -152,22 +153,20 @@ export default function HomePage({ onSelectToken, onLaunch, navSlot }) {
         </div>
 
         <div
+          className="db-home-hero-pad"
           style={{
             position: 'absolute',
             bottom: '16%',
             left: 0,
             right: 0,
             zIndex: 3,
-            padding: '0 48px',
             transform: `translateY(${-scrollY * 0.18}px)`,
           }}
         >
           <h1
+            className="db-home-h1"
             style={{
               fontWeight: 800,
-              fontSize: 'clamp(72px, 13vw, 155px)',
-              lineHeight: 0.88,
-              letterSpacing: '-4px',
               color: INK,
               margin: 0,
               userSelect: 'none',
@@ -180,7 +179,7 @@ export default function HomePage({ onSelectToken, onLaunch, navSlot }) {
         </div>
 
         <div
-          className="float-card"
+          className="float-card db-home-hero-card"
           style={{
             position: 'absolute',
             bottom: '26%',
@@ -201,23 +200,23 @@ export default function HomePage({ onSelectToken, onLaunch, navSlot }) {
         </div>
 
         <div
+          className="db-home-hero-pad"
           style={{
             position: 'absolute',
             bottom: '5%',
             left: 0,
             right: 0,
             zIndex: 3,
-            padding: '0 48px',
             transform: `translateY(${-scrollY * 0.12}px)`,
           }}
         >
           <span
+            className="db-home-h1"
             style={{
               fontWeight: 800,
-              fontSize: 'clamp(72px, 13vw, 155px)',
-              lineHeight: 0.88,
-              letterSpacing: '-4px',
               color: INK,
+              display: 'inline-block',
+              maxWidth: '100%',
             }}
           >
             launchpad
@@ -256,10 +255,10 @@ export default function HomePage({ onSelectToken, onLaunch, navSlot }) {
 
       <section
         ref={r1.ref}
+        className="db-home-section-pad"
         style={{
           position: 'relative',
           background: SKY,
-          padding: '120px 48px',
           overflow: 'hidden',
           minHeight: '80vh',
           display: 'flex',
@@ -295,11 +294,9 @@ export default function HomePage({ onSelectToken, onLaunch, navSlot }) {
 
           <div style={revealStyle(r1.visible, 80, 'up')}>
             <h2
+              className="db-home-h2-big"
               style={{
                 fontWeight: 800,
-                fontSize: 'clamp(52px, 9vw, 110px)',
-                lineHeight: 0.9,
-                letterSpacing: '-3px',
                 color: INK,
                 margin: 0,
                 maxWidth: 900,
@@ -360,9 +357,9 @@ export default function HomePage({ onSelectToken, onLaunch, navSlot }) {
 
       <section
         ref={r2.ref}
+        className="db-home-section-pad"
         style={{
           background: WHITE,
-          padding: '120px 48px',
           borderRadius: '48px 48px 0 0',
           position: 'relative',
           zIndex: 4,
@@ -384,11 +381,9 @@ export default function HomePage({ onSelectToken, onLaunch, navSlot }) {
               how it works
             </p>
             <h2
+              className="db-home-h2-med"
               style={{
                 fontWeight: 800,
-                fontSize: 'clamp(40px, 7vw, 80px)',
-                lineHeight: 0.9,
-                letterSpacing: '-2px',
                 color: INK,
                 margin: '0 0 72px',
               }}
@@ -450,7 +445,8 @@ export default function HomePage({ onSelectToken, onLaunch, navSlot }) {
 
       <section
         ref={r3.ref}
-        style={{ background: SKY, padding: '140px 48px', position: 'relative', overflow: 'hidden' }}
+        className="db-home-section-pad-tall"
+        style={{ background: SKY, position: 'relative', overflow: 'hidden' }}
       >
         <Cloud
           width={500}
@@ -477,11 +473,9 @@ export default function HomePage({ onSelectToken, onLaunch, navSlot }) {
           <div style={{ display: 'flex', alignItems: 'flex-end', gap: 32, flexWrap: 'wrap', marginBottom: 64 }}>
             <div style={revealStyle(r3.visible, 60, 'up')}>
               <p
+                className="db-home-num-huge"
                 style={{
                   fontWeight: 800,
-                  fontSize: 'clamp(120px, 22vw, 260px)',
-                  lineHeight: 0.82,
-                  letterSpacing: '-8px',
                   color: INK,
                   margin: 0,
                 }}
@@ -547,7 +541,11 @@ export default function HomePage({ onSelectToken, onLaunch, navSlot }) {
         <MarqueeStrip />
       </section>
 
-      <section ref={r5.ref} style={{ background: WHITE, padding: '20px 48px 100px' }}>
+      <section
+        ref={r5.ref}
+        className="db-home-hero-pad"
+        style={{ background: WHITE, paddingTop: 20, paddingBottom: 100 }}
+      >
         <div style={{ maxWidth: 1200, margin: '0 auto' }}>
           <div style={revealStyle(r5.visible, 0, 'up')}>
             <div
@@ -574,11 +572,9 @@ export default function HomePage({ onSelectToken, onLaunch, navSlot }) {
                   explore
                 </p>
                 <h2
+                  className="db-home-h2-small"
                   style={{
                     fontWeight: 800,
-                    fontSize: 'clamp(40px, 6vw, 72px)',
-                    lineHeight: 0.9,
-                    letterSpacing: '-2px',
                     color: INK,
                     margin: 0,
                   }}
@@ -614,7 +610,8 @@ export default function HomePage({ onSelectToken, onLaunch, navSlot }) {
 
       <section
         ref={r6.ref}
-        style={{ background: SKY, padding: '140px 48px 160px', position: 'relative', overflow: 'hidden' }}
+        className="db-home-section-pad-callout"
+        style={{ background: SKY, position: 'relative', overflow: 'hidden' }}
       >
         <CloudStrip />
         <Cloud
@@ -645,11 +642,9 @@ export default function HomePage({ onSelectToken, onLaunch, navSlot }) {
           </div>
           <div style={revealStyle(r6.visible, 80, 'up')}>
             <h2
+              className="db-home-h1"
               style={{
                 fontWeight: 800,
-                fontSize: 'clamp(72px, 14vw, 160px)',
-                lineHeight: 0.88,
-                letterSpacing: '-4px',
                 color: INK,
                 margin: '0 0 60px',
               }}
@@ -684,6 +679,7 @@ export default function HomePage({ onSelectToken, onLaunch, navSlot }) {
           </div>
 
           <div
+            className="db-home-hero-card"
             style={{
               position: 'absolute',
               top: '20%',

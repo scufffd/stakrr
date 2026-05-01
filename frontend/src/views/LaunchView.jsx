@@ -3,6 +3,7 @@ import { Buffer } from 'buffer';
 import { Transaction, VersionedTransaction } from '@solana/web3.js';
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { apiUrl } from '../apiBase.js';
+import { confirmWithFallback } from '../lib/confirm.js';
 
 const LOCK_TIERS = [
   { days: 1, mult: '1.00×', color: '#94A3B8' },
@@ -250,27 +251,31 @@ export default function LaunchView({ onLaunched }) {
       const signedLock = lockTx ? signed[cursor++] : null;
       const signedPool = signed[cursor++];
 
+      const bhCreate = await connection.getLatestBlockhash('confirmed');
       const createSig = await connection.sendRawTransaction(signedCreate.serialize(), {
         skipPreflight: false,
         maxRetries: 3,
       });
-      const bhCreate = await connection.getLatestBlockhash('confirmed');
-      await connection.confirmTransaction(
-        { signature: createSig, blockhash: bhCreate.blockhash, lastValidBlockHeight: bhCreate.lastValidBlockHeight },
-        'confirmed',
+      await confirmWithFallback(
+        connection,
+        createSig,
+        { blockhash: bhCreate.blockhash, lastValidBlockHeight: bhCreate.lastValidBlockHeight },
+        { commitment: 'confirmed' },
       );
 
       let lockFeesSig = null;
       if (signedLock) {
         try {
+          const bhLock = await connection.getLatestBlockhash('confirmed');
           lockFeesSig = await connection.sendRawTransaction(signedLock.serialize(), {
             skipPreflight: false,
             maxRetries: 3,
           });
-          const bhLock = await connection.getLatestBlockhash('confirmed');
-          await connection.confirmTransaction(
-            { signature: lockFeesSig, blockhash: bhLock.blockhash, lastValidBlockHeight: bhLock.lastValidBlockHeight },
-            'confirmed',
+          await confirmWithFallback(
+            connection,
+            lockFeesSig,
+            { blockhash: bhLock.blockhash, lastValidBlockHeight: bhLock.lastValidBlockHeight },
+            { commitment: 'confirmed' },
           );
         } catch (err) {
           // Don't hard-fail the whole launch — surface a warning so the user
@@ -282,14 +287,16 @@ export default function LaunchView({ onLaunched }) {
       }
 
       const rm = prep.rewardMode || rewardMode;
+      const bhPool = await connection.getLatestBlockhash('confirmed');
       const poolSig = await connection.sendRawTransaction(signedPool.serialize(), {
         skipPreflight: false,
         maxRetries: 3,
       });
-      const bhPool = await connection.getLatestBlockhash('confirmed');
-      await connection.confirmTransaction(
-        { signature: poolSig, blockhash: bhPool.blockhash, lastValidBlockHeight: bhPool.lastValidBlockHeight },
-        'confirmed',
+      await confirmWithFallback(
+        connection,
+        poolSig,
+        { blockhash: bhPool.blockhash, lastValidBlockHeight: bhPool.lastValidBlockHeight },
+        { commitment: 'confirmed' },
       );
 
       let autoStakeSig = null;
@@ -317,18 +324,16 @@ export default function LaunchView({ onLaunched }) {
             }
             const asTx = Transaction.from(Buffer.from(asJson.autoStakeTxBase64, 'base64'));
             const signedAs = await signTransaction(asTx);
+            const bhAs = await connection.getLatestBlockhash('confirmed');
             autoStakeSig = await connection.sendRawTransaction(signedAs.serialize(), {
               skipPreflight: false,
               maxRetries: 3,
             });
-            const bhAs = await connection.getLatestBlockhash('confirmed');
-            await connection.confirmTransaction(
-              {
-                signature: autoStakeSig,
-                blockhash: bhAs.blockhash,
-                lastValidBlockHeight: bhAs.lastValidBlockHeight,
-              },
-              'confirmed',
+            await confirmWithFallback(
+              connection,
+              autoStakeSig,
+              { blockhash: bhAs.blockhash, lastValidBlockHeight: bhAs.lastValidBlockHeight },
+              { commitment: 'confirmed' },
             );
             break;
           } catch (err) {

@@ -184,8 +184,8 @@ export default function NightFooter({ onLaunch }) {
         display: 'flex',
         flexDirection: 'column',
         justifyContent: 'center',
-        padding: '160px 48px 200px',
       }}
+      className="db-night-footer-section"
     >
       <DarkCloudStrip />
       <DarkCloudStripBottom />
@@ -235,11 +235,9 @@ export default function NightFooter({ onLaunch }) {
 
       <div style={{ position: 'relative', zIndex: 4, maxWidth: 1100, margin: '0 auto', width: '100%' }}>
         <h2
+          className="db-night-footer-h2"
           style={{
             fontWeight: 800,
-            fontSize: 'clamp(56px, 10vw, 120px)',
-            lineHeight: 0.9,
-            letterSpacing: '-3px',
             color: CYAN,
             margin: '0 0 64px',
           }}
@@ -250,6 +248,7 @@ export default function NightFooter({ onLaunch }) {
         </h2>
 
         <div
+          className="db-night-footer-grid"
           style={{
             display: 'grid',
             gridTemplateColumns: '1fr 1fr 1fr',
