@@ -81,6 +81,7 @@ export async function buildPresaleAutoStakeBatches({
   lockDays,
   tokenTotalRaw,
   excludeWallets = [],
+  minTransferLamports,
 }) {
   const connection = getConnection();
   const stakeMint = new PublicKey(mint);
@@ -97,6 +98,7 @@ export async function buildPresaleAutoStakeBatches({
     presaleWallet,
     cutoffSignature,
     excludeWallets,
+    minTransferLamports,
   });
 
   if (!scan.contributors.length) {

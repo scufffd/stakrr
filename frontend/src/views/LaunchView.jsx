@@ -141,7 +141,30 @@ async function tryClientPumpfunMetadata({ name, symbol, description, twitter, te
   return { uri, imageUrl };
 }
 
-export default function LaunchView({ onLaunched }) {
+/**
+ * Props:
+ *   onLaunched(mint)        — called once the launch finalises on-chain.
+ *   inline                  — when true, skip the success screen entirely
+ *                             and call onLaunched immediately. Used by the
+ *                             admin presale view, which embeds this form
+ *                             and chains its own UI off onLaunched.
+ *   forceAutoStakeOff       — when true, hide the deployer auto-stake
+ *                             checkbox and never auto-stake the deployer.
+ *                             The admin presale flow needs this because
+ *                             the entire dev-buy bag goes to presale
+ *                             contributors, not the deployer.
+ *   submitLabel             — optional override for the submit button text
+ *                             (e.g. "Launch & auto-stake presale").
+ *   gateMessage             — optional message shown above the form
+ *                             (e.g. "Step 1: Launch the token").
+ */
+export default function LaunchView({
+  onLaunched,
+  inline = false,
+  forceAutoStakeOff = false,
+  submitLabel,
+  gateMessage,
+}) {
   const { connection } = useConnection();
   const wallet = useWallet();
   const { publicKey, signTransaction, signAllTransactions } = wallet;
@@ -164,7 +187,7 @@ export default function LaunchView({ onLaunched }) {
 
   const walletConnected = !!publicKey;
   const buyAmount = Number(initialBuy || 0);
-  const canAutoStake = walletConnected && buyAmount > 0;
+  const canAutoStake = !forceAutoStakeOff && walletConnected && buyAmount > 0;
   const autoStakeActive = canAutoStake && autoStake;
 
   const onPickImage = (e) => {
@@ -368,7 +391,10 @@ export default function LaunchView({ onLaunched }) {
       setResult(data);
       const mint = data.stakeMint || data.mint;
       if (typeof onLaunched === 'function' && mint) {
-        setTimeout(() => onLaunched(mint), 2000);
+        // In inline mode (admin presale view) the parent immediately
+        // chains into the next step — no 2s "opening your token" delay.
+        if (inline) onLaunched(mint, data);
+        else setTimeout(() => onLaunched(mint), 2000);
       }
     } catch (err) {
       setError(err.message || String(err));
@@ -378,6 +404,20 @@ export default function LaunchView({ onLaunched }) {
   };
 
   const launchedMint = result?.stakeMint || result?.mint;
+
+  // Inline mode: skip the success screen entirely. The parent (admin
+  // presale view) renders its own combined progress UI.
+  if (result && inline) {
+    return (
+      <div style={{ background: '#ECFDF5', border: '1px solid #BBF7D0', borderRadius: 12, padding: '14px 18px', color: '#065f46' }}>
+        <strong>Launched.</strong>{' '}
+        <code style={{ fontFamily: "'DM Mono', monospace", fontSize: 13 }}>
+          {launchedMint?.slice(0, 6)}…{launchedMint?.slice(-6)}
+        </code>{' '}
+        — proceeding to presale auto-stake.
+      </div>
+    );
+  }
 
   if (result) {
     return (
@@ -525,21 +565,30 @@ export default function LaunchView({ onLaunched }) {
   ];
 
   return (
-    <div style={{ maxWidth: 640, margin: '0 auto' }}>
-      <h2
-        style={{
-          fontWeight: 800,
-          fontSize: 28,
-          margin: '0 0 4px',
-          letterSpacing: '-0.5px',
-          fontFamily: "'Syne', sans-serif",
-        }}
-      >
-        Launch a token
-      </h2>
-      <p style={{ color: '#888', fontSize: 14, margin: '0 0 32px', fontWeight: 500 }}>
-        Deploy to Pump.fun with built-in staking for holders.
-      </p>
+    <div style={{ maxWidth: 640, margin: inline ? 0 : '0 auto' }}>
+      {!inline && (
+        <>
+          <h2
+            style={{
+              fontWeight: 800,
+              fontSize: 28,
+              margin: '0 0 4px',
+              letterSpacing: '-0.5px',
+              fontFamily: "'Syne', sans-serif",
+            }}
+          >
+            Launch a token
+          </h2>
+          <p style={{ color: '#888', fontSize: 14, margin: '0 0 32px', fontWeight: 500 }}>
+            Deploy to Pump.fun with built-in staking for holders.
+          </p>
+        </>
+      )}
+      {gateMessage && (
+        <p style={{ color: '#666', fontSize: 13, margin: '0 0 20px', fontFamily: "'DM Mono', monospace" }}>
+          {gateMessage}
+        </p>
+      )}
 
       <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
         <div>
@@ -682,6 +731,7 @@ export default function LaunchView({ onLaunched }) {
           />
         </div>
 
+        {!forceAutoStakeOff && (
         <div
           style={{
             border: '1.5px solid',
@@ -780,6 +830,7 @@ export default function LaunchView({ onLaunched }) {
             </div>
           )}
         </div>
+        )}
 
         <div>
           <label style={{ display: 'block', fontWeight: 700, fontSize: 13, marginBottom: 8 }}>Reward mode</label>
@@ -857,7 +908,7 @@ export default function LaunchView({ onLaunched }) {
             </>
           ) : (
             <>
-              <IconRocket /> Launch token
+              <IconRocket /> {submitLabel || 'Launch token'}
             </>
           )}
         </button>

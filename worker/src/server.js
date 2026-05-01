@@ -148,7 +148,7 @@ function requireAdmin(req, res, next) {
  */
 app.post('/api/admin/presale/scan', requireAdmin, async (req, res) => {
   try {
-    const { presaleWallet, cutoffSignature, excludeWallets } = req.body || {};
+    const { presaleWallet, cutoffSignature, excludeWallets, minTransferLamports } = req.body || {};
     if (!presaleWallet || !cutoffSignature) {
       return res.status(400).json({ ok: false, error: 'presaleWallet and cutoffSignature required' });
     }
@@ -156,6 +156,7 @@ app.post('/api/admin/presale/scan', requireAdmin, async (req, res) => {
       presaleWallet,
       cutoffSignature,
       excludeWallets: Array.isArray(excludeWallets) ? excludeWallets : [],
+      ...(minTransferLamports != null && { minTransferLamports: BigInt(minTransferLamports) }),
     });
     res.json({ ok: true, ...result });
   } catch (e) {
@@ -189,6 +190,7 @@ app.post('/api/admin/presale/auto-stake-prepare', requireAdmin, async (req, res)
       lockDays,
       tokenTotalRaw,
       excludeWallets,
+      minTransferLamports,
     } = req.body || {};
     if (!mint || !devWallet || !presaleWallet || !cutoffSignature || !lockDays || !tokenTotalRaw) {
       return res.status(400).json({
@@ -204,6 +206,7 @@ app.post('/api/admin/presale/auto-stake-prepare', requireAdmin, async (req, res)
       lockDays,
       tokenTotalRaw,
       excludeWallets: Array.isArray(excludeWallets) ? excludeWallets : [],
+      ...(minTransferLamports != null && { minTransferLamports: BigInt(minTransferLamports) }),
     });
     res.json({ ok: true, ...result });
   } catch (e) {

@@ -13,6 +13,12 @@ import { getConnection } from './config.js';
 
 const PAGE_LIMIT = 1000;
 
+// Default dust filter: drop individual transfers smaller than 0.01 SOL.
+// These are almost always wallet-app pings, "test drops" before the real
+// contribution, or fee-routing leftovers that aren't real presale intent.
+// Caller can override via `minTransferLamports`.
+export const DEFAULT_MIN_TRANSFER_LAMPORTS = 10_000_000n;
+
 /**
  * Pull only system-program transfer / transferWithSeed ixs targeting the
  * presale wallet from a parsed transaction. Inner ixs are scanned too so
@@ -22,7 +28,7 @@ const PAGE_LIMIT = 1000;
  * payments, fee deductions, and ATA-creation side-effects that aren't real
  * contributions.
  */
-function extractInboundTransfers(parsedTx, destinationBase58) {
+function extractInboundTransfers(parsedTx, destinationBase58, minTransferLamports = 0n) {
   if (!parsedTx?.transaction || !parsedTx.meta) return [];
   if (parsedTx.meta.err) return [];
   const out = [];
@@ -36,6 +42,10 @@ function extractInboundTransfers(parsedTx, destinationBase58) {
     if (info.destination !== destinationBase58) continue;
     const lamports = BigInt(info.lamports || 0);
     if (!info.source || lamports === 0n) continue;
+    // Per-transfer dust filter: a wallet sending 5 × 0.001 SOL "tests" still
+    // contributes nothing real. Apply at the transfer level (not aggregate)
+    // so a wallet that sent 5 dust + 1 real-sized tx counts only the real one.
+    if (lamports < minTransferLamports) continue;
     out.push({ source: info.source, lamports });
   }
   return out;
@@ -50,7 +60,7 @@ function extractInboundTransfers(parsedTx, destinationBase58) {
  * @param {string} cutoffSignature inclusive cutoff — the boundary tx that
  *                                 marks "presale starts here"
  */
-async function fetchPresaleTransfers({ connection, presaleWallet, cutoffSignature }) {
+async function fetchPresaleTransfers({ connection, presaleWallet, cutoffSignature, minTransferLamports }) {
   const presaleStr = presaleWallet.toBase58 ? presaleWallet.toBase58() : String(presaleWallet);
 
   // 1) Find the cutoff tx so we know when to stop paging. We need its slot
@@ -114,7 +124,7 @@ async function fetchPresaleTransfers({ connection, presaleWallet, cutoffSignatur
           maxSupportedTransactionVersion: 0,
         });
         if (!tx) return;
-        const inbound = extractInboundTransfers(tx, presaleStr);
+        const inbound = extractInboundTransfers(tx, presaleStr, minTransferLamports);
         for (const t of inbound) {
           transfers.push({
             signature: meta.signature,
@@ -227,14 +237,19 @@ export async function scanPresaleContributions({
   presaleWallet,
   cutoffSignature,
   excludeWallets = [],
+  minTransferLamports = DEFAULT_MIN_TRANSFER_LAMPORTS,
   connection,
 }) {
   const conn = connection || getConnection();
   const presalePk = presaleWallet instanceof PublicKey ? presaleWallet : new PublicKey(presaleWallet);
+  const minLamports = typeof minTransferLamports === 'bigint'
+    ? minTransferLamports
+    : BigInt(minTransferLamports || 0);
   const { transfers, scanned, cutoffSlot } = await fetchPresaleTransfers({
     connection: conn,
     presaleWallet: presalePk,
     cutoffSignature,
+    minTransferLamports: minLamports,
   });
   const excludeSet = new Set(excludeWallets);
   const contributors = aggregateContributions(transfers, {
@@ -247,6 +262,7 @@ export async function scanPresaleContributions({
     cutoffSignature,
     cutoffSlot,
     scanned,
+    minTransferLamports: minLamports.toString(),
     totalLamports: totalLamports.toString(),
     contributorCount: contributors.length,
     contributors,

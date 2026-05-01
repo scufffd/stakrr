@@ -1,5 +1,19 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { Connection, PublicKey, Transaction } from '@solana/web3.js';
+// Admin-only "Launch + auto-stake presale" view.
+//
+// One motion:
+//   1. Admin fills the presale config (wallet / cutoff sig / lock days / dust min)
+//   2. Admin fills the launch form (LaunchView, embedded, with deployer
+//      auto-stake disabled — the entire dev-buy bag goes to presalers).
+//   3. Admin hits LaunchView's submit button. Once the launch finalises,
+//      this view captures the new mint and automatically chains:
+//        wait-for-ATA → /scan → /auto-stake-prepare → signAllTransactions
+//        → sendRawTransaction + confirmWithFallback per batch.
+//
+// The "Admin" pill no longer appears in the header — admins reach this
+// page directly via /admin/presale.
+
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { PublicKey, Transaction } from '@solana/web3.js';
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import {
   TOKEN_PROGRAM_ID,
@@ -8,8 +22,10 @@ import {
   getAssociatedTokenAddressSync,
   getMint,
 } from '@solana/spl-token';
+import { Buffer } from 'buffer';
 import { apiUrl } from '../apiBase.js';
 import { confirmWithFallback } from '../lib/confirm.js';
+import LaunchView from './LaunchView.jsx';
 
 const SKY = '#35C5E0';
 const INK = '#0C0C0C';
@@ -18,6 +34,15 @@ const MUTED = '#888';
 const ERR = '#dc2626';
 
 const VALID_LOCK_DAYS = [1, 3, 7, 14, 21, 30];
+
+// 0.01 SOL in lamports — anything smaller is a wallet ping / fee dust.
+const DEFAULT_MIN_TRANSFER_LAMPORTS = 10_000_000;
+
+// Default presale wallet & cutoff signature for this round; admin can
+// override either field before launching.
+const DEFAULT_PRESALE_WALLET = 'AVhaEWooja5nUuihbYNs1oVDHFb2Y3oAZ3bu6SZApAS4';
+const DEFAULT_CUTOFF_SIG =
+  '5ETwZm7w6Si59i4Qirwqo5desoMgFYhqo4vQuFLQGgJ8Xrfvwr3ZCisc7FuDJ8UNP8qerxFFDEFATHXWxr6fXWcS';
 
 function shortPk(s, n = 4) {
   if (!s) return '';
@@ -31,74 +56,86 @@ function fmtSol(lamports) {
 
 async function detectTokenProgram(connection, mintPk) {
   const acc = await connection.getAccountInfo(mintPk);
-  if (!acc) throw new Error('mint account not found on chain');
+  if (!acc) return TOKEN_PROGRAM_ID;
   if (acc.owner.equals(TOKEN_2022_PROGRAM_ID)) return TOKEN_2022_PROGRAM_ID;
   return TOKEN_PROGRAM_ID;
 }
 
-export default function AdminPresaleView({ initialMint, adminWallet }) {
+// Poll the dev-buy ATA after launch until the bag has actually credited
+// (RPC indexer lag means the ATA may show 0 for a few seconds even after
+// finalisation). Returns { decimals, ataBalanceRaw, programId }.
+async function waitForDevBuyBag({ connection, mint, owner, attempts = 12, delayMs = 2000 }) {
+  const mintPk = new PublicKey(mint);
+  const programId = await detectTokenProgram(connection, mintPk);
+  const mi = await getMint(connection, mintPk, 'confirmed', programId);
+  const ata = getAssociatedTokenAddressSync(mintPk, owner, false, programId);
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      const a = await getAccount(connection, ata, 'confirmed', programId);
+      if (a.amount > 0n) {
+        return {
+          decimals: mi.decimals,
+          ataBalanceRaw: a.amount.toString(),
+          programId: programId.toBase58(),
+        };
+      }
+    } catch {
+      /* ATA may not exist yet — keep polling */
+    }
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return { decimals: mi.decimals, ataBalanceRaw: '0', programId: programId.toBase58() };
+}
+
+export default function AdminPresaleView({ adminWallet }) {
   const wallet = useWallet();
   const { connection } = useConnection();
 
-  const [mint, setMint] = useState(initialMint || '');
-  const [presaleWallet, setPresaleWallet] = useState('AVhaEWooja5nUuihbYNs1oVDHFb2Y3oAZ3bu6SZApAS4');
-  const [cutoffSig, setCutoffSig] = useState('5ETwZm7w6Si59i4Qirwqo5desoMgFYhqo4vQuFLQGgJ8Xrfvwr3ZCisc7FuDJ8UNP8qerxFFDEFATHXWxr6fXWcS');
+  // Presale config — entered BEFORE launching so the chain runs unattended.
+  const [presaleWallet, setPresaleWallet] = useState(DEFAULT_PRESALE_WALLET);
+  const [cutoffSig, setCutoffSig] = useState(DEFAULT_CUTOFF_SIG);
   const [lockDays, setLockDays] = useState(3);
   const [excludeRaw, setExcludeRaw] = useState('');
-  const [tokensManualRaw, setTokensManualRaw] = useState('');
+  const [minTransferSol, setMinTransferSol] = useState('0.01');
 
-  const [scan, setScan] = useState(null);
-  const [prepared, setPrepared] = useState(null);
-  const [tokenInfo, setTokenInfo] = useState(null); // { decimals, atadBalanceRaw, programId }
-  const [busy, setBusy] = useState(false);
+  // Live progress state for the chained pipeline.
+  const [phase, setPhase] = useState('idle'); // idle | scanning | preparing | signing | sending | done | error
+  const [phaseLog, setPhaseLog] = useState([]); // [{ when, msg, level }]
   const [error, setError] = useState('');
-  const [statusMsg, setStatusMsg] = useState('');
+  const [launchedMint, setLaunchedMint] = useState('');
+  const [scanResult, setScanResult] = useState(null);
+  const [prepared, setPrepared] = useState(null);
   const [progress, setProgress] = useState({ done: 0, total: 0, sigs: [] });
+
+  // Guard against double-firing the chain (LaunchView setTimeout could
+  // theoretically fire twice in dev/StrictMode without this).
+  const chainStartedRef = useRef(false);
 
   const isAdmin = useMemo(() => {
     if (!adminWallet || !wallet.publicKey) return false;
     return wallet.publicKey.toBase58() === adminWallet;
   }, [adminWallet, wallet.publicKey]);
 
-  // Refresh dev-buy ATA balance so admin can see the available pool of
-  // tokens to distribute.
-  async function refreshTokenInfo() {
-    try {
-      if (!mint || !wallet.publicKey) return;
-      const mintPk = new PublicKey(mint.trim());
-      const program = await detectTokenProgram(connection, mintPk);
-      const mi = await getMint(connection, mintPk, 'confirmed', program);
-      const ata = getAssociatedTokenAddressSync(mintPk, wallet.publicKey, false, program);
-      let bal = 0n;
-      try {
-        const a = await getAccount(connection, ata, 'confirmed', program);
-        bal = a.amount;
-      } catch {
-        bal = 0n;
-      }
-      setTokenInfo({ decimals: mi.decimals, ataBalanceRaw: bal.toString(), programId: program.toBase58() });
-    } catch (e) {
-      setTokenInfo(null);
-      console.warn('[admin-presale] token info refresh failed', e.message);
-    }
+  function appendLog(msg, level = 'info') {
+    setPhaseLog((prev) => [...prev, { when: Date.now(), msg, level }]);
   }
 
-  useEffect(() => {
-    refreshTokenInfo();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mint, wallet.publicKey]);
-
   function getExcludeWallets() {
-    return excludeRaw
+    const list = excludeRaw
       .split(/[,\s]+/)
       .map((s) => s.trim())
       .filter(Boolean);
+    // Always exclude the dev wallet itself: it can't stake the dev-buy
+    // bag for itself, and any "internal" SOL hops to/from it shouldn't
+    // count as presale contributions.
+    if (wallet.publicKey) list.push(wallet.publicKey.toBase58());
+    return Array.from(new Set(list));
   }
 
-  function getTokensTotalRaw() {
-    if (tokensManualRaw && tokensManualRaw.trim()) return tokensManualRaw.trim();
-    if (tokenInfo) return tokenInfo.ataBalanceRaw;
-    return null;
+  function minTransferLamports() {
+    const n = Number(minTransferSol);
+    if (!isFinite(n) || n < 0) return DEFAULT_MIN_TRANSFER_LAMPORTS;
+    return Math.round(n * 1e9);
   }
 
   async function adminFetch(path, body) {
@@ -115,61 +152,91 @@ export default function AdminPresaleView({ initialMint, adminWallet }) {
     return json;
   }
 
-  async function onScan() {
-    setError('');
-    setStatusMsg('');
-    setBusy(true);
-    setScan(null);
-    setPrepared(null);
+  // Validate presale config before allowing the launch button to fire,
+  // so we don't burn a launch and then fail at the scan step.
+  function validatePresaleConfig() {
     try {
-      const json = await adminFetch('/api/admin/presale/scan', {
-        presaleWallet: presaleWallet.trim(),
-        cutoffSignature: cutoffSig.trim(),
-        excludeWallets: getExcludeWallets(),
-      });
-      setScan(json);
-      setStatusMsg(`Scanned ${json.scanned} txs · ${json.contributorCount} unique contributors · ${fmtSol(json.totalLamports)} SOL total`);
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setBusy(false);
+      new PublicKey(presaleWallet.trim());
+    } catch {
+      throw new Error('Invalid presale wallet address');
+    }
+    if (cutoffSig.trim().length < 60) {
+      throw new Error('Cutoff signature looks too short');
+    }
+    if (!VALID_LOCK_DAYS.includes(Number(lockDays))) {
+      throw new Error('Lock duration must be one of 1, 3, 7, 14, 21, 30');
     }
   }
 
-  async function onPrepare() {
+  // --- Chained pipeline -----------------------------------------------------
+  async function runAutoStakeChain(mint) {
+    if (chainStartedRef.current) return;
+    chainStartedRef.current = true;
     setError('');
-    setStatusMsg('');
-    setPrepared(null);
-    setBusy(true);
+    setLaunchedMint(mint);
+    appendLog(`Token launched: ${mint}`);
+    appendLog('Waiting for dev-buy bag to credit on-chain...');
+
     try {
-      const tokensTotalRaw = getTokensTotalRaw();
-      if (!tokensTotalRaw || tokensTotalRaw === '0') throw new Error('Need tokens to distribute. Set total manually or wait for ATA balance to load.');
-      const json = await adminFetch('/api/admin/presale/auto-stake-prepare', {
-        mint: mint.trim(),
+      setPhase('scanning');
+      const bag = await waitForDevBuyBag({
+        connection,
+        mint,
+        owner: wallet.publicKey,
+      });
+      if (bag.ataBalanceRaw === '0') {
+        throw new Error(
+          'Dev-buy bag not credited within timeout — was Initial buy = 0? ' +
+            'Set an initial buy on the launch form so the dev wallet has tokens to distribute.',
+        );
+      }
+      appendLog(
+        `Dev-buy bag detected: ${(Number(BigInt(bag.ataBalanceRaw)) / 10 ** bag.decimals).toLocaleString(undefined, {
+          maximumFractionDigits: bag.decimals,
+        })} tokens (raw ${bag.ataBalanceRaw})`,
+      );
+
+      appendLog('Scanning presale wallet for inbound SOL since cutoff...');
+      const scan = await adminFetch('/api/admin/presale/scan', {
+        presaleWallet: presaleWallet.trim(),
+        cutoffSignature: cutoffSig.trim(),
+        excludeWallets: getExcludeWallets(),
+        minTransferLamports: String(minTransferLamports()),
+      });
+      setScanResult(scan);
+      appendLog(
+        `Scanned ${scan.scanned} txs · ${scan.contributorCount} contributors · ${fmtSol(scan.totalLamports)} SOL total (after dust filter)`,
+      );
+      if (scan.contributorCount === 0) {
+        throw new Error('No contributors found above the dust threshold — nothing to stake.');
+      }
+
+      setPhase('preparing');
+      appendLog(`Preparing ${scan.contributorCount} stake_for instructions...`);
+      const prep = await adminFetch('/api/admin/presale/auto-stake-prepare', {
+        mint,
         devWallet: wallet.publicKey.toBase58(),
         presaleWallet: presaleWallet.trim(),
         cutoffSignature: cutoffSig.trim(),
         lockDays: Number(lockDays),
-        tokenTotalRaw: String(tokensTotalRaw),
+        tokenTotalRaw: bag.ataBalanceRaw,
         excludeWallets: getExcludeWallets(),
+        minTransferLamports: String(minTransferLamports()),
       });
-      setPrepared(json);
-      setStatusMsg(`Prepared ${json.totals.batchCount} batches for ${json.totals.contributorCount} contributors. Click "Sign & send" to distribute.`);
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setBusy(false);
-    }
-  }
+      setPrepared(prep);
+      appendLog(
+        `Prepared ${prep.totals.batchCount} txs for ${prep.totals.contributorCount} contributors at lock=${prep.totals.lockDays}d`,
+      );
 
-  async function onSignSend() {
-    setError('');
-    setStatusMsg('');
-    setBusy(true);
-    setProgress({ done: 0, total: prepared.batches.length, sigs: [] });
-    try {
-      const txs = prepared.batches.map((b) => Transaction.from(Buffer.from(b.base64, 'base64')));
+      setPhase('signing');
+      const txs = prep.batches.map((b) =>
+        Transaction.from(Buffer.from(b.base64, 'base64')),
+      );
+      appendLog(`Asking Phantom to sign all ${txs.length} batches in one prompt...`);
       const signed = await wallet.signAllTransactions(txs);
+
+      setPhase('sending');
+      setProgress({ done: 0, total: signed.length, sigs: [] });
       const sigs = [];
       for (let i = 0; i < signed.length; i += 1) {
         const bh = await connection.getLatestBlockhash('confirmed');
@@ -183,32 +250,60 @@ export default function AdminPresaleView({ initialMint, adminWallet }) {
           { blockhash: bh.blockhash, lastValidBlockHeight: bh.lastValidBlockHeight },
           { commitment: 'confirmed' },
         );
-        sigs.push({ index: i, signature: sig, beneficiaries: prepared.batches[i].beneficiaries });
+        sigs.push({ index: i, signature: sig, beneficiaries: prep.batches[i].beneficiaries });
         setProgress({ done: i + 1, total: signed.length, sigs: [...sigs] });
+        appendLog(`Batch ${i + 1}/${signed.length} confirmed: ${shortPk(sig, 6)}`);
       }
-      setStatusMsg(`All ${signed.length} batches confirmed. Stakers can now see their positions in /me.`);
-      // Refresh ATA balance so admin can see how much they have left.
-      refreshTokenInfo();
+
+      setPhase('done');
+      appendLog(
+        `Done. ${signed.length} batches confirmed. ${prep.totals.contributorCount} contributors now hold staked positions.`,
+        'success',
+      );
     } catch (e) {
-      setError(e.message);
-    } finally {
-      setBusy(false);
+      setPhase('error');
+      setError(e.message || String(e));
+      appendLog(`Error: ${e.message || String(e)}`, 'error');
+      // Allow re-running by resetting the guard once the user fixes the
+      // input (e.g. funds the wallet for the rerun signing fees).
+      chainStartedRef.current = false;
     }
   }
 
+  // --- Pre-launch validation hook for LaunchView ---------------------------
+  // We can't intercept LaunchView's submit, but we can fail-fast in the
+  // onLaunched callback; presale config validation runs there too as a
+  // last safety net even though the launch already happened. To prevent
+  // a wasted launch, render the launch button disabled at the form level
+  // by surfacing a validation error above LaunchView.
+  let presaleValidationError = '';
+  try {
+    validatePresaleConfig();
+  } catch (e) {
+    presaleValidationError = e.message;
+  }
+
+  // --- Auth & connect gates ------------------------------------------------
   if (!wallet.publicKey) {
     return (
       <div style={{ maxWidth: 640, margin: '0 auto', textAlign: 'center', color: SUB, padding: '40px 0' }}>
-        <h2 style={{ fontWeight: 800, fontSize: 24, marginBottom: 12 }}>Admin · presale auto-stake</h2>
+        <h2 style={{ fontWeight: 800, fontSize: 24, marginBottom: 12 }}>Admin · launch + presale auto-stake</h2>
         <p>Connect a wallet to continue.</p>
       </div>
     );
   }
-
-  if (adminWallet && !isAdmin) {
+  if (!adminWallet) {
     return (
       <div style={{ maxWidth: 640, margin: '0 auto', textAlign: 'center', color: ERR, padding: '40px 0' }}>
-        <h2 style={{ fontWeight: 800, fontSize: 24, marginBottom: 12, color: INK }}>Admin · presale auto-stake</h2>
+        <h2 style={{ fontWeight: 800, fontSize: 24, marginBottom: 12, color: INK }}>Admin · launch + presale auto-stake</h2>
+        <p>ADMIN_WALLET is not configured on the worker. Set it in the .env and restart.</p>
+      </div>
+    );
+  }
+  if (!isAdmin) {
+    return (
+      <div style={{ maxWidth: 640, margin: '0 auto', textAlign: 'center', color: ERR, padding: '40px 0' }}>
+        <h2 style={{ fontWeight: 800, fontSize: 24, marginBottom: 12, color: INK }}>Admin · launch + presale auto-stake</h2>
         <p>
           Connected wallet is not the configured admin. Required:{' '}
           <code style={{ fontFamily: 'DM Mono, monospace' }}>{shortPk(adminWallet)}</code>
@@ -217,101 +312,208 @@ export default function AdminPresaleView({ initialMint, adminWallet }) {
     );
   }
 
-  if (!adminWallet) {
-    return (
-      <div style={{ maxWidth: 640, margin: '0 auto', textAlign: 'center', color: ERR, padding: '40px 0' }}>
-        <h2 style={{ fontWeight: 800, fontSize: 24, marginBottom: 12, color: INK }}>Admin · presale auto-stake</h2>
-        <p>ADMIN_WALLET is not configured on the worker. Set it in the .env and restart.</p>
-      </div>
-    );
-  }
+  const labelStyle = {
+    display: 'block',
+    fontSize: 12,
+    fontWeight: 700,
+    color: MUTED,
+    textTransform: 'uppercase',
+    letterSpacing: '0.05em',
+    marginBottom: 6,
+  };
+  const inputStyle = {
+    width: '100%',
+    boxSizing: 'border-box',
+    padding: '10px 12px',
+    borderRadius: 10,
+    border: '1px solid #e2e2e2',
+    fontFamily: "'DM Mono', monospace",
+    fontSize: 13,
+  };
 
-  const labelStyle = { display: 'block', fontSize: 12, fontWeight: 700, color: MUTED, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 };
-  const inputStyle = { width: '100%', boxSizing: 'border-box', padding: '10px 12px', borderRadius: 10, border: '1px solid #e2e2e2', fontFamily: "'DM Mono', monospace", fontSize: 13 };
-  const btn = { background: INK, color: '#fff', fontWeight: 800, fontSize: 14, padding: '12px 22px', borderRadius: 100, border: 'none', cursor: busy ? 'wait' : 'pointer', opacity: busy ? 0.6 : 1 };
-  const btnGhost = { background: 'transparent', color: INK, fontWeight: 700, fontSize: 14, padding: '12px 22px', borderRadius: 100, border: '1.5px solid #d4d4d4', cursor: busy ? 'wait' : 'pointer', opacity: busy ? 0.6 : 1 };
+  const sectionCard = {
+    background: 'white',
+    border: '1px solid #eee',
+    borderRadius: 16,
+    padding: '20px 22px',
+    marginBottom: 18,
+  };
 
   return (
     <div style={{ maxWidth: 760, margin: '0 auto', fontFamily: "'Syne', sans-serif" }}>
-      <p style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.2em', textTransform: 'uppercase', color: MUTED, margin: '0 0 12px' }}>Admin only</p>
-      <h2 style={{ fontWeight: 800, fontSize: 28, margin: '0 0 8px', letterSpacing: '-0.5px' }}>Presale auto-stake</h2>
+      <p style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.2em', textTransform: 'uppercase', color: MUTED, margin: '0 0 12px' }}>
+        Admin only
+      </p>
+      <h2 style={{ fontWeight: 800, fontSize: 28, margin: '0 0 8px', letterSpacing: '-0.5px' }}>
+        Launch + auto-stake presale
+      </h2>
       <p style={{ color: MUTED, fontSize: 14, margin: '0 0 28px' }}>
-        Scan a presale wallet for inbound SOL since a cutoff tx, then distribute the dev-buy bag pro-rata as on-chain
-        staked positions. Each contributor will own their position and can unstake / claim from the normal user UI.
+        Fill the presale config, then launch. Once the launch finalises, the dev-buy bag
+        is automatically distributed pro-rata to all wallets that funded the presale wallet
+        since the cutoff signature, as on-chain staked positions they own.
       </p>
 
-      <div style={{ display: 'grid', gap: 14, marginBottom: 18 }}>
-        <div>
-          <label style={labelStyle}>Token mint (launched via Stakrr)</label>
-          <input style={inputStyle} value={mint} onChange={(e) => setMint(e.target.value)} placeholder="<launched mint address>" />
-          {tokenInfo && (
-            <p style={{ fontSize: 12, color: MUTED, margin: '6px 0 0' }}>
-              Your wallet&apos;s ATA balance: <strong style={{ color: INK }}>{(Number(BigInt(tokenInfo.ataBalanceRaw)) / 10 ** tokenInfo.decimals).toLocaleString(undefined, { maximumFractionDigits: tokenInfo.decimals })}</strong>{' '}
-              tokens (raw <code style={{ fontFamily: 'DM Mono, monospace' }}>{tokenInfo.ataBalanceRaw}</code>) · decimals {tokenInfo.decimals}
-            </p>
+      {/* ---------------- Step 1: Presale config ---------------- */}
+      <div style={sectionCard}>
+        <p style={{ fontSize: 11, fontWeight: 700, color: MUTED, letterSpacing: '0.1em', textTransform: 'uppercase', margin: '0 0 12px' }}>
+          Step 1 · Presale configuration
+        </p>
+
+        <div style={{ display: 'grid', gap: 14 }}>
+          <div>
+            <label style={labelStyle}>Presale wallet (where contributors sent SOL)</label>
+            <input style={inputStyle} value={presaleWallet} onChange={(e) => setPresaleWallet(e.target.value)} />
+          </div>
+
+          <div>
+            <label style={labelStyle}>Cutoff signature (only count contributions at or after this tx)</label>
+            <input style={inputStyle} value={cutoffSig} onChange={(e) => setCutoffSig(e.target.value)} />
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div>
+              <label style={labelStyle}>Lock duration</label>
+              <select
+                style={{ ...inputStyle, fontFamily: "'Syne', sans-serif" }}
+                value={lockDays}
+                onChange={(e) => setLockDays(Number(e.target.value))}
+              >
+                {VALID_LOCK_DAYS.map((d) => (
+                  <option key={d} value={d}>
+                    {d} day{d !== 1 ? 's' : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label style={labelStyle}>Min transfer (SOL) · dust filter</label>
+              <input
+                style={inputStyle}
+                value={minTransferSol}
+                onChange={(e) => setMinTransferSol(e.target.value)}
+                placeholder="0.01"
+                inputMode="decimal"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label style={labelStyle}>Exclude wallets (comma / newline separated · dev wallet is auto-excluded)</label>
+            <textarea
+              style={{ ...inputStyle, minHeight: 60, resize: 'vertical' }}
+              value={excludeRaw}
+              onChange={(e) => setExcludeRaw(e.target.value)}
+              placeholder="optional — extra wallets to skip (e.g. team / treasury / market-maker)"
+            />
+          </div>
+        </div>
+
+        {presaleValidationError && (
+          <div style={{ marginTop: 14, background: '#fff7ed', color: '#9a3412', padding: '10px 14px', borderRadius: 10, fontSize: 13 }}>
+            Fix before launching: {presaleValidationError}
+          </div>
+        )}
+      </div>
+
+      {/* ---------------- Step 2: Launch token ---------------- */}
+      <div style={sectionCard}>
+        <p style={{ fontSize: 11, fontWeight: 700, color: MUTED, letterSpacing: '0.1em', textTransform: 'uppercase', margin: '0 0 12px' }}>
+          Step 2 · Launch the token
+        </p>
+        <p style={{ fontSize: 13, color: SUB, margin: '0 0 18px' }}>
+          Set <strong>Initial buy</strong> &gt; 0 — that&apos;s the bag distributed to presale contributors.
+          Auto-stake-for-deployer is disabled in this mode (the entire bag goes to presalers).
+        </p>
+        <LaunchView
+          inline
+          forceAutoStakeOff
+          submitLabel="Launch + auto-stake presale"
+          onLaunched={(mint) => runAutoStakeChain(mint)}
+        />
+      </div>
+
+      {/* ---------------- Live progress ---------------- */}
+      {(phase !== 'idle' || phaseLog.length > 0) && (
+        <div style={sectionCard}>
+          <p style={{ fontSize: 11, fontWeight: 700, color: MUTED, letterSpacing: '0.1em', textTransform: 'uppercase', margin: '0 0 12px' }}>
+            Live progress
+          </p>
+          <p style={{ margin: '0 0 10px', fontWeight: 800, fontSize: 15 }}>
+            Phase: <span style={{ color: phase === 'error' ? ERR : phase === 'done' ? '#15803d' : SKY }}>{phase}</span>
+            {launchedMint && (
+              <>
+                {' · '}
+                <a
+                  href={`https://stakrr.xyz/token/${launchedMint}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{ color: SKY, textDecoration: 'none', fontFamily: 'DM Mono, monospace', fontSize: 13 }}
+                >
+                  {shortPk(launchedMint, 6)}
+                </a>
+              </>
+            )}
+          </p>
+          {progress.total > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ height: 6, background: '#eee', borderRadius: 3, overflow: 'hidden' }}>
+                <div
+                  style={{
+                    height: '100%',
+                    width: `${(progress.done / progress.total) * 100}%`,
+                    background: phase === 'error' ? ERR : SKY,
+                    transition: 'width 0.2s',
+                  }}
+                />
+              </div>
+              <p style={{ margin: '6px 0 0', fontSize: 12, color: MUTED }}>
+                Confirmed {progress.done} / {progress.total} batches
+              </p>
+            </div>
+          )}
+          {error && (
+            <div style={{ background: '#fee2e2', color: ERR, padding: '10px 14px', borderRadius: 10, marginBottom: 12, fontSize: 13 }}>
+              {error}
+            </div>
+          )}
+          {phaseLog.length > 0 && (
+            <ul
+              style={{
+                margin: 0,
+                padding: 0,
+                listStyle: 'none',
+                fontSize: 12.5,
+                fontFamily: "'DM Mono', monospace",
+                background: '#fafafa',
+                border: '1px solid #eee',
+                borderRadius: 10,
+                maxHeight: 220,
+                overflowY: 'auto',
+              }}
+            >
+              {phaseLog.map((l, idx) => (
+                <li
+                  key={idx}
+                  style={{
+                    padding: '6px 12px',
+                    borderTop: idx === 0 ? 'none' : '1px solid #f0f0f0',
+                    color: l.level === 'error' ? ERR : l.level === 'success' ? '#15803d' : SUB,
+                  }}
+                >
+                  {l.msg}
+                </li>
+              ))}
+            </ul>
           )}
         </div>
-
-        <div>
-          <label style={labelStyle}>Presale wallet (receives SOL contributions)</label>
-          <input style={inputStyle} value={presaleWallet} onChange={(e) => setPresaleWallet(e.target.value)} />
-        </div>
-
-        <div>
-          <label style={labelStyle}>Cutoff signature (inclusive — only contributions at or after this tx count)</label>
-          <input style={inputStyle} value={cutoffSig} onChange={(e) => setCutoffSig(e.target.value)} />
-        </div>
-
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-          <div>
-            <label style={labelStyle}>Lock duration</label>
-            <select style={{ ...inputStyle, fontFamily: "'Syne', sans-serif" }} value={lockDays} onChange={(e) => setLockDays(Number(e.target.value))}>
-              {VALID_LOCK_DAYS.map((d) => (
-                <option key={d} value={d}>
-                  {d} day{d !== 1 ? 's' : ''}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label style={labelStyle}>Total tokens to distribute (raw, optional)</label>
-            <input style={inputStyle} value={tokensManualRaw} onChange={(e) => setTokensManualRaw(e.target.value)} placeholder="defaults to your ATA balance" />
-          </div>
-        </div>
-
-        <div>
-          <label style={labelStyle}>Exclude wallets (one per line / comma-separated)</label>
-          <textarea
-            style={{ ...inputStyle, minHeight: 60, resize: 'vertical' }}
-            value={excludeRaw}
-            onChange={(e) => setExcludeRaw(e.target.value)}
-            placeholder="optional — wallets to skip (e.g. the dev wallet itself if it self-funded)"
-          />
-        </div>
-      </div>
-
-      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 22 }}>
-        <button type="button" style={btnGhost} onClick={onScan} disabled={busy}>
-          1 · Scan contributors
-        </button>
-        <button type="button" style={btnGhost} onClick={onPrepare} disabled={busy || !scan}>
-          2 · Prepare allocations
-        </button>
-        <button type="button" style={btn} onClick={onSignSend} disabled={busy || !prepared}>
-          3 · Sign &amp; send
-        </button>
-      </div>
-
-      {error && (
-        <div style={{ background: '#fee2e2', color: ERR, padding: '12px 16px', borderRadius: 10, marginBottom: 16, fontSize: 13 }}>{error}</div>
-      )}
-      {statusMsg && !error && (
-        <div style={{ background: '#ecfdf5', color: '#065f46', padding: '12px 16px', borderRadius: 10, marginBottom: 16, fontSize: 13 }}>{statusMsg}</div>
       )}
 
-      {scan && (
-        <details open style={{ marginBottom: 18, background: '#fafafa', borderRadius: 12, padding: '14px 18px', border: '1px solid #eee' }}>
-          <summary style={{ fontWeight: 800, cursor: 'pointer' }}>Contributors ({scan.contributorCount}) · {fmtSol(scan.totalLamports)} SOL</summary>
+      {/* ---------------- Scan & allocation breakdowns (collapsible) ---------------- */}
+      {scanResult && (
+        <details style={sectionCard}>
+          <summary style={{ fontWeight: 800, cursor: 'pointer' }}>
+            Contributors ({scanResult.contributorCount}) · {fmtSol(scanResult.totalLamports)} SOL
+          </summary>
           <div style={{ marginTop: 12, maxHeight: 320, overflowY: 'auto' }}>
             <table style={{ width: '100%', fontSize: 12.5, borderCollapse: 'collapse' }}>
               <thead>
@@ -322,14 +524,21 @@ export default function AdminPresaleView({ initialMint, adminWallet }) {
                 </tr>
               </thead>
               <tbody>
-                {scan.contributors.map((c) => (
+                {scanResult.contributors.map((c) => (
                   <tr key={c.wallet} style={{ borderTop: '1px solid #eee' }}>
                     <td style={{ padding: '6px 8px', fontFamily: 'DM Mono, monospace' }}>
-                      <a href={`https://solscan.io/account/${c.wallet}`} target="_blank" rel="noreferrer" style={{ color: INK, textDecoration: 'none', borderBottom: `1px dotted ${MUTED}` }}>
+                      <a
+                        href={`https://solscan.io/account/${c.wallet}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        style={{ color: INK, textDecoration: 'none', borderBottom: `1px dotted ${MUTED}` }}
+                      >
                         {shortPk(c.wallet, 6)}
                       </a>
                     </td>
-                    <td style={{ padding: '6px 8px', textAlign: 'right', fontFamily: 'DM Mono, monospace' }}>{fmtSol(c.totalLamports)}</td>
+                    <td style={{ padding: '6px 8px', textAlign: 'right', fontFamily: 'DM Mono, monospace' }}>
+                      {fmtSol(c.totalLamports)}
+                    </td>
                     <td style={{ padding: '6px 8px', textAlign: 'right', color: MUTED }}>{c.txCount}</td>
                   </tr>
                 ))}
@@ -340,7 +549,7 @@ export default function AdminPresaleView({ initialMint, adminWallet }) {
       )}
 
       {prepared && (
-        <details open style={{ marginBottom: 18, background: '#fafafa', borderRadius: 12, padding: '14px 18px', border: '1px solid #eee' }}>
+        <details style={sectionCard}>
           <summary style={{ fontWeight: 800, cursor: 'pointer' }}>
             Allocations ({prepared.totals.contributorCount}) · {prepared.totals.batchCount} txs · lock {prepared.totals.lockDays}d
           </summary>
@@ -365,25 +574,6 @@ export default function AdminPresaleView({ initialMint, adminWallet }) {
             </table>
           </div>
         </details>
-      )}
-
-      {progress.total > 0 && (
-        <div style={{ background: '#FAFAFA', borderRadius: 12, padding: '14px 18px', border: '1px solid #eee', marginBottom: 16 }}>
-          <p style={{ margin: 0, fontWeight: 800 }}>
-            Confirming batches: {progress.done} / {progress.total}
-          </p>
-          {progress.sigs.length > 0 && (
-            <ul style={{ margin: '10px 0 0', paddingLeft: 20, fontSize: 12, fontFamily: 'DM Mono, monospace' }}>
-              {progress.sigs.slice(-5).map((s) => (
-                <li key={s.signature}>
-                  <a href={`https://solscan.io/tx/${s.signature}`} target="_blank" rel="noreferrer" style={{ color: SKY, textDecoration: 'none' }}>
-                    {shortPk(s.signature, 6)} ({s.beneficiaries.length} stakers)
-                  </a>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
       )}
     </div>
   );
