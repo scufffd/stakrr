@@ -1,14 +1,16 @@
-import React, { useCallback } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
 import { useWallet } from '@solana/wallet-adapter-react';
 import LaunchView from './views/LaunchView.jsx';
 import PoolView from './views/PoolView.jsx';
 import UserDashboardView from './views/UserDashboardView.jsx';
 import DocsPage from './views/DocsPage.jsx';
+import AdminPresaleView from './views/AdminPresaleView.jsx';
 import HomePage from './components/designBoost/HomePage.jsx';
 import BluebirdMark from './components/designBoost/BluebirdMark.jsx';
 import Cloud, { CloudStrip } from './components/designBoost/Cloud.jsx';
 import { useRouter } from './lib/router.js';
+import { apiUrl } from './apiBase.js';
 
 const SKY = '#35C5E0';
 const INK = '#0C0C0C';
@@ -40,7 +42,7 @@ function NavPill({ active, onClick, children }) {
   );
 }
 
-function Nav({ tab, onHome, onLaunch, onProfile, onDocs, position }) {
+function Nav({ tab, onHome, onLaunch, onProfile, onDocs, onAdmin, showAdmin, position }) {
   return (
     <nav
       className="db-nav"
@@ -89,6 +91,11 @@ function Nav({ tab, onHome, onLaunch, onProfile, onDocs, position }) {
         <NavPill active={tab === 'docs'} onClick={onDocs}>
           Docs
         </NavPill>
+        {showAdmin && (
+          <NavPill active={tab === 'admin-presale'} onClick={onAdmin}>
+            Admin
+          </NavPill>
+        )}
         <div className="design-boost-wallet-wrap">
           <WalletMultiButton />
         </div>
@@ -101,6 +108,7 @@ function innerHeroTitle(tab) {
   if (tab === 'launch') return 'launch.';
   if (tab === 'docs') return 'docs.';
   if (tab === 'profile') return 'me.';
+  if (tab === 'admin-presale') return 'admin.';
   return 'token.';
 }
 
@@ -115,11 +123,28 @@ export default function App() {
   const goLaunch = useCallback(() => navigate({ tab: 'launch' }), [navigate]);
   const goProfile = useCallback(() => navigate({ tab: 'profile' }), [navigate]);
   const goDocs = useCallback(() => navigate({ tab: 'docs' }), [navigate]);
+  const goAdmin = useCallback(() => navigate({ tab: 'admin-presale' }), [navigate]);
 
   const isHome = tab === 'home';
 
+  // Pull live worker config so the Admin nav-pill only renders for the
+  // configured admin wallet (cosmetic guard — the API still rejects
+  // unauthorized calls regardless of UI state).
+  const [adminWallet, setAdminWallet] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetch(apiUrl('/api/info'))
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (!cancelled && j?.ok) setAdminWallet(j.adminWallet || null);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+  const showAdmin = !!(adminWallet && wallet.publicKey?.toBase58() === adminWallet);
+
   const navSlot = (
-    <Nav tab={tab} onHome={goHome} onLaunch={goLaunch} onProfile={goProfile} onDocs={goDocs} position="relative" />
+    <Nav tab={tab} onHome={goHome} onLaunch={goLaunch} onProfile={goProfile} onDocs={goDocs} onAdmin={goAdmin} showAdmin={showAdmin} position="relative" />
   );
 
   return (
@@ -143,7 +168,7 @@ export default function App() {
               style={{ position: 'absolute', right: '3%', top: 52, zIndex: 1, opacity: 0.85 }}
             />
 
-            <Nav tab={tab} onHome={goHome} onLaunch={goLaunch} onProfile={goProfile} onDocs={goDocs} position="relative" />
+            <Nav tab={tab} onHome={goHome} onLaunch={goLaunch} onProfile={goProfile} onDocs={goDocs} onAdmin={goAdmin} showAdmin={showAdmin} position="relative" />
 
             <div className="db-inner-hero" style={{ textAlign: 'center', position: 'relative', zIndex: 5 }}>
               <BluebirdMark
@@ -182,6 +207,9 @@ export default function App() {
             {tab === 'token' && selectedMint && <PoolView mint={selectedMint} onBack={goHome} />}
             {tab === 'profile' && <UserDashboardView wallet={wallet} onSelectToken={onSelectToken} />}
             {tab === 'docs' && <DocsPage />}
+            {tab === 'admin-presale' && (
+              <AdminPresaleView initialMint={selectedMint} adminWallet={adminWallet} />
+            )}
           </div>
 
           <footer className="db-footer-inner" style={{ background: INK, display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16, alignItems: 'center' }}>

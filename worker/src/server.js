@@ -41,6 +41,8 @@ import {
 } from './launch.js';
 import { buildWalletSummary } from './wallet-summary.js';
 import { getVanityPoolStats } from './vanity-mints.js';
+import { scanPresaleContributions } from './presale-scan.js';
+import { buildPresaleAutoStakeBatches } from './presale-autostake.js';
 
 const app = express();
 app.use(express.json({ limit: '32kb' }));
@@ -105,12 +107,108 @@ app.get('/api/info', (req, res) => {
     },
     treasury: config.treasuryKeypair.publicKey.toBase58(),
     feeRecipient: config.lockFees.recipient || config.treasuryKeypair.publicKey.toBase58(),
+    platformFeeVault: config.platformFeeVault?.toBase58() || null,
+    adminWallet: config.adminWallet?.toBase58() || null,
     lockFeesEnabled: config.lockFees.enabled,
     platformFeeBps: config.platformFeeBps,
     minDistributeLamports: config.minDistributeLamports,
     loopIntervalMs: config.loopIntervalMs,
     repo: process.env.PUBLIC_REPO_URL || 'https://github.com/scufffd/stakrr',
   });
+});
+
+/**
+ * Admin gate. Endpoints under /api/admin/* require:
+ *   - ADMIN_WALLET configured on the server
+ *   - x-admin-wallet header == ADMIN_WALLET pubkey (base58)
+ *
+ * The header is a soft gate — the actual on-chain authority is enforced by
+ * Solana itself (the tx still needs the dev wallet's signature). The
+ * header just stops random scrapers from hitting the prepare endpoint and
+ * scanning for presale contributors via our infra.
+ */
+function requireAdmin(req, res, next) {
+  if (!config.adminWallet) {
+    return res.status(503).json({ ok: false, error: 'admin endpoints disabled (ADMIN_WALLET unset)' });
+  }
+  const header = (req.get('x-admin-wallet') || '').trim();
+  if (!header || header !== config.adminWallet.toBase58()) {
+    return res.status(403).json({ ok: false, error: 'admin auth required' });
+  }
+  return next();
+}
+
+/**
+ * Read-only: scan a presale wallet for inbound SOL transfers since a
+ * cutoff signature (inclusive). Returns aggregated contributors sorted
+ * by SOL contributed.
+ *
+ * Body:
+ *   { presaleWallet, cutoffSignature, excludeWallets?: [pubkey] }
+ */
+app.post('/api/admin/presale/scan', requireAdmin, async (req, res) => {
+  try {
+    const { presaleWallet, cutoffSignature, excludeWallets } = req.body || {};
+    if (!presaleWallet || !cutoffSignature) {
+      return res.status(400).json({ ok: false, error: 'presaleWallet and cutoffSignature required' });
+    }
+    const result = await scanPresaleContributions({
+      presaleWallet,
+      cutoffSignature,
+      excludeWallets: Array.isArray(excludeWallets) ? excludeWallets : [],
+    });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * Build unsigned stake_for + prime_checkpoint batches. The dev wallet
+ * must sign each tx in the browser (signAllTransactions) — the server
+ * never holds the dev key.
+ *
+ * Body:
+ *   {
+ *     mint,                  // launched stake mint
+ *     devWallet,             // pubkey that owns the dev-buy tokens (== signer)
+ *     presaleWallet,
+ *     cutoffSignature,
+ *     lockDays,              // 1 | 3 | 7 | 14 | 21 | 30
+ *     tokenTotalRaw,         // raw token units (string) to distribute
+ *     excludeWallets?: [pubkey],
+ *   }
+ */
+app.post('/api/admin/presale/auto-stake-prepare', requireAdmin, async (req, res) => {
+  try {
+    const {
+      mint,
+      devWallet,
+      presaleWallet,
+      cutoffSignature,
+      lockDays,
+      tokenTotalRaw,
+      excludeWallets,
+    } = req.body || {};
+    if (!mint || !devWallet || !presaleWallet || !cutoffSignature || !lockDays || !tokenTotalRaw) {
+      return res.status(400).json({
+        ok: false,
+        error: 'mint, devWallet, presaleWallet, cutoffSignature, lockDays, tokenTotalRaw required',
+      });
+    }
+    const result = await buildPresaleAutoStakeBatches({
+      mint,
+      devWallet,
+      presaleWallet,
+      cutoffSignature,
+      lockDays,
+      tokenTotalRaw,
+      excludeWallets: Array.isArray(excludeWallets) ? excludeWallets : [],
+    });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 /**
