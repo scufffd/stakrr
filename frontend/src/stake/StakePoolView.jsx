@@ -108,6 +108,10 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
   const [supplyRaw, setSupplyRaw] = useState(null);
   const [userBalanceRaw, setUserBalanceRaw] = useState('0');
   const [positions, setPositions] = useState([]);
+  // Reward mints registered on the pool (each row = one mint enabled as a
+  // payout line). We watch this to detect the "stake mint missing as a
+  // reward line" case which breaks unstake_early — see backfill banner below.
+  const [rewardTokenMints, setRewardTokenMints] = useState([]);
   const [refreshTick, setRefreshTick] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
@@ -165,6 +169,15 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
         const owned = await client.fetchAllPositionsByOwner(wallet.publicKey);
         if (cancelled) return;
         setPositions(owned);
+        // Reward mints registered on the pool — used to surface the
+        // "stake mint isn't a reward line" backfill prompt for the deployer.
+        try {
+          const rms = await client.fetchAllRewardMints();
+          if (cancelled) return;
+          setRewardTokenMints(rms.map((r) => r.account.tokenMint.toBase58()));
+        } catch {
+          if (!cancelled) setRewardTokenMints([]);
+        }
       } catch (e) {
         if (!cancelled) setLoadError(e.message || String(e));
       } finally {
@@ -254,6 +267,30 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
     stakeMint,
   ]);
 
+  /**
+   * Pool-authority-only backfill: registers the **stake mint itself** as a
+   * reward line. The on-chain program needs this to route the 10% early-unstake
+   * penalty back to remaining stakers; without it the program fails with
+   * `AccountNotInitialized` (Anchor 3012, error 6005 `StakeRewardLineMissing`).
+   *
+   * Old launches (pre-fix) only registered WSOL as a reward, so every existing
+   * pool needs a one-time backfill from its deployer wallet. New launches
+   * include this in the bundle automatically (worker/src/launch.js).
+   */
+  const onBackfillStakeRewardLine = useCallback(async () => {
+    setBusy(true); setError(null); setLastSig(null);
+    try {
+      const ix = await client.addRewardMintIx(wallet.publicKey, stakeMint, stakeTokenProgram);
+      const sig = await sendTx([ix]);
+      setLastSig(sig);
+      reload();
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [client, wallet, stakeMint, stakeTokenProgram, reload, sendTx]);
+
   const onUnstake = useCallback(async (position, early) => {
     setBusy(true); setError(null); setLastSig(null);
     try {
@@ -331,6 +368,16 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
   }
 
   const balanceFmt = decimals != null ? fmtAmount(userBalanceRaw, decimals) : '—';
+
+  // Backfill banner gating: the program rejects unstake_early when the stake
+  // mint isn't registered as a reward line. We only show the fix-it CTA to
+  // the pool authority (the original deployer); regular users get a plain
+  // explanation + a disabled early-unstake button so they don't waste fees.
+  const stakeMintB58Lower = stakeMint.toBase58();
+  const stakeMintIsRewardLine = rewardTokenMints.includes(stakeMintB58Lower);
+  const poolAuthorityB58 = pool?.authority?.toBase58?.() || null;
+  const isPoolAuthority = !!poolAuthorityB58 && wallet?.publicKey?.toBase58?.() === poolAuthorityB58;
+  const earlyUnstakeReady = stakeMintIsRewardLine;
 
   // Total staked across the pool, expressed as raw atoms (BN.toString())
   // and as a percentage of circulating supply. `pool.totalStaked` is the
@@ -436,6 +483,42 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
         </form>
       </div>
 
+      {!earlyUnstakeReady && (
+        <div
+          className="panel panel--tight"
+          style={{
+            background: isPoolAuthority ? '#FFFBEB' : '#F8FAFC',
+            border: `1px solid ${isPoolAuthority ? '#FCD34D' : '#E2E8F0'}`,
+          }}
+        >
+          <h3 className="section-title" style={{ fontSize: '1rem', marginBottom: 6 }}>
+            Early unstake disabled
+          </h3>
+          <p className="muted" style={{ fontSize: '0.8125rem', margin: 0, lineHeight: 1.55 }}>
+            This pool was launched before the stake-mint reward line was bundled into the
+            initial pool tx. The on-chain program needs that line registered before
+            anyone can pay the 10% early-unstake penalty.{' '}
+            {isPoolAuthority ? (
+              <strong>You&apos;re the pool authority — one click below registers it.</strong>
+            ) : (
+              <>Holders can still <strong>regular-unstake</strong> after lock expiry. Only the
+              pool deployer can enable early unstakes.</>
+            )}
+          </p>
+          {isPoolAuthority && (
+            <button
+              type="button"
+              onClick={onBackfillStakeRewardLine}
+              disabled={busy}
+              className="btn-primary"
+              style={{ marginTop: 12 }}
+            >
+              {busy ? 'Submitting…' : 'Enable early unstakes'}
+            </button>
+          )}
+        </div>
+      )}
+
       <div className="panel panel--tight">
         <h3 className="section-title" style={{ fontSize: '1.25rem', marginBottom: 8 }}>Your positions</h3>
         {positions.length === 0 && <p className="muted" style={{ fontSize: '0.875rem', margin: 0 }}>No active positions yet.</p>}
@@ -467,7 +550,17 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
                       Unstake
                     </button>
                   ) : (
-                    <button type="button" onClick={() => onUnstake(p, true)} disabled={busy} className="btn-small btn-small--danger">
+                    <button
+                      type="button"
+                      onClick={() => onUnstake(p, true)}
+                      disabled={busy || !earlyUnstakeReady}
+                      className="btn-small btn-small--danger"
+                      title={
+                        earlyUnstakeReady
+                          ? 'Exit before lock end with a 10% principal penalty (redistributed to remaining stakers).'
+                          : 'Early unstake is unavailable until the pool deployer enables it (see banner above).'
+                      }
+                    >
                       Unstake early (10% penalty)
                     </button>
                   )}

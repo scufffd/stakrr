@@ -306,11 +306,32 @@ async function buildPoolRewardTxFor({ connection, creatorPk, stakeMint, rewardMi
     rewardMint,
     allowMissingMint: true,
   });
+
   const tx = new Transaction();
   const fee = priorityFeeIx();
   if (fee) tx.add(fee);
   tx.add(ixPool);
   tx.add(ixReward);
+
+  // unstake_early routes the 10% principal penalty back to remaining stakers
+  // through the stake-mint reward line, so the program requires
+  // `add_reward_mint(stake_mint)` to have been called once. In token-reward
+  // mode `rewardMint === stakeMint` already so the line above covers it; in
+  // SOL-reward mode we need a second registration. Bundling here means every
+  // launch is born with early-unstake support — without it the program fails
+  // at instruction-3 with `AccountNotInitialized` for `stake_reward_mint`
+  // (Anchor 3012), which we hit live on yks7qy…pump on a 30-day position.
+  if (!stakeMint.equals(rewardMint)) {
+    const { ix: ixStakeRewardLine } = await addRewardMintIx({
+      connection,
+      authority: creatorPk,
+      stakeMint,
+      rewardMint: stakeMint,
+      allowMissingMint: true,
+    });
+    tx.add(ixStakeRewardLine);
+  }
+
   const { blockhash } = await connection.getLatestBlockhash('confirmed');
   tx.recentBlockhash = blockhash;
   tx.feePayer = creatorPk;
@@ -425,6 +446,20 @@ export async function buildUnsignedPoolRewardTxBase64({
   if (fee) tx.add(fee);
   tx.add(ixPool);
   tx.add(ixReward);
+
+  // Mirror the bundled-launch path: register the stake mint as its own reward
+  // line so unstake_early can pay the 10% penalty back to remaining stakers.
+  // See buildPoolRewardTxFor for the full rationale.
+  if (!stakeMint.equals(rewardMint)) {
+    const { ix: ixStakeRewardLine } = await addRewardMintIx({
+      connection,
+      authority: creatorPk,
+      stakeMint,
+      rewardMint: stakeMint,
+    });
+    tx.add(ixStakeRewardLine);
+  }
+
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
   tx.recentBlockhash = blockhash;
   tx.feePayer = creatorPk;
