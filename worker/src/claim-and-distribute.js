@@ -156,8 +156,24 @@ function splitFees(claimedLamports) {
   return { platform, stakers };
 }
 
-async function depositSolAsWsolToPool({ connection, treasury, stakeMint, lamports }) {
+/**
+ * Build a SystemProgram.transfer ix sweeping the platform fee out of the
+ * treasury into the dedicated fee vault. Returns null when no vault is
+ * configured (env unset) or amount is zero — caller should treat null as
+ * "don't add this ix" so tx layout is unchanged in legacy deployments.
+ */
+function buildPlatformFeeSweepIx(treasury, lamports) {
+  if (!config.platformFeeVault) return null;
   if (lamports <= 0n) return null;
+  return SystemProgram.transfer({
+    fromPubkey: treasury.publicKey,
+    toPubkey: config.platformFeeVault,
+    lamports: Number(lamports),
+  });
+}
+
+async function depositSolAsWsolToPool({ connection, treasury, stakeMint, lamports, platformLamports = 0n }) {
+  if (lamports <= 0n) return { depositSig: null, sweepSig: null };
 
   const wrap = await wrapSolIxs({
     payer: treasury.publicKey,
@@ -179,11 +195,35 @@ async function depositSolAsWsolToPool({ connection, treasury, stakeMint, lamport
   for (const ix of wrap.ixs) tx.add(ix);
   tx.add(dep.ix);
 
+  // Bundle the platform-fee sweep in the same tx — saves a network fee +
+  // ensures it's atomic with the staker deposit (we either move both or
+  // neither, never just the staker portion).
+  const sweep = buildPlatformFeeSweepIx(treasury, platformLamports);
+  if (sweep) tx.add(sweep);
+
   const signature = await signAndPollConfirm(connection, tx, [treasury], {
     commitment: 'confirmed',
-    label: 'deposit_rewards(wsol)',
+    label: 'deposit_rewards(wsol)+sweep',
   });
-  return signature;
+  return { depositSig: signature, sweepSig: sweep ? signature : null };
+}
+
+/**
+ * Token-reward mode can't piggy-back the sweep onto the deposit tx (that
+ * tx has its own large account list). Sweep as a tiny standalone tx after
+ * the deposit. ~5000 lamports network fee, paid by treasury.
+ */
+async function sweepPlatformFeeStandalone({ connection, treasury, lamports }) {
+  const sweepIx = buildPlatformFeeSweepIx(treasury, lamports);
+  if (!sweepIx) return null;
+  const tx = new Transaction();
+  const fee = priorityFeeIx();
+  if (fee) tx.add(fee);
+  tx.add(sweepIx);
+  return signAndPollConfirm(connection, tx, [treasury], {
+    commitment: 'confirmed',
+    label: 'platform_fee_sweep',
+  });
 }
 
 /**
@@ -514,6 +554,7 @@ export async function runPoolCycle({ pool }) {
 
   let depositSig = null;
   let buySig = null;
+  let sweepSig = null;
   let rewardsDepositedRaw = '0';
   let rewardsDepositedLabel = stakers.toString(); // for SOL mode, lamports == raw
 
@@ -536,17 +577,27 @@ export async function runPoolCycle({ pool }) {
           depositSig,
           depositedRaw: res.depositedRaw,
         });
+        sweepSig = await sweepPlatformFeeStandalone({ connection, treasury, lamports: platform });
+        if (sweepSig) log('cycle: swept platform fee', { stakeMint: pool.stakeMint, sweepSig, lamports: platform.toString() });
       }
     } else {
-      depositSig = await depositSolAsWsolToPool({
+      const solRes = await depositSolAsWsolToPool({
         connection,
         treasury,
         stakeMint,
         lamports: stakers,
+        platformLamports: platform,
       });
+      depositSig = solRes.depositSig;
+      sweepSig = solRes.sweepSig;
       rewardsDepositedRaw = stakers.toString();
       rewardsDepositedLabel = stakers.toString();
-      log('cycle: deposited wSOL to pool', { stakeMint: pool.stakeMint, sig: depositSig });
+      log('cycle: deposited wSOL to pool + swept platform fee', {
+        stakeMint: pool.stakeMint,
+        sig: depositSig,
+        sweepBundled: !!sweepSig,
+        platformLamports: platform.toString(),
+      });
     }
   }
 
@@ -586,12 +637,14 @@ export async function runPoolCycle({ pool }) {
     rewardMode,
     claimedLamports: claimedLamports.toString(),
     platformFeeLamports: platform.toString(),
+    platformFeeVault: config.platformFeeVault?.toBase58() || null,
     rewardsDepositedRaw,
     rewardsDepositedLabel,
     claimSig,
     distributeSig,
     buySig,
     depositSig,
+    sweepSig,
     pushedClaims: pushResult.pushed,
     pushTxSigs: pushResult.txSigs,
   });
@@ -606,6 +659,7 @@ export async function runPoolCycle({ pool }) {
     distributeSig,
     buySig,
     depositSig,
+    sweepSig,
     pushedClaims: pushResult.pushed,
   };
 }

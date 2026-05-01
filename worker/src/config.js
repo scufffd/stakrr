@@ -89,6 +89,33 @@ export const config = {
   launchFeeLamports: intEnv('LAUNCH_FEE_LAMPORTS', 0),
   minDistributeLamports: intEnv('MIN_DISTRIBUTE_LAMPORTS', 2_000_000),
 
+  /**
+   * Wallet that receives the platform fee skim every claim cycle. Kept
+   * separate from `treasury` (which signs txs and pays network fees) so
+   * platform revenue never gets mixed with operating capital. When unset,
+   * the skim is a no-op and the 2% remains in the treasury.
+   *
+   * Set this to a wallet you don't actively transact from — e.g. a hardware
+   * wallet or multisig — so balances are auditable.
+   */
+  platformFeeVault: (() => {
+    const v = optional('PLATFORM_FEE_VAULT', '').trim();
+    if (!v) return null;
+    try { return new PublicKey(v); } catch { throw new Error(`PLATFORM_FEE_VAULT is not a valid pubkey: ${v}`); }
+  })(),
+
+  /**
+   * Wallet allowed to use admin-only API endpoints (e.g. presale auto-stake).
+   * When unset, those endpoints reject all requests. Verified by checking
+   * the `x-admin-wallet` header against this pubkey *and* requiring a
+   * recent (≤60s) signed nonce so we don't trust a header alone.
+   */
+  adminWallet: (() => {
+    const v = optional('ADMIN_WALLET', '').trim();
+    if (!v) return null;
+    try { return new PublicKey(v); } catch { throw new Error(`ADMIN_WALLET is not a valid pubkey: ${v}`); }
+  })(),
+
   // Pump fee-share lock (see pump-fees.js). When `lockFees.enabled` is true,
   // every Stakrr launch runs `pump_fees::create_fee_sharing_config` +
   // `update_fee_shares` after the Pump create, migrating the on-chain

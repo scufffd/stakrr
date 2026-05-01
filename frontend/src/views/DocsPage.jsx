@@ -14,6 +14,7 @@ const GITHUB = import.meta.env.VITE_GITHUB_URL || REPO_FALLBACK;
 const FALLBACK = {
   treasury: '9sfK1heMLLBCaYhUEH7C2ZsRtQYDCGpa956HEVS6TgWu',
   feeRecipient: '9sfK1heMLLBCaYhUEH7C2ZsRtQYDCGpa956HEVS6TgWu',
+  platformFeeVault: null,
   programs: {
     stake: '65YrGaBL5ukm4SVcsEBoUgnqTrNXy2pDiPKeQKjSexVA',
     pumpFees: 'pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ',
@@ -150,8 +151,16 @@ export default function DocsPage() {
                 <code style={mono}>deposit_rewards</code>&apos;d into that token&apos;s reward vault, where stakers can claim it.
               </li>
               <li>
-                <strong>{platformPct}%</strong> stays in the treasury wallet to cover RPC, claim-cycle network fees,
-                and platform operations.
+                <strong>{platformPct}%</strong>{' '}
+                {cfg.platformFeeVault ? (
+                  <>
+                    <code style={mono}>SystemProgram.transfer</code>&apos;d in the same atomic tx to the platform fee
+                    vault <Solscan pubkey={cfg.platformFeeVault} />, kept separate from the operating treasury so
+                    revenue is auditable.
+                  </>
+                ) : (
+                  <>retained inside the treasury wallet to cover RPC, claim-cycle network fees, and platform operations.</>
+                )}
               </li>
             </ul>
           </li>
@@ -217,7 +226,8 @@ export default function DocsPage() {
               ['pump_fees program', cfg.programs.pumpFees],
               ['pump bonding-curve program', cfg.programs.pumpBondingCurve],
               ['Stakrr treasury / fee recipient', cfg.feeRecipient],
-            ].map(([label, value]) => (
+              cfg.platformFeeVault ? ['Platform fee vault', cfg.platformFeeVault] : null,
+            ].filter(Boolean).map(([label, value]) => (
               <tr key={label} style={{ borderBottom: '1px solid #eee' }}>
                 <td style={{ padding: '10px 8px 10px 0', color: MUTED, fontWeight: 600, whiteSpace: 'nowrap', verticalAlign: 'top' }}>{label}</td>
                 <td style={{ padding: '10px 0', wordBreak: 'break-all' }}>
