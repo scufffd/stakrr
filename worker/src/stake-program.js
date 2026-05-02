@@ -332,4 +332,106 @@ export async function fetchOwnerPositionsInPool({ connection, signer, stakeMint,
   return rows.filter((p) => p.account.owner.equals(owner));
 }
 
+/**
+ * Fetch every RewardCheckpoint for a (pool, rewardMint). Indexes by position
+ * pubkey so callers can join with a position list cheaply (one RPC call total
+ * regardless of staker count). RewardCheckpoint layout:
+ *   disc(8) bump(1) position(32) reward_mint(32) acc_per_share(16) claimable(8) total_claimed(8) reserved(16)
+ * `reward_mint` lives at offset 8 + 1 + 32 = 41.
+ */
+export async function fetchCheckpointsForRewardMint({ connection, stakeMint, rewardMint }) {
+  const program = loadProgramReadOnly(connection);
+  const pool = findPoolPda(stakeMint);
+  const rewardMintPda = findRewardMintPda(pool, rewardMint);
+  const all = await program.account.rewardCheckpoint.all([
+    { memcmp: { offset: 41, bytes: rewardMintPda.toBase58() } },
+  ]);
+  const byPosition = new Map();
+  for (const cp of all) {
+    byPosition.set(cp.account.position.toBase58(), cp);
+  }
+  return { rewardMintPda, byPosition };
+}
+
+/**
+ * Stakers leaderboard data for a single mint. Active positions enriched with
+ * lifetime claimed + currently-claimable amounts per position, plus the
+ * each-staker share of total effective stake (used for "% of pool" UX).
+ *
+ * If the pool's RewardMint has accrued more `acc_per_share` than the
+ * checkpoint last captured, we project the additional claimable so the UI
+ * shows up-to-the-second pending fees without forcing each staker to prime.
+ *
+ * `rewardMint` is the SOL reward (wsol) for `rewardMode === 'sol'` pools, or
+ * the stake mint itself for `rewardMode === 'token'`.
+ */
+export async function fetchStakersLeaderboard({ connection, stakeMint, rewardMint }) {
+  const [pool, positions, cpData, rm] = await Promise.all([
+    Promise.resolve(findPoolPda(stakeMint)),
+    fetchActivePositions({ connection, stakeMint }),
+    fetchCheckpointsForRewardMint({ connection, stakeMint, rewardMint }),
+    fetchRewardMint({ connection, stakeMint, rewardMint }),
+  ]);
+  const accPerShareLatest = rm?.accPerShare ? new BN(rm.accPerShare.toString()) : new BN(0);
+  // Anchor 0.31 codec returns BN for u128; SCALE matches the on-chain Q64.64
+  // accumulator (1e12 used by the program).
+  const SCALE = new BN('1000000000000');
+
+  // Total effective for share-of-pool denomination — sum across positions
+  // (more reliable than the StakePool's totalEffective if the pool's value
+  // is stale due to a missing prime cycle).
+  const totalEffective = positions.reduce(
+    (acc, p) => acc.add(new BN(p.account.effective.toString())),
+    new BN(0),
+  );
+
+  const stakers = positions.map((p) => {
+    const acc = p.account;
+    const effectiveBn = new BN(acc.effective.toString());
+    const cp = cpData.byPosition.get(p.publicKey.toBase58());
+    const totalClaimedBn = cp ? new BN(cp.account.totalClaimed.toString()) : new BN(0);
+    const cpClaimable = cp ? new BN(cp.account.claimable.toString()) : new BN(0);
+    const cpAcc = cp ? new BN(cp.account.accPerShare.toString()) : new BN(0);
+    const projectedAccrual = accPerShareLatest.gt(cpAcc)
+      ? accPerShareLatest.sub(cpAcc).mul(effectiveBn).div(SCALE)
+      : new BN(0);
+    const claimableBn = cpClaimable.add(projectedAccrual);
+    const earnedBn = totalClaimedBn.add(claimableBn);
+    const shareBps = totalEffective.gt(new BN(0))
+      ? Number(effectiveBn.muln(10_000).div(totalEffective).toString())
+      : 0;
+    return {
+      position: p.publicKey.toBase58(),
+      owner: acc.owner.toBase58(),
+      amountRaw: acc.amount.toString(),
+      effective: effectiveBn.toString(),
+      multiplierBps: acc.multiplierBps ?? acc.multiplier_bps ?? 0,
+      lockDays: acc.lockDays ?? acc.lock_days ?? 0,
+      lockStart: Number(acc.lockStart ?? acc.lock_start ?? 0),
+      lockEnd: Number(acc.lockEnd ?? acc.lock_end ?? 0),
+      shareBps,
+      totalClaimedRaw: totalClaimedBn.toString(),
+      claimableRaw: claimableBn.toString(),
+      earnedRaw: earnedBn.toString(),
+      hasCheckpoint: !!cp,
+    };
+  });
+
+  // Default sort: largest stake first.
+  stakers.sort((a, b) => {
+    const A = BigInt(a.effective);
+    const B = BigInt(b.effective);
+    return A === B ? 0 : (B > A ? 1 : -1);
+  });
+  return {
+    pool: pool.toBase58(),
+    rewardMint: rewardMint.toBase58(),
+    rewardMintPda: cpData.rewardMintPda.toBase58(),
+    accPerShare: accPerShareLatest.toString(),
+    totalEffective: totalEffective.toString(),
+    stakerCount: stakers.length,
+    stakers,
+  };
+}
+
 export { BN };

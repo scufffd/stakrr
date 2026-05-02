@@ -838,6 +838,8 @@ function SnipesTab({ adminPk }) {
   const [expandedId, setExpandedId] = useState(null);
   const [holdings, setHoldings] = useState({}); // walletId -> holdings
   const [busy, setBusy] = useState(null);
+  const [drawerKey, setDrawerKey] = useState(null); // `${snipeId}-${walletId}` of the open trade drawer
+  const [lastSig, setLastSig] = useState(null);
 
   const reload = useCallback(async () => {
     if (!adminPk) return;
@@ -882,15 +884,38 @@ function SnipesTab({ adminPk }) {
     await loadHoldings(snipe);
   }, [expandedId, loadHoldings]);
 
-  const handleSell = useCallback(async (snipe, walletId, pct) => {
-    if (!confirm(`Sell ${pct}% of this wallet's bag?`)) return;
+  const handleSell = useCallback(async (snipe, walletId, pct, slippage = 10) => {
+    if (!confirm(`Sell ${pct}% of this wallet's bag (slippage ${slippage}%)?`)) return;
     setBusy(`${snipe.id}-${walletId}`);
+    setLastSig(null);
     try {
-      await adminFetch('/api/admin/snipe/sell', {
+      const out = await adminFetch('/api/admin/snipe/sell', {
         method: 'POST',
         adminPk,
-        body: { walletId, mint: snipe.mint, sellPct: pct, slippage: 10, snipeId: snipe.id },
+        body: { walletId, mint: snipe.mint, sellPct: pct, slippage, snipeId: snipe.id },
       });
+      setLastSig(out.sig || null);
+      await loadHoldings(snipe);
+      await reload();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(null);
+    }
+  }, [adminPk, loadHoldings, reload]);
+
+  const handleBuy = useCallback(async (snipe, walletId, solAmount, slippage = 10) => {
+    if (!(solAmount > 0)) { setErr('amount must be > 0'); return; }
+    if (!confirm(`Buy ${solAmount} SOL worth from this wallet (slippage ${slippage}%)?`)) return;
+    setBusy(`${snipe.id}-${walletId}`);
+    setLastSig(null);
+    try {
+      const out = await adminFetch('/api/admin/snipe/buy', {
+        method: 'POST',
+        adminPk,
+        body: { walletId, mint: snipe.mint, solAmount, slippage, snipeId: snipe.id },
+      });
+      setLastSig(out.sig || null);
       await loadHoldings(snipe);
       await reload();
     } catch (e) {
@@ -1005,30 +1030,53 @@ function SnipesTab({ adminPk }) {
                             {(s.snipers || []).map((sn) => {
                               const h = holdings[sn.walletId];
                               const id = `${s.id}-${sn.walletId}`;
+                              const drawerOpen = drawerKey === id;
                               return (
-                                <tr key={sn.walletId}>
-                                  <td style={td}><span style={{ fontFamily: 'monospace', fontSize: 12 }}>{shortPk(sn.publicKey, 5)}</span></td>
-                                  <td style={td}>
-                                    <span style={{ padding: '2px 6px', borderRadius: 4, fontSize: 11, background: sn.kind === 'in-bundle' ? '#dbeafe' : '#fef3c7', color: sn.kind === 'in-bundle' ? '#1e40af' : '#92400e' }}>{sn.kind}</span>
-                                  </td>
-                                  <td style={{ ...td, textAlign: 'right' }}>{fmtSol(h?.sol)}</td>
-                                  <td style={{ ...td, textAlign: 'right' }}>
-                                    {h?.tokens ? fmtTokens(h.tokens.amountRaw, h.tokens.decimals) : (h?.error ? <span style={{ color: ERR }}>err</span> : '…')}
-                                  </td>
-                                  <td style={{ ...td, fontFamily: 'monospace', fontSize: 11 }}>
-                                    {sn.buySig ? (
-                                      <a href={`https://solscan.io/tx/${sn.buySig}`} target="_blank" rel="noreferrer" style={linkStyle}>{shortPk(sn.buySig, 5)}</a>
-                                    ) : sn.error ? <span style={{ color: ERR }} title={sn.error}>err</span> : '—'}
-                                  </td>
-                                  <td style={td}>
-                                    <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                                      <button onClick={() => handleSell(s, sn.walletId, 100)} disabled={busy === id || !h?.tokens?.amountRaw || h?.tokens?.amountRaw === '0'} style={tinyBtn}>sell all</button>
-                                      <button onClick={() => handleSell(s, sn.walletId, 50)} disabled={busy === id || !h?.tokens?.amountRaw || h?.tokens?.amountRaw === '0'} style={tinyBtn}>sell 50%</button>
-                                      <button onClick={() => handleTransfer(s, sn.walletId)} disabled={busy === id} style={tinyBtn}>transfer</button>
-                                      <button onClick={() => handleSweep(s, sn.walletId)} disabled={busy === id || !h?.sol} style={tinyBtn}>sweep SOL</button>
-                                    </div>
-                                  </td>
-                                </tr>
+                                <React.Fragment key={sn.walletId}>
+                                  <tr>
+                                    <td style={td}><span style={{ fontFamily: 'monospace', fontSize: 12 }}>{shortPk(sn.publicKey, 5)}</span></td>
+                                    <td style={td}>
+                                      <span style={{ padding: '2px 6px', borderRadius: 4, fontSize: 11, background: sn.kind === 'in-bundle' ? '#dbeafe' : '#fef3c7', color: sn.kind === 'in-bundle' ? '#1e40af' : '#92400e' }}>{sn.kind}</span>
+                                    </td>
+                                    <td style={{ ...td, textAlign: 'right' }}>{fmtSol(h?.sol)}</td>
+                                    <td style={{ ...td, textAlign: 'right' }}>
+                                      {h?.tokens ? fmtTokens(h.tokens.amountRaw, h.tokens.decimals) : (h?.error ? <span style={{ color: ERR }}>err</span> : '…')}
+                                    </td>
+                                    <td style={{ ...td, fontFamily: 'monospace', fontSize: 11 }}>
+                                      {sn.buySig ? (
+                                        <a href={`https://solscan.io/tx/${sn.buySig}`} target="_blank" rel="noreferrer" style={linkStyle}>{shortPk(sn.buySig, 5)}</a>
+                                      ) : sn.error ? <span style={{ color: ERR }} title={sn.error}>err</span> : '—'}
+                                    </td>
+                                    <td style={td}>
+                                      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                                        <button
+                                          onClick={() => setDrawerKey(drawerOpen ? null : id)}
+                                          style={{ ...tinyBtn, background: drawerOpen ? SKY : '#fff', color: drawerOpen ? '#fff' : SUB, borderColor: drawerOpen ? SKY : BORDER, fontWeight: 600 }}
+                                        >
+                                          {drawerOpen ? 'close' : 'trade'}
+                                        </button>
+                                        <button onClick={() => handleTransfer(s, sn.walletId)} disabled={busy === id} style={tinyBtn}>transfer</button>
+                                        <button onClick={() => handleSweep(s, sn.walletId)} disabled={busy === id || !h?.sol} style={tinyBtn}>sweep SOL</button>
+                                      </div>
+                                    </td>
+                                  </tr>
+                                  {drawerOpen && (
+                                    <tr>
+                                      <td colSpan={6} style={{ padding: 0, background: '#fff', borderBottom: `1px solid ${BORDER}` }}>
+                                        <TradeDrawer
+                                          snipe={s}
+                                          sniper={sn}
+                                          holdings={h}
+                                          busy={busy === id}
+                                          lastSig={lastSig}
+                                          onSell={(pct, slip) => handleSell(s, sn.walletId, pct, slip)}
+                                          onBuy={(sol, slip) => handleBuy(s, sn.walletId, sol, slip)}
+                                          onRefresh={() => loadHoldings(s)}
+                                        />
+                                      </td>
+                                    </tr>
+                                  )}
+                                </React.Fragment>
                               );
                             })}
                           </tbody>
@@ -1044,6 +1092,213 @@ function SnipesTab({ adminPk }) {
             )}
           </tbody>
         </table>
+      </div>
+    </div>
+  );
+}
+
+// ── TradeDrawer: per-sniper buy/sell panel ──────────────────────────────────
+
+function TradeDrawer({ snipe, sniper, holdings, busy, lastSig, onSell, onBuy, onRefresh }) {
+  const [mode, setMode] = useState('sell'); // 'sell' | 'buy'
+  const [sellPct, setSellPct] = useState(100);
+  const [buySol, setBuySol] = useState('');
+  const [slippage, setSlippage] = useState(10);
+
+  const tokens = holdings?.tokens;
+  const sol = holdings?.sol || 0;
+  const decimals = tokens?.decimals ?? 6;
+  const tokenBalance = tokens ? Number(BigInt(tokens.amountRaw) * 1000n / (10n ** BigInt(decimals))) / 1000 : 0;
+  const sellRaw = tokens && tokens.amountRaw !== '0'
+    ? (BigInt(tokens.amountRaw) * BigInt(Math.round(sellPct))) / 100n
+    : 0n;
+  const sellTokens = decimals != null
+    ? Number(sellRaw * 1000n / (10n ** BigInt(decimals))) / 1000
+    : 0;
+
+  const buyAmt = Number(buySol);
+  const canBuy = !busy && buyAmt > 0 && buyAmt <= sol - 0.005; // leave fee buffer
+  const canSell = !busy && tokens && tokens.amountRaw !== '0' && sellPct > 0;
+
+  return (
+    <div style={{ padding: 16, background: '#fafafa', borderTop: `1px solid ${BORDER}` }}>
+      <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+        {/* Left: balances */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: 200 }}>
+          <div style={{ fontSize: 11, color: MUTED, textTransform: 'uppercase', letterSpacing: 0.4 }}>Wallet</div>
+          <div style={{ fontFamily: 'monospace', fontSize: 12, color: INK }}>{sniper.publicKey}</div>
+          <div style={{ marginTop: 4, fontSize: 13 }}>
+            <div><strong>{fmtSol(sol, 6)}</strong> SOL</div>
+            <div><strong>{tokens ? fmtTokens(tokens.amountRaw, decimals) : '0'}</strong> {snipe.symbol}</div>
+          </div>
+          <button onClick={onRefresh} style={{ ...smallBtn, marginTop: 4, alignSelf: 'flex-start' }}>refresh balances</button>
+        </div>
+
+        {/* Right: trade form */}
+        <div style={{ flex: 1, minWidth: 320 }}>
+          <div style={{ display: 'flex', gap: 4, marginBottom: 12 }}>
+            <button
+              onClick={() => setMode('sell')}
+              style={{ ...tinyBtn, padding: '6px 14px', fontSize: 12, fontWeight: 600,
+                background: mode === 'sell' ? '#dc2626' : '#fff',
+                color: mode === 'sell' ? '#fff' : SUB,
+                borderColor: mode === 'sell' ? '#dc2626' : BORDER }}
+            >
+              SELL
+            </button>
+            <button
+              onClick={() => setMode('buy')}
+              style={{ ...tinyBtn, padding: '6px 14px', fontSize: 12, fontWeight: 600,
+                background: mode === 'buy' ? '#16a34a' : '#fff',
+                color: mode === 'buy' ? '#fff' : SUB,
+                borderColor: mode === 'buy' ? '#16a34a' : BORDER }}
+            >
+              BUY MORE
+            </button>
+          </div>
+
+          {mode === 'sell' ? (
+            <div style={{ display: 'grid', gap: 8 }}>
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: MUTED, marginBottom: 4 }}>
+                  <span>Sell</span>
+                  <span><strong style={{ color: INK }}>{sellPct}%</strong> = {fmtTokens(sellRaw.toString(), decimals)} {snipe.symbol}</span>
+                </div>
+                <input
+                  type="range"
+                  min={1}
+                  max={100}
+                  step={1}
+                  value={sellPct}
+                  onChange={(e) => setSellPct(Number(e.target.value))}
+                  style={{ width: '100%' }}
+                  disabled={!tokens || tokens.amountRaw === '0'}
+                />
+                <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
+                  {[10, 25, 50, 75, 100].map((p) => (
+                    <button
+                      key={p}
+                      onClick={() => setSellPct(p)}
+                      style={{ ...tinyBtn, padding: '3px 8px', fontWeight: sellPct === p ? 600 : 500,
+                        background: sellPct === p ? SKY : '#fff',
+                        color: sellPct === p ? '#fff' : SUB,
+                        borderColor: sellPct === p ? SKY : BORDER }}
+                    >
+                      {p}%
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <span style={{ fontSize: 12, color: MUTED }}>Slippage</span>
+                {[5, 10, 15, 25].map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => setSlippage(s)}
+                    style={{ ...tinyBtn, padding: '3px 8px', fontWeight: slippage === s ? 600 : 500,
+                      background: slippage === s ? SKY : '#fff',
+                      color: slippage === s ? '#fff' : SUB,
+                      borderColor: slippage === s ? SKY : BORDER }}
+                  >
+                    {s}%
+                  </button>
+                ))}
+                <input
+                  type="number"
+                  value={slippage}
+                  onChange={(e) => setSlippage(Math.max(1, Math.min(99, Number(e.target.value) || 10)))}
+                  style={{ ...inputStyle, width: 70, padding: '4px 8px', fontSize: 12 }}
+                  min={1} max={99}
+                />
+              </div>
+              <div>
+                <button
+                  onClick={() => onSell(sellPct, slippage)}
+                  disabled={!canSell}
+                  style={{ ...btn('#dc2626'), width: '100%', opacity: canSell ? 1 : 0.5, cursor: canSell ? 'pointer' : 'not-allowed' }}
+                >
+                  {busy ? '…submitting' : `Sell ${sellPct}% (${fmtTokens(sellRaw.toString(), decimals)} ${snipe.symbol})`}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div style={{ display: 'grid', gap: 8 }}>
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: MUTED, marginBottom: 4 }}>
+                  <span>Buy with</span>
+                  <span>SOL balance: <strong style={{ color: INK }}>{fmtSol(sol, 6)}</strong></span>
+                </div>
+                <input
+                  type="number"
+                  value={buySol}
+                  onChange={(e) => setBuySol(e.target.value)}
+                  placeholder="0.05"
+                  step="0.001"
+                  min="0"
+                  style={inputStyle}
+                />
+                <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
+                  {[0.01, 0.05, 0.1, 0.25].map((amt) => (
+                    <button
+                      key={amt}
+                      onClick={() => setBuySol(String(amt))}
+                      disabled={amt > sol - 0.005}
+                      style={{ ...tinyBtn, padding: '3px 8px' }}
+                    >
+                      {amt} SOL
+                    </button>
+                  ))}
+                  <button
+                    onClick={() => setBuySol(String(Math.max(0, sol - 0.01).toFixed(4)))}
+                    style={{ ...tinyBtn, padding: '3px 8px' }}
+                  >
+                    max
+                  </button>
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <span style={{ fontSize: 12, color: MUTED }}>Slippage</span>
+                {[5, 10, 15, 25].map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => setSlippage(s)}
+                    style={{ ...tinyBtn, padding: '3px 8px', fontWeight: slippage === s ? 600 : 500,
+                      background: slippage === s ? SKY : '#fff',
+                      color: slippage === s ? '#fff' : SUB,
+                      borderColor: slippage === s ? SKY : BORDER }}
+                  >
+                    {s}%
+                  </button>
+                ))}
+                <input
+                  type="number"
+                  value={slippage}
+                  onChange={(e) => setSlippage(Math.max(1, Math.min(99, Number(e.target.value) || 10)))}
+                  style={{ ...inputStyle, width: 70, padding: '4px 8px', fontSize: 12 }}
+                  min={1} max={99}
+                />
+              </div>
+              <div>
+                <button
+                  onClick={() => onBuy(buyAmt, slippage)}
+                  disabled={!canBuy}
+                  style={{ ...btn('#16a34a'), width: '100%', opacity: canBuy ? 1 : 0.5, cursor: canBuy ? 'pointer' : 'not-allowed' }}
+                >
+                  {busy ? '…submitting' : `Buy with ${buyAmt || 0} SOL`}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {lastSig && (
+            <div style={{ marginTop: 8, fontSize: 12, color: MUTED }}>
+              last tx:{' '}
+              <a href={`https://solscan.io/tx/${lastSig}`} target="_blank" rel="noreferrer" style={linkStyle}>
+                {shortPk(lastSig, 7)}
+              </a>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

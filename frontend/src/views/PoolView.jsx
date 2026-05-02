@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import StakePoolView from '../stake/StakePoolView.jsx';
+import StakersLeaderboard from './StakersLeaderboard.jsx';
 import { apiUrl } from '../apiBase.js';
 
 const LAMPORTS = 1_000_000_000n;
@@ -310,6 +311,17 @@ export default function PoolView({ mint, onBack }) {
               )}
             </div>
           </div>
+
+          {token.initialized && (
+            <div style={{ marginTop: 24 }}>
+              <StakersLeaderboard
+                mint={token.stakeMint}
+                decimals={6}
+                symbol={meta.symbol || 'TKN'}
+                rewardMode={token.rewardMode || 'sol'}
+              />
+            </div>
+          )}
         </div>
       )}
     </div>

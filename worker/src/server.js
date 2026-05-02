@@ -30,7 +30,7 @@ import multer from 'multer';
 import { PublicKey } from '@solana/web3.js';
 import { config, authoritySigner, getConnection } from './config.js';
 import { getPool, listPools } from './registry.js';
-import { fetchPool, fetchRewardMint, fetchActivePositions } from './stake-program.js';
+import { fetchPool, fetchRewardMint, fetchActivePositions, fetchStakersLeaderboard } from './stake-program.js';
 import {
   prepareCreatorLaunch,
   buildLockFeesTxBase64,
@@ -708,6 +708,45 @@ app.get('/api/tokens/:mint/public', (req, res, next) => {
 });
 app.get('/api/pools/:mint/public', (req, res, next) => {
   sendPublicTokenView(req, res, 'pool').catch(next);
+});
+
+/**
+ * Public stakers leaderboard for a single mint. Returns each active
+ * position's owner, staked amount, lock duration, and lifetime fees earned
+ * (claimed + currently-claimable). Used by the token detail page's
+ * "Stakers" tab — same shape we'd want for csv exports later.
+ */
+app.get('/api/tokens/:mint/stakers', async (req, res) => {
+  try {
+    const pool = getPool(req.params.mint);
+    if (!pool) return res.status(404).json({ ok: false, error: 'not_found' });
+    const connection = getConnection();
+    const stakeMint = new PublicKey(pool.stakeMint);
+    const rewardMode = pool.rewardMode || 'sol';
+    const rewardMintPk = rewardMode === 'token'
+      ? stakeMint
+      : new PublicKey(pool.rewardMint || config.wsolMint.toBase58());
+    const data = await fetchStakersLeaderboard({
+      connection,
+      stakeMint,
+      rewardMint: rewardMintPk,
+    });
+    res.json({
+      ok: true,
+      mint: pool.stakeMint,
+      symbol: pool?.metadata?.symbol || pool?.symbol || null,
+      rewardMode,
+      ...data,
+    });
+  } catch (e) {
+    console.error(JSON.stringify({
+      ts: new Date().toISOString(),
+      message: 'stakers leaderboard failed',
+      mint: req.params.mint,
+      error: e.message,
+    }));
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // ---- Launch ----
