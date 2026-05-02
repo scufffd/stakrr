@@ -43,6 +43,27 @@ import { buildWalletSummary } from './wallet-summary.js';
 import { getVanityPoolStats } from './vanity-mints.js';
 import { scanPresaleContributions } from './presale-scan.js';
 import { buildPresaleAutoStakeBatches } from './presale-autostake.js';
+import {
+  vaultEnabled,
+  vaultStats,
+  listWalletsWithBalances,
+  generateWallet as generateSnipeWallet,
+  importWallet as importSnipeWallet,
+  removeWallet as removeSnipeWallet,
+  updateWallet as updateSnipeWallet,
+  exportWalletSecret as exportSnipeWalletSecret,
+  getWallet as getSnipeWallet,
+} from './snipe/wallet-vault.js';
+import { stealthLaunch, quoteStealthLaunch, ensureEphemeralWallets } from './snipe/orchestrator.js';
+import { listSnipes, getSnipe } from './snipe/snipe-store.js';
+import {
+  readSniperHoldings,
+  sellSniperBag,
+  buyMoreFromSniper,
+  transferSniperTokens,
+  sweepSniperSol,
+  markSniperResolved,
+} from './snipe/post-ops.js';
 
 const app = express();
 app.use(express.json({ limit: '32kb' }));
@@ -213,6 +234,340 @@ app.post('/api/admin/presale/auto-stake-prepare', requireAdmin, async (req, res)
     res.json({ ok: true, ...result });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── Stealth-launch / sniper bundle (admin only) ────────────────────────────
+//
+// Endpoints under /api/admin/snipe/* manage the off-public-nav bundling tool:
+//   - vault: list/generate/import/export/remove sniper keypairs (encrypted at rest)
+//   - launch: build a Jito bundle (create + dev buy + N sniper buys) atomically,
+//     then locally finish the lock-fees + pool-init txs and add to the public registry
+//   - snipes: list past launches initiated via this tool
+//   - ops: sell/buy/transfer/sweep on a per-sniper basis
+//
+// All endpoints require x-admin-wallet (same gate as /admin/presale) and
+// rely on SNIPE_VAULT_KEY (32-byte hex) being set on the server. If the
+// vault key is missing every endpoint returns 503 with a clear error.
+
+function requireVault(req, res, next) {
+  if (!vaultEnabled()) {
+    return res.status(503).json({
+      ok: false,
+      error: 'sniper vault disabled — set SNIPE_VAULT_KEY (32 byte hex) in worker .env',
+    });
+  }
+  return next();
+}
+
+app.get('/api/admin/snipe/info', requireAdmin, (req, res) => {
+  try {
+    res.json({
+      ok: true,
+      vault: vaultStats(),
+      bundle: {
+        maxBundleTxs: 5,
+        defaultJitoTipSol: parseFloat(process.env.JITO_TIP_SOL || '0.001'),
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/admin/snipe/wallets', requireAdmin, requireVault, async (req, res) => {
+  try {
+    const filter = {};
+    if (req.query.source) filter.source = String(req.query.source);
+    if (req.query.launchMint) filter.launchMint = String(req.query.launchMint);
+    const wallets = await listWalletsWithBalances(filter);
+    res.json({ ok: true, wallets });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/admin/snipe/wallets/generate', requireAdmin, requireVault, (req, res) => {
+  try {
+    const body = req.body || {};
+    const count = Math.max(1, Math.min(20, Number(body.count) || 1));
+    const source = body.source === 'ephemeral' ? 'ephemeral' : 'pool';
+    if (source === 'ephemeral') {
+      const created = ensureEphemeralWallets(count, { labelPrefix: body.labelPrefix || 'ephemeral' });
+      return res.json({ ok: true, created });
+    }
+    const created = [];
+    for (let i = 0; i < count; i += 1) {
+      created.push(generateSnipeWallet({
+        label: body.label ? `${body.label}-${i + 1}` : undefined,
+        source: 'pool',
+        tags: Array.isArray(body.tags) ? body.tags : [],
+      }));
+    }
+    res.json({ ok: true, created });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/admin/snipe/wallets/import', requireAdmin, requireVault, (req, res) => {
+  try {
+    const body = req.body || {};
+    if (!body.secretKey) return res.status(400).json({ ok: false, error: 'secretKey required (base58 or JSON byte array)' });
+    const wallet = importSnipeWallet({
+      secretKey: body.secretKey,
+      label: body.label,
+      source: body.source === 'ephemeral' ? 'ephemeral' : 'pool',
+      tags: Array.isArray(body.tags) ? body.tags : [],
+      launchMint: body.launchMint || null,
+    });
+    res.json({ ok: true, wallet });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.patch('/api/admin/snipe/wallets/:id', requireAdmin, requireVault, (req, res) => {
+  try {
+    const updated = updateSnipeWallet(req.params.id, req.body || {});
+    if (!updated) return res.status(404).json({ ok: false, error: 'wallet not found' });
+    res.json({ ok: true, wallet: updated });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.delete('/api/admin/snipe/wallets/:id', requireAdmin, requireVault, async (req, res) => {
+  try {
+    const w = getSnipeWallet(req.params.id);
+    if (!w) return res.status(404).json({ ok: false, error: 'wallet not found' });
+    const force = req.query.force === '1' || req.query.force === 'true';
+    // Safety: refuse to delete a wallet that still has SOL — admin should
+    // sweep first so funds aren't accidentally orphaned.
+    if (!force) {
+      const bal = await getConnection().getBalance(new PublicKey(w.publicKey), 'confirmed');
+      if (bal > 5_000) {
+        return res.status(409).json({
+          ok: false,
+          error: `wallet still has ${bal} lamports — sweep first or pass ?force=1 to override`,
+        });
+      }
+    }
+    if (!removeSnipeWallet(req.params.id)) {
+      return res.status(404).json({ ok: false, error: 'wallet not found' });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// SECRET KEY EXPORT — requires both admin gate AND an extra confirmation
+// header to defend against an accidental click in the UI exposing private
+// material.
+app.post('/api/admin/snipe/wallets/:id/export', requireAdmin, requireVault, (req, res) => {
+  try {
+    const confirm = req.get('x-export-confirm');
+    if (confirm !== 'I-UNDERSTAND-EXPORTING-PRIVATE-KEYS') {
+      return res.status(403).json({
+        ok: false,
+        error: 'set header x-export-confirm: I-UNDERSTAND-EXPORTING-PRIVATE-KEYS to retrieve secret',
+      });
+    }
+    const out = exportSnipeWalletSecret(req.params.id, { confirm: true });
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// ── Stealth launch ───────────────────────────────────────────────────────────
+
+app.post('/api/admin/snipe/quote', requireAdmin, requireVault, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const out = await quoteStealthLaunch({
+      devWalletId: body.devWalletId,
+      sniperWalletIds: Array.isArray(body.sniperWalletIds) ? body.sniperWalletIds : [],
+      devBuySol: Number(body.devBuySol) || 0,
+      sniperSolPerWallet: Number(body.sniperSolPerWallet) || 0,
+      jitoTipSol: body.jitoTipSol == null ? null : Number(body.jitoTipSol),
+    });
+    res.json({ ok: true, quote: out });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/admin/snipe/launch', requireAdmin, requireVault, upload.single('image'), async (req, res) => {
+  try {
+    const body = req.body || {};
+
+    // multipart sends sniperWalletIds as a JSON-encoded string; raw JSON sends an array
+    let sniperWalletIds = [];
+    if (Array.isArray(body.sniperWalletIds)) {
+      sniperWalletIds = body.sniperWalletIds;
+    } else if (typeof body.sniperWalletIds === 'string' && body.sniperWalletIds.trim()) {
+      try { sniperWalletIds = JSON.parse(body.sniperWalletIds); }
+      catch { sniperWalletIds = body.sniperWalletIds.split(',').map((s) => s.trim()).filter(Boolean); }
+    }
+
+    let metadataUri = null;
+    try { metadataUri = validateExternalMetadataUri(body.metadataUri); }
+    catch (e) { return res.status(400).json({ ok: false, error: e.message }); }
+
+    const metadata = {
+      name: body.name?.trim(),
+      symbol: body.symbol?.trim()?.toUpperCase(),
+      description: body.description || '',
+      twitter: body.twitter || undefined,
+      telegram: body.telegram || undefined,
+      website: body.website || undefined,
+      image: body.metadataImageUrl || body.imageUrl || undefined,
+    };
+    if (!metadata.name || !metadata.symbol) {
+      return res.status(400).json({ ok: false, error: 'name and symbol required' });
+    }
+    if (!body.devWalletId) {
+      return res.status(400).json({ ok: false, error: 'devWalletId required' });
+    }
+    if (!metadataUri && !req.file?.buffer && !body.imageUrl) {
+      return res.status(400).json({ ok: false, error: 'image (file or imageUrl) or metadataUri required' });
+    }
+    const initiatorPk = req.get('x-admin-wallet') || null;
+    const result = await stealthLaunch({
+      devWalletId: body.devWalletId,
+      sniperWalletIds,
+      devBuySol: Number(body.devBuySol) || 0,
+      sniperSolPerWallet: Number(body.sniperSolPerWallet) || 0,
+      jitoTipSol: body.jitoTipSol == null ? null : Number(body.jitoTipSol),
+      slippageBps: Number(body.slippageBps) || 5000,
+      rewardMode: body.rewardMode === 'token' ? 'token' : 'sol',
+      metadata,
+      fileBuffer: req.file?.buffer || null,
+      fileContentType: req.file?.mimetype || null,
+      imageUrl: body.imageUrl || null,
+      metadataUri: metadataUri || null,
+      metadataImageUrl: body.metadataImageUrl || null,
+      initiatedBy: initiatorPk,
+    });
+    res.json(result);
+  } catch (e) {
+    console.error(JSON.stringify({
+      ts: new Date().toISOString(),
+      message: 'snipe launch failed',
+      error: e.message,
+      stack: e.stack?.split('\n').slice(0, 8),
+    }));
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── Snipes (past launches) ──────────────────────────────────────────────────
+
+app.get('/api/admin/snipe/snipes', requireAdmin, (req, res) => {
+  try {
+    const status = req.query.status ? String(req.query.status) : null;
+    res.json({ ok: true, snipes: listSnipes({ status }) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/admin/snipe/snipes/:id', requireAdmin, (req, res) => {
+  try {
+    const snipe = getSnipe(req.params.id);
+    if (!snipe) return res.status(404).json({ ok: false, error: 'snipe not found' });
+    res.json({ ok: true, snipe });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── Post-launch ops on individual sniper wallets ─────────────────────────────
+
+app.post('/api/admin/snipe/holdings', requireAdmin, requireVault, async (req, res) => {
+  try {
+    const { walletId, mint } = req.body || {};
+    if (!walletId) return res.status(400).json({ ok: false, error: 'walletId required' });
+    const out = await readSniperHoldings({ walletId, mint });
+    res.json({ ok: true, holdings: out });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/admin/snipe/sell', requireAdmin, requireVault, async (req, res) => {
+  try {
+    const { walletId, mint, sellPct, slippage, pool, snipeId } = req.body || {};
+    if (!walletId || !mint) return res.status(400).json({ ok: false, error: 'walletId and mint required' });
+    const out = await sellSniperBag({
+      walletId, mint,
+      sellPct: sellPct == null ? 100 : Number(sellPct),
+      slippage: slippage == null ? 10 : Number(slippage),
+      pool: pool || 'auto',
+    });
+    if (snipeId) {
+      try { markSniperResolved({ snipeId, walletId, action: 'sold' }); }
+      catch { /* bookkeeping; non-fatal */ }
+    }
+    res.json(out);
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/admin/snipe/buy', requireAdmin, requireVault, async (req, res) => {
+  try {
+    const { walletId, mint, solAmount, slippage, pool } = req.body || {};
+    if (!walletId || !mint || !solAmount) {
+      return res.status(400).json({ ok: false, error: 'walletId, mint, solAmount required' });
+    }
+    const out = await buyMoreFromSniper({
+      walletId, mint,
+      solAmount: Number(solAmount),
+      slippage: slippage == null ? 10 : Number(slippage),
+      pool: pool || 'auto',
+    });
+    res.json(out);
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/admin/snipe/transfer', requireAdmin, requireVault, async (req, res) => {
+  try {
+    const { walletId, mint, toAddress, amountRaw, snipeId } = req.body || {};
+    if (!walletId || !mint || !toAddress || !amountRaw) {
+      return res.status(400).json({ ok: false, error: 'walletId, mint, toAddress, amountRaw required' });
+    }
+    const out = await transferSniperTokens({ walletId, mint, toAddress, amountRaw });
+    if (snipeId) {
+      try { markSniperResolved({ snipeId, walletId, action: 'transferred' }); }
+      catch { /* non-fatal */ }
+    }
+    res.json(out);
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/admin/snipe/sweep', requireAdmin, requireVault, async (req, res) => {
+  try {
+    const { walletId, toAddress, leaveLamports, snipeId } = req.body || {};
+    if (!walletId) return res.status(400).json({ ok: false, error: 'walletId required' });
+    const out = await sweepSniperSol({
+      walletId,
+      toAddress: toAddress || null,
+      leaveLamports: leaveLamports == null ? undefined : Number(leaveLamports),
+    });
+    if (snipeId) {
+      try { markSniperResolved({ snipeId, walletId, action: 'swept' }); }
+      catch { /* non-fatal */ }
+    }
+    res.json(out);
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
   }
 });
 

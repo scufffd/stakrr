@@ -18,7 +18,7 @@
 
 import { useEffect, useState, useCallback } from 'react';
 
-const VALID_TABS = new Set(['home', 'launch', 'profile', 'docs', 'token', 'admin-presale']);
+const VALID_TABS = new Set(['home', 'launch', 'profile', 'docs', 'token', 'admin-presale', 'admin-snipe']);
 
 /**
  * Parse a pathname into { tab, mint }. Pure function — easy to test.
@@ -32,6 +32,7 @@ export function parsePath(pathname) {
   if (clean === '/admin/presale') return { tab: 'admin-presale', mint: null };
   const adminPresaleMint = clean.match(/^\/admin\/presale\/([1-9A-HJ-NP-Za-km-z]{32,44})$/);
   if (adminPresaleMint) return { tab: 'admin-presale', mint: adminPresaleMint[1] };
+  if (clean === '/admin/snipe') return { tab: 'admin-snipe', mint: null };
   const tokenMatch = clean.match(/^\/token\/([1-9A-HJ-NP-Za-km-z]{32,44})$/);
   if (tokenMatch) return { tab: 'token', mint: tokenMatch[1] };
   return { tab: 'home', mint: null };
@@ -48,6 +49,7 @@ export function buildPath({ tab, mint } = {}) {
   if (tab === 'profile') return '/me';
   if (tab === 'docs') return '/docs';
   if (tab === 'admin-presale') return mint ? `/admin/presale/${mint}` : '/admin/presale';
+  if (tab === 'admin-snipe') return '/admin/snipe';
   if (tab === 'token' && mint) return `/token/${mint}`;
   return '/';
 }
