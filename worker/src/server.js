@@ -62,6 +62,16 @@ import {
   listKolScanCategories,
 } from './snipe/kol-list.js';
 import { runKolAirdrop, previewKolAirdrop } from './snipe/kol-airdrop.js';
+import {
+  listTokens as listMmTokens,
+  getTokenInternal as getMmTokenInternal,
+  upsertToken as upsertMmToken,
+  pauseToken as pauseMmToken,
+  resumeToken as resumeMmToken,
+  deleteToken as deleteMmToken,
+  DEFAULT_CONFIG as MM_DEFAULT_CONFIG,
+} from './mm/store.js';
+import { strategyStep as mmStrategyStep, scheduleNext as mmScheduleNext } from './mm/strategy.js';
 import { listSnipes, getSnipe, updateSnipe } from './snipe/snipe-store.js';
 import {
   readSniperHoldings,
@@ -700,6 +710,101 @@ app.post('/api/admin/snipe/kol/run', requireAdmin, requireVault, async (req, res
       } catch { /* non-fatal */ }
     }
     res.json({ ok: true, result: out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── MM bot (admin-only) ──────────────────────────────────────────────────────
+//
+// Per-token market-making config + status. Bot itself runs in a separate
+// pm2 process (`stakrr-mm`) reading worker/data/mm.json on every tick.
+// These endpoints just CRUD the config and surface state for the admin UI.
+
+app.get('/api/admin/mm/info', requireAdmin, (req, res) => {
+  res.json({
+    ok: true,
+    defaults: MM_DEFAULT_CONFIG,
+    tokens: listMmTokens(),
+  });
+});
+
+app.get('/api/admin/mm/list', requireAdmin, (req, res) => {
+  res.json({ ok: true, tokens: listMmTokens() });
+});
+
+app.get('/api/admin/mm/:mint', requireAdmin, (req, res) => {
+  const t = getMmTokenInternal(req.params.mint);
+  if (!t) return res.status(404).json({ ok: false, error: 'not in mm.json' });
+  res.json({ ok: true, token: t });
+});
+
+/**
+ * Configure (create or update) MM for a token. `walletId` MUST be a vault
+ * id — the bot signs trades server-side using that keypair. Admin is
+ * expected to fund the wallet externally before enabling.
+ */
+app.post('/api/admin/mm/configure', requireAdmin, requireVault, (req, res) => {
+  try {
+    const { mint, symbol, walletId, config, enabled } = req.body || {};
+    if (!mint) return res.status(400).json({ ok: false, error: 'mint required' });
+    if (!walletId) return res.status(400).json({ ok: false, error: 'walletId required' });
+    const t = upsertMmToken({
+      mint,
+      symbol: symbol || null,
+      walletId,
+      config: config || {},
+      enabled: enabled !== false,
+    });
+    res.json({ ok: true, token: t });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/admin/mm/pause', requireAdmin, (req, res) => {
+  try {
+    const { mint, reason } = req.body || {};
+    if (!mint) return res.status(400).json({ ok: false, error: 'mint required' });
+    const t = pauseMmToken(mint, reason || 'manual pause');
+    res.json({ ok: true, token: t });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/admin/mm/resume', requireAdmin, (req, res) => {
+  try {
+    const { mint } = req.body || {};
+    if (!mint) return res.status(400).json({ ok: false, error: 'mint required' });
+    const t = resumeMmToken(mint);
+    res.json({ ok: true, token: t });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.delete('/api/admin/mm/:mint', requireAdmin, (req, res) => {
+  try {
+    const out = deleteMmToken(req.params.mint);
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * Manual single-tick trigger — admin-only debug helper. Fires one strategy
+ * step for a token on demand, regardless of nextActionAt. Useful for
+ * verifying setup before letting the daemon take over.
+ */
+app.post('/api/admin/mm/tick', requireAdmin, requireVault, async (req, res) => {
+  try {
+    const { mint } = req.body || {};
+    if (!mint) return res.status(400).json({ ok: false, error: 'mint required' });
+    const out = await mmStrategyStep(mint);
+    const next = mmScheduleNext(mint);
+    res.json({ ok: true, result: out, nextAt: next });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }

@@ -1,3 +1,5 @@
+// PM2 ecosystem for STAKRR. Includes the API, the claim+distribute loop,
+// the slow vanity-mint grinder, and the per-token market-maker daemon.
 module.exports = {
   apps: [
     {
@@ -45,6 +47,26 @@ module.exports = {
       env: { NODE_ENV: "production" },
       out_file: "/home/stakrr/.pm2/logs/stakrr-grind-out.log",
       error_file: "/home/stakrr/.pm2/logs/stakrr-grind-err.log",
+      time: true,
+      autorestart: true,
+      restart_delay: 5000,
+    },
+    {
+      // Per-token market-maker daemon. Reads worker/data/mm.json on every
+      // tick and executes one strategy step per enabled token whose
+      // nextActionAt has elapsed. Bot is admin-configured per token via
+      // /api/admin/mm/configure and is structurally net-negative on the
+      // Pump bonding curve — bankroll + drawdown caps in mm.json bound loss.
+      name: "stakrr-mm",
+      namespace: "stakrr",
+      script: "scripts/run-mm.js",
+      cwd: "/home/stakrr/stakrr/worker",
+      instances: 1,
+      exec_mode: "fork",
+      max_memory_restart: "200M",
+      env: { NODE_ENV: "production" },
+      out_file: "/home/stakrr/.pm2/logs/stakrr-mm-out.log",
+      error_file: "/home/stakrr/.pm2/logs/stakrr-mm-err.log",
       time: true,
       autorestart: true,
       restart_delay: 5000,

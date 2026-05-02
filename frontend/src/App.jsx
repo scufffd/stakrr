@@ -7,6 +7,7 @@ import UserDashboardView from './views/UserDashboardView.jsx';
 import DocsPage from './views/DocsPage.jsx';
 import AdminPresaleView from './views/AdminPresaleView.jsx';
 import AdminSnipeView from './views/AdminSnipeView.jsx';
+import AdminMmView from './views/AdminMmView.jsx';
 import HomePage from './components/designBoost/HomePage.jsx';
 import BluebirdMark from './components/designBoost/BluebirdMark.jsx';
 import Cloud, { CloudStrip } from './components/designBoost/Cloud.jsx';
@@ -106,6 +107,7 @@ function innerHeroTitle(tab) {
   if (tab === 'profile') return 'me.';
   if (tab === 'admin-presale') return 'admin.';
   if (tab === 'admin-snipe') return 'admin.';
+  if (tab === 'admin-mm') return 'admin.';
   return 'token.';
 }
 
@@ -214,6 +216,9 @@ export default function App() {
             )}
             {tab === 'admin-snipe' && (
               <AdminSnipeView adminWallets={adminWallets} />
+            )}
+            {tab === 'admin-mm' && (
+              <AdminMmView adminWallets={adminWallets} />
             )}
           </div>
 
