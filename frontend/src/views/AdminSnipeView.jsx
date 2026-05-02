@@ -422,6 +422,20 @@ function LaunchTab({ adminPk, onLaunched }) {
   const [slippageBps, setSlippageBps] = useState('5000');
   const [rewardMode, setRewardMode] = useState('sol');
 
+  // Inline "import another wallet to use as dev" UX — paste a secret key,
+  // it's stored encrypted in the vault (so it can be reused/swept later)
+  // and auto-selected as the deployer for this launch.
+  const [showDevImport, setShowDevImport] = useState(false);
+  const [devImportSecret, setDevImportSecret] = useState('');
+  const [devImportLabel, setDevImportLabel] = useState('');
+  const [devImportSource, setDevImportSource] = useState('ephemeral');
+  const [devImporting, setDevImporting] = useState(false);
+  const [devImportErr, setDevImportErr] = useState(null);
+
+  // Show wallets with 0 SOL too — useful right after importing a new dev
+  // wallet that you're about to fund externally.
+  const [showUnfunded, setShowUnfunded] = useState(false);
+
   const [quote, setQuote] = useState(null);
   const [quoteErr, setQuoteErr] = useState(null);
   const [submitting, setSubmitting] = useState(false);
@@ -447,14 +461,51 @@ function LaunchTab({ adminPk, onLaunched }) {
     () => wallets.filter((w) => (w.sol || 0) > 0).sort((a, b) => (b.sol || 0) - (a.sol || 0)),
     [wallets],
   );
+  // Dev picker: include unfunded wallets if the toggle is on (so a freshly
+  // imported wallet shows up before you've topped it up). Sniper picker stays
+  // funded-only — pre-flight will reject the launch otherwise.
+  const devCandidates = useMemo(() => {
+    const sorted = wallets.slice().sort((a, b) => (b.sol || 0) - (a.sol || 0));
+    return showUnfunded ? sorted : sorted.filter((w) => (w.sol || 0) > 0);
+  }, [wallets, showUnfunded]);
   const devCandidate = useMemo(
-    () => fundedWallets.find((w) => w.id === devWalletId) || null,
-    [fundedWallets, devWalletId],
+    () => devCandidates.find((w) => w.id === devWalletId) || wallets.find((w) => w.id === devWalletId) || null,
+    [devCandidates, wallets, devWalletId],
   );
 
   const toggleSniper = useCallback((id) => {
     setSniperIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
   }, []);
+
+  const handleDevImport = useCallback(async () => {
+    setDevImportErr(null);
+    if (!devImportSecret.trim()) { setDevImportErr('paste a secret key first'); return; }
+    setDevImporting(true);
+    try {
+      const out = await adminFetch('/api/admin/snipe/wallets/import', {
+        method: 'POST',
+        adminPk,
+        body: {
+          secretKey: devImportSecret.trim(),
+          label: devImportLabel.trim() || `dev-${new Date().toISOString().slice(11, 19)}`,
+          source: devImportSource,
+        },
+      });
+      // Refresh wallet list, then auto-select the import as dev.
+      await reload();
+      if (out.wallet?.id) setDevWalletId(out.wallet.id);
+      // Surface unfunded wallets in case the import is empty (typical for
+      // fresh keypairs the user is about to fund externally).
+      setShowUnfunded(true);
+      setDevImportSecret('');
+      setDevImportLabel('');
+      setShowDevImport(false);
+    } catch (e) {
+      setDevImportErr(e.message);
+    } finally {
+      setDevImporting(false);
+    }
+  }, [adminPk, devImportSecret, devImportLabel, devImportSource, reload]);
 
   const refreshQuote = useCallback(async () => {
     setQuoteErr(null);
@@ -558,31 +609,127 @@ function LaunchTab({ adminPk, onLaunched }) {
       </Card>
 
       <Card title="2. Deployer wallet" style={{ marginTop: 16 }}>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
-          <span style={{ fontSize: 12, color: MUTED }}>{loading ? 'loading wallets…' : `${fundedWallets.length} funded`}</span>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+          <span style={{ fontSize: 12, color: MUTED }}>
+            {loading
+              ? 'loading wallets…'
+              : `${devCandidates.length} ${showUnfunded ? 'wallet' : 'funded'}${devCandidates.length === 1 ? '' : 's'} shown`}
+          </span>
           <button type="button" onClick={reload} style={smallBtn}>refresh</button>
+          <label style={{ fontSize: 12, color: SUB, display: 'inline-flex', alignItems: 'center', gap: 4, marginLeft: 'auto' }}>
+            <input
+              type="checkbox"
+              checked={showUnfunded}
+              onChange={(e) => setShowUnfunded(e.target.checked)}
+              style={{ marginRight: 4 }}
+            />
+            show unfunded
+          </label>
+          <button
+            type="button"
+            onClick={() => setShowDevImport((v) => !v)}
+            style={{ ...smallBtn, color: SKY, borderColor: SKY }}
+          >
+            {showDevImport ? '× cancel' : '+ import wallet to use as dev'}
+          </button>
         </div>
+
+        {showDevImport && (
+          <div style={{
+            border: `1px dashed ${SKY}`, borderRadius: 8, padding: 12, marginBottom: 12, background: '#f0fbfd',
+          }}>
+            <div style={{ fontSize: 12, color: SUB, marginBottom: 8 }}>
+              Paste a base58 secret key (Phantom export) or a JSON byte array. Stored encrypted in the vault, auto-selected as dev.
+              Use <strong>ephemeral</strong> for one-launch wallets you'll sweep + delete after; <strong>pool</strong> if you want to reuse it across launches.
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr auto', gap: 8, alignItems: 'flex-end' }}>
+              <Field label="Secret key">
+                <input
+                  type="password"
+                  placeholder="2vXkLp… or [123, 45, …]"
+                  value={devImportSecret}
+                  onChange={(e) => setDevImportSecret(e.target.value)}
+                  style={inputStyle}
+                />
+              </Field>
+              <Field label="Label (optional)">
+                <input
+                  value={devImportLabel}
+                  onChange={(e) => setDevImportLabel(e.target.value)}
+                  placeholder="e.g. dev-launch-7"
+                  style={inputStyle}
+                />
+              </Field>
+              <Field label="Source">
+                <select value={devImportSource} onChange={(e) => setDevImportSource(e.target.value)} style={inputStyle}>
+                  <option value="ephemeral">ephemeral (one-shot)</option>
+                  <option value="pool">pool (reusable)</option>
+                </select>
+              </Field>
+              <button
+                type="button"
+                onClick={handleDevImport}
+                disabled={devImporting}
+                style={btn(SKY)}
+              >
+                {devImporting ? 'importing…' : 'import & select'}
+              </button>
+            </div>
+            {devImportErr && (
+              <div style={{ color: ERR, fontSize: 12, marginTop: 8 }}>{devImportErr}</div>
+            )}
+          </div>
+        )}
+
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 8 }}>
-          {fundedWallets.map((w) => (
-            <button
-              type="button"
-              key={w.id}
-              onClick={() => setDevWalletId(w.id)}
-              style={{
-                ...selectableCard,
-                borderColor: devWalletId === w.id ? SKY : BORDER,
-                background: devWalletId === w.id ? '#ecfeff' : '#fff',
-              }}
-            >
-              <div style={{ fontWeight: 600 }}>{w.label}</div>
-              <div style={{ fontFamily: 'monospace', fontSize: 11, color: MUTED }}>{shortPk(w.publicKey, 5)}</div>
-              <div style={{ marginTop: 4, fontSize: 13 }}>{fmtSol(w.sol)} SOL</div>
-            </button>
-          ))}
-          {fundedWallets.length === 0 && (
-            <div style={{ color: MUTED, gridColumn: '1 / -1' }}>No funded wallets — generate or import + fund some first.</div>
+          {devCandidates.map((w) => {
+            const isSelected = devWalletId === w.id;
+            const unfunded = !(w.sol > 0);
+            return (
+              <button
+                type="button"
+                key={w.id}
+                onClick={() => setDevWalletId(w.id)}
+                style={{
+                  ...selectableCard,
+                  borderColor: isSelected ? SKY : BORDER,
+                  background: isSelected ? '#ecfeff' : '#fff',
+                  opacity: unfunded && !isSelected ? 0.65 : 1,
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontWeight: 600 }}>{w.label}</span>
+                  <span style={{
+                    padding: '1px 5px', borderRadius: 3, fontSize: 10,
+                    background: w.source === 'pool' ? '#dbeafe' : '#f1f5f9',
+                    color: w.source === 'pool' ? '#1e40af' : '#475569',
+                  }}>{w.source}</span>
+                </div>
+                <div style={{ fontFamily: 'monospace', fontSize: 11, color: MUTED, marginTop: 2 }}>{shortPk(w.publicKey, 5)}</div>
+                <div style={{ marginTop: 4, fontSize: 13, color: unfunded ? WARN : INK }}>
+                  {fmtSol(w.sol)} SOL{unfunded && <span style={{ marginLeft: 4, fontSize: 10, color: WARN }}>· fund before launching</span>}
+                </div>
+              </button>
+            );
+          })}
+          {devCandidates.length === 0 && (
+            <div style={{ color: MUTED, gridColumn: '1 / -1' }}>
+              {showUnfunded
+                ? 'No wallets in the vault yet. Import one above or generate from the Wallets tab.'
+                : 'No funded wallets. Toggle "show unfunded" to pick one anyway, or fund an existing wallet.'}
+            </div>
           )}
         </div>
+
+        {devCandidate && !(devCandidate.sol > 0) && (
+          <div style={{
+            marginTop: 10, padding: 8, fontSize: 12, color: WARN,
+            background: '#fffbeb', border: `1px solid ${WARN}`, borderRadius: 6,
+          }}>
+            Selected dev wallet has 0 SOL. Send funds to <span style={{ fontFamily: 'monospace' }}>{devCandidate.publicKey}</span> before submitting — the pre-flight check will reject the launch otherwise.
+            Hit refresh once the transfer lands.
+          </div>
+        )}
       </Card>
 
       <Card title="3. Sniper wallets" style={{ marginTop: 16 }}>
