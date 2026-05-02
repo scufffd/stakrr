@@ -29,6 +29,7 @@ import { buildBuyTokenTx } from '../pumpdev.js';
 import { launchBundle, MAX_BUNDLE_TXS } from './jito-bundle.js';
 import { getKeypairById, listWallets, generateWallet, updateWallet } from './wallet-vault.js';
 import { createSnipe, updateSnipe, getSnipe } from './snipe-store.js';
+import { runKolAirdrop } from './kol-airdrop.js';
 
 // Buffer: lock-fees + pool init + reward registration + 1 ATA rent + a small
 // safety margin. Empirically ~0.045 SOL covers it; use 0.06 to be safe.
@@ -454,6 +455,45 @@ export async function stealthLaunch(params) {
     });
   }
 
+  // Optional KOL airdrop — auto-stake a slice of the dev-buy bag across a
+  // curated KOL wallet list. Runs AFTER pool init confirms so the on-chain
+  // pool exists. Failure here is logged but doesn't roll back the launch
+  // (admin can retry the airdrop separately).
+  let kolResult = null;
+  if (params.kolAirdrop && Array.isArray(params.kolAirdrop.wallets) && params.kolAirdrop.wallets.length > 0) {
+    try {
+      log('kol airdrop starting', {
+        snipeId: snipeRow.id,
+        mint: bundle.mint,
+        walletCount: params.kolAirdrop.wallets.length,
+        lockDays: params.kolAirdrop.lockDays,
+        allocationPct: params.kolAirdrop.tokenAllocationPct,
+      });
+      kolResult = await runKolAirdrop({
+        mint: bundle.mint,
+        devWalletId,
+        wallets: params.kolAirdrop.wallets,
+        lockDays: params.kolAirdrop.lockDays || 7,
+        tokenAllocationPct: params.kolAirdrop.tokenAllocationPct,
+        tokenAllocationRaw: params.kolAirdrop.tokenAllocationRaw,
+        log: (msg, extra) => log(`kol-airdrop: ${msg}`, { snipeId: snipeRow.id, ...extra }),
+      });
+      updateSnipe(snipeRow.id, { kolAirdrop: kolResult });
+      log('kol airdrop complete', {
+        snipeId: snipeRow.id,
+        mint: bundle.mint,
+        ok: kolResult.ok,
+        batches: kolResult.totals.batchCount,
+        wallets: kolResult.totals.walletCount,
+      });
+    } catch (e) {
+      // Non-fatal — the launch is already complete; admin can retry KOL
+      // airdrop standalone via /api/admin/snipe/kol/run.
+      log('kol airdrop failed (non-fatal)', { snipeId: snipeRow.id, error: e.message });
+      updateSnipe(snipeRow.id, { kolAirdrop: { ok: false, error: e.message } });
+    }
+  }
+
   // Add to public registry via the existing finalize path so the new mint
   // shows up on /token/<mint>, in /api/tokens, etc.
   let finalizeOut = null;
@@ -510,6 +550,7 @@ export async function stealthLaunch(params) {
     metadataSource,
     metadataImageUrl: resolvedImageUrl,
     finalize: finalizeOut,
+    kolAirdrop: kolResult,
   };
 }
 

@@ -442,6 +442,19 @@ function LaunchTab({ adminPk, onLaunched }) {
   const [result, setResult] = useState(null);
   const [err, setErr] = useState(null);
 
+  // KOL airdrop (optional inline auto-stake to a curated wallet list, runs
+  // after pool init confirms, signed locally with the dev's vault keypair)
+  const [kolEnabled, setKolEnabled] = useState(false);
+  const [kolText, setKolText] = useState('');
+  const [kolWallets, setKolWallets] = useState([]);
+  const [kolParseErr, setKolParseErr] = useState(null);
+  const [kolLockDays, setKolLockDays] = useState(30);
+  const [kolAllocPct, setKolAllocPct] = useState(25);
+  const [kolScanCategory, setKolScanCategory] = useState('pnl-7d');
+  const [kolScanLimit, setKolScanLimit] = useState(20);
+  const [kolScanLoading, setKolScanLoading] = useState(false);
+  const [kolScanErr, setKolScanErr] = useState(null);
+
   const reload = useCallback(async () => {
     if (!adminPk) return;
     setLoading(true);
@@ -507,6 +520,49 @@ function LaunchTab({ adminPk, onLaunched }) {
     }
   }, [adminPk, devImportSecret, devImportLabel, devImportSource, reload]);
 
+  const parseKolList = useCallback(async () => {
+    setKolParseErr(null);
+    if (!kolText.trim()) { setKolWallets([]); return; }
+    try {
+      const out = await adminFetch('/api/admin/snipe/kol/parse', {
+        method: 'POST',
+        adminPk,
+        body: { text: kolText },
+      });
+      setKolWallets(out.wallets || []);
+    } catch (e) {
+      setKolParseErr(e.message);
+      setKolWallets([]);
+    }
+  }, [adminPk, kolText]);
+
+  // Re-parse on text changes (debounced) so the count updates live.
+  useEffect(() => {
+    if (!kolEnabled) return;
+    const t = setTimeout(parseKolList, 350);
+    return () => clearTimeout(t);
+  }, [kolEnabled, parseKolList]);
+
+  const fetchKolScan = useCallback(async () => {
+    setKolScanErr(null);
+    setKolScanLoading(true);
+    try {
+      const out = await adminFetch(`/api/admin/snipe/kol/scan?category=${encodeURIComponent(kolScanCategory)}&limit=${Number(kolScanLimit) || 20}`, {
+        adminPk,
+      });
+      // Append to text area (one wallet per line) — the user can edit/curate.
+      const lines = (out.wallets || []).map((w) => (w.label ? `${w.wallet}, 1, ${w.label}` : w.wallet));
+      setKolText((prev) => {
+        const sep = prev.trim() ? '\n' : '';
+        return prev + sep + `# kolscan ${kolScanCategory} (${lines.length})\n` + lines.join('\n');
+      });
+    } catch (e) {
+      setKolScanErr(e.message);
+    } finally {
+      setKolScanLoading(false);
+    }
+  }, [adminPk, kolScanCategory, kolScanLimit]);
+
   const refreshQuote = useCallback(async () => {
     setQuoteErr(null);
     setQuote(null);
@@ -565,6 +621,14 @@ function LaunchTab({ adminPk, onLaunched }) {
       fd.append('slippageBps', String(Number(slippageBps) || 5000));
       fd.append('rewardMode', rewardMode);
 
+      if (kolEnabled && kolWallets.length > 0) {
+        fd.append('kolAirdrop', JSON.stringify({
+          wallets: kolWallets,
+          lockDays: Number(kolLockDays) || 7,
+          tokenAllocationPct: Number(kolAllocPct) || 25,
+        }));
+      }
+
       const out = await adminFetch('/api/admin/snipe/launch', {
         method: 'POST',
         adminPk,
@@ -578,7 +642,7 @@ function LaunchTab({ adminPk, onLaunched }) {
     } finally {
       setSubmitting(false);
     }
-  }, [adminPk, name, symbol, description, twitter, telegram, website, imageFile, imageUrl, metadataUri, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol, slippageBps, rewardMode, onLaunched]);
+  }, [adminPk, name, symbol, description, twitter, telegram, website, imageFile, imageUrl, metadataUri, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol, slippageBps, rewardMode, kolEnabled, kolWallets, kolLockDays, kolAllocPct, onLaunched]);
 
   return (
     <form onSubmit={handleSubmit}>
@@ -785,7 +849,123 @@ function LaunchTab({ adminPk, onLaunched }) {
         </Field>
       </Card>
 
-      <Card title="5. Pre-flight quote" style={{ marginTop: 16 }}>
+      <Card title="5. KOL airdrop (optional)" style={{ marginTop: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+          <input
+            id="kol-enabled"
+            type="checkbox"
+            checked={kolEnabled}
+            onChange={(e) => setKolEnabled(e.target.checked)}
+          />
+          <label htmlFor="kol-enabled" style={{ fontSize: 13, color: SUB, cursor: 'pointer' }}>
+            Auto-stake a slice of the dev-buy bag to KOL wallets after pool init
+          </label>
+        </div>
+        <div style={{ fontSize: 11, color: MUTED, marginBottom: kolEnabled ? 12 : 0 }}>
+          Wallets will receive <em>staked positions</em> (not raw tokens) — they unstake on the public site to claim. Same flow as the presale auto-stake.
+        </div>
+
+        {kolEnabled && (
+          <>
+            <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
+              <Field label="Lock duration">
+                <select value={kolLockDays} onChange={(e) => setKolLockDays(Number(e.target.value))} style={inputStyle}>
+                  <option value={1}>1 day</option>
+                  <option value={3}>3 days</option>
+                  <option value={7}>7 days</option>
+                  <option value={14}>14 days</option>
+                  <option value={21}>21 days</option>
+                  <option value={30}>30 days</option>
+                </select>
+              </Field>
+              <Field label="% of dev buy bag">
+                <input
+                  type="number"
+                  min="1"
+                  max="100"
+                  value={kolAllocPct}
+                  onChange={(e) => setKolAllocPct(e.target.value)}
+                  style={inputStyle}
+                />
+              </Field>
+              <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
+                <div style={{ fontSize: 11, color: MUTED, marginBottom: 4 }}>Wallets parsed</div>
+                <div style={{
+                  border: `1px solid ${BORDER}`, borderRadius: 8, padding: '8px 10px',
+                  background: kolWallets.length ? '#f0fdf4' : '#fff', fontWeight: 600,
+                }}>
+                  {kolWallets.length} {kolWallets.length === 1 ? 'wallet' : 'wallets'}
+                  {kolWallets.length > 0 && (
+                    <span style={{ color: MUTED, fontWeight: 400, fontSize: 11, marginLeft: 6 }}>
+                      ≈ {Math.ceil(kolWallets.length / 2)} batches
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 12, marginBottom: 12 }}>
+              <Field label="KOL wallets (one address per line, optional `,weight,label` columns)">
+                <textarea
+                  rows={8}
+                  value={kolText}
+                  onChange={(e) => setKolText(e.target.value)}
+                  placeholder={'# paste pubkeys, one per line\n# or addr,weight,label\nABC123…XYZ\nDEF456…UVW, 2, alpha-kol'}
+                  style={{ ...inputStyle, fontFamily: 'monospace', fontSize: 12, resize: 'vertical' }}
+                />
+              </Field>
+              <div>
+                <Field label="Or fetch from KolScan">
+                  <select value={kolScanCategory} onChange={(e) => setKolScanCategory(e.target.value)} style={inputStyle}>
+                    <option value="pnl-24h">P&L · 24h</option>
+                    <option value="pnl-7d">P&L · 7d</option>
+                    <option value="pnl-30d">P&L · 30d</option>
+                    <option value="volume-24h">Volume · 24h</option>
+                    <option value="top-traders">Top traders · all-time</option>
+                  </select>
+                </Field>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 8 }}>
+                  <input
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={kolScanLimit}
+                    onChange={(e) => setKolScanLimit(e.target.value)}
+                    style={{ ...inputStyle, width: 70, padding: '6px 8px' }}
+                  />
+                  <span style={{ color: MUTED, fontSize: 12 }}>wallets</span>
+                  <button
+                    type="button"
+                    onClick={fetchKolScan}
+                    disabled={kolScanLoading}
+                    style={{ ...smallBtn, marginLeft: 'auto' }}
+                  >
+                    {kolScanLoading ? 'fetching…' : 'fetch + append'}
+                  </button>
+                </div>
+                {kolScanErr && <div style={{ fontSize: 11, color: ERR, marginTop: 6 }}>{kolScanErr}</div>}
+                <div style={{ fontSize: 10, color: MUTED, marginTop: 8, lineHeight: 1.4 }}>
+                  KolScan integration is best-effort — if their API changes the fetch errors and you fall back to manual paste/CSV. Cached 60s server-side.
+                </div>
+              </div>
+            </div>
+
+            {kolParseErr && (
+              <div style={{ color: ERR, fontSize: 12, marginBottom: 8 }}>
+                Parse error: {kolParseErr}
+              </div>
+            )}
+
+            {kolWallets.length > 0 && (
+              <div style={{ fontSize: 11, color: MUTED, padding: 8, background: '#f9fafb', borderRadius: 6 }}>
+                Will create <strong style={{ color: INK }}>{kolWallets.length} stake positions</strong> across <strong style={{ color: INK }}>{Math.ceil(kolWallets.length / 2)} txs</strong>, locked for <strong style={{ color: INK }}>{kolLockDays} days</strong>, using <strong style={{ color: INK }}>{kolAllocPct}%</strong> of the dev wallet's post-bundle bag.
+              </div>
+            )}
+          </>
+        )}
+      </Card>
+
+      <Card title="6. Pre-flight quote" style={{ marginTop: 16 }}>
         {quoteErr && <div style={{ color: ERR, marginBottom: 8 }}>{quoteErr}</div>}
         {quote ? (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
@@ -818,6 +998,19 @@ function LaunchTab({ adminPk, onLaunched }) {
             <KV k="snipers in bundle" v={String(result.inBundleSnipers?.length || 0)} />
             <KV k="overflow snipers" v={String(result.overflowSnipers?.length || 0)} />
           </div>
+          {result.kolAirdrop && (
+            <div style={{ marginTop: 12, padding: 10, background: result.kolAirdrop.ok ? '#dcfce7' : '#fee2e2', borderRadius: 6, fontSize: 12 }}>
+              <strong>KOL airdrop:</strong>{' '}
+              {result.kolAirdrop.ok ? (
+                <>
+                  staked {result.kolAirdrop.totals?.walletCount} positions in {result.kolAirdrop.totals?.batchCount} txs
+                  ({fmtTokens(result.kolAirdrop.totals?.tokensSentRaw, 6)} {symbol}) · {result.kolAirdrop.totals?.lockDays}d lock
+                </>
+              ) : (
+                <span style={{ color: ERR }}>failed: {result.kolAirdrop.error || 'see worker logs'}</span>
+              )}
+            </div>
+          )}
           <div style={{ marginTop: 12 }}>
             <a href={`/token/${result.mint}`} target="_blank" rel="noreferrer" style={{ color: SKY, fontWeight: 600 }}>
               → open public stake page

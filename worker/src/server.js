@@ -55,7 +55,14 @@ import {
   getWallet as getSnipeWallet,
 } from './snipe/wallet-vault.js';
 import { stealthLaunch, quoteStealthLaunch, ensureEphemeralWallets } from './snipe/orchestrator.js';
-import { listSnipes, getSnipe } from './snipe/snipe-store.js';
+import {
+  parseTextWalletList,
+  normalizeJsonWalletList,
+  fetchKolScanLeaderboard,
+  listKolScanCategories,
+} from './snipe/kol-list.js';
+import { runKolAirdrop, previewKolAirdrop } from './snipe/kol-airdrop.js';
+import { listSnipes, getSnipe, updateSnipe } from './snipe/snipe-store.js';
 import {
   readSniperHoldings,
   sellSniperBag,
@@ -435,6 +442,27 @@ app.post('/api/admin/snipe/launch', requireAdmin, requireVault, upload.single('i
       return res.status(400).json({ ok: false, error: 'image (file or imageUrl) or metadataUri required' });
     }
     const initiatorPk = req.get('x-admin-wallet') || null;
+
+    // Optional KOL airdrop config — wallets list comes JSON-encoded just like
+    // sniperWalletIds since this is a multipart request. Empty / missing
+    // means "no airdrop, just launch".
+    let kolAirdrop = null;
+    if (body.kolAirdrop) {
+      let parsed = body.kolAirdrop;
+      if (typeof parsed === 'string') {
+        try { parsed = JSON.parse(parsed); }
+        catch { return res.status(400).json({ ok: false, error: 'kolAirdrop must be valid JSON' }); }
+      }
+      if (parsed && Array.isArray(parsed.wallets) && parsed.wallets.length > 0) {
+        kolAirdrop = {
+          wallets: parsed.wallets,
+          lockDays: Number(parsed.lockDays) || 7,
+          tokenAllocationPct: parsed.tokenAllocationPct != null ? Number(parsed.tokenAllocationPct) : undefined,
+          tokenAllocationRaw: parsed.tokenAllocationRaw || undefined,
+        };
+      }
+    }
+
     const result = await stealthLaunch({
       devWalletId: body.devWalletId,
       sniperWalletIds,
@@ -450,6 +478,7 @@ app.post('/api/admin/snipe/launch', requireAdmin, requireVault, upload.single('i
       metadataUri: metadataUri || null,
       metadataImageUrl: body.metadataImageUrl || null,
       initiatedBy: initiatorPk,
+      kolAirdrop,
     });
     res.json(result);
   } catch (e) {
@@ -568,6 +597,111 @@ app.post('/api/admin/snipe/sweep', requireAdmin, requireVault, async (req, res) 
     res.json(out);
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// ── KOL airdrop list management ──────────────────────────────────────────────
+
+/**
+ * Parse a free-form text/CSV blob into a validated wallet list. Used by the
+ * launch UI as the user pastes/uploads — gives them immediate feedback on
+ * bad pubkeys before they hit launch.
+ */
+app.post('/api/admin/snipe/kol/parse', requireAdmin, (req, res) => {
+  try {
+    const { text, json } = req.body || {};
+    let wallets;
+    if (Array.isArray(json)) {
+      wallets = normalizeJsonWalletList(json);
+    } else if (typeof text === 'string') {
+      wallets = parseTextWalletList(text);
+    } else {
+      return res.status(400).json({ ok: false, error: 'pass either { text } or { json: [...] }' });
+    }
+    res.json({ ok: true, wallets, count: wallets.length });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * KolScan-style leaderboard fetch. Returns `[{ wallet, label, weight }]`.
+ * Cached server-side for 60s per category to avoid hammering kolscan when
+ * the admin clicks "fetch" repeatedly. If kolscan changes their API the
+ * helper throws with a clear message and the UI falls back to CSV/paste.
+ */
+app.get('/api/admin/snipe/kol/scan', requireAdmin, async (req, res) => {
+  try {
+    const category = String(req.query.category || 'pnl-7d');
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 25));
+    const force = req.query.force === '1' || req.query.force === 'true';
+    const wallets = await fetchKolScanLeaderboard(category, { limit, force });
+    res.json({ ok: true, category, wallets, count: wallets.length });
+  } catch (e) {
+    res.status(502).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/admin/snipe/kol/scan/categories', requireAdmin, (req, res) => {
+  res.json({ ok: true, categories: listKolScanCategories() });
+});
+
+/**
+ * Pre-flight preview for an airdrop config — shows allocation per wallet,
+ * batch count, total tokens consumed. Cheap, no chain calls. Powers the
+ * launch UI's "preview KOL airdrop" pane.
+ */
+app.post('/api/admin/snipe/kol/preview', requireAdmin, (req, res) => {
+  try {
+    const { wallets, tokenAllocationRaw, devBagRaw } = req.body || {};
+    const out = previewKolAirdrop({
+      wallets,
+      tokenAllocationRaw,
+      devBagRaw,
+    });
+    res.json({ ok: true, preview: out });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * Standalone retroactive airdrop on an already-launched token. Required for
+ * the case where the dev did a normal launch and only later wants to
+ * airdrop to KOLs from the same dev wallet's bag. Uses the vault keypair to
+ * sign — same as the in-launch flow.
+ */
+app.post('/api/admin/snipe/kol/run', requireAdmin, requireVault, async (req, res) => {
+  try {
+    const { mint, devWalletId, wallets, lockDays, tokenAllocationPct, tokenAllocationRaw, snipeId } = req.body || {};
+    if (!mint || !devWalletId || !Array.isArray(wallets) || wallets.length === 0) {
+      return res.status(400).json({ ok: false, error: 'mint, devWalletId, wallets[] required' });
+    }
+    const out = await runKolAirdrop({
+      mint,
+      devWalletId,
+      wallets,
+      lockDays: Number(lockDays) || 7,
+      tokenAllocationPct: tokenAllocationPct != null ? Number(tokenAllocationPct) : undefined,
+      tokenAllocationRaw,
+      log: (msg, extra) => console.log(JSON.stringify({
+        ts: new Date().toISOString(), tag: 'kol-airdrop', message: msg, snipeId: snipeId || null, ...extra,
+      })),
+    });
+    if (snipeId) {
+      try {
+        const snipe = getSnipe(snipeId);
+        if (snipe) {
+          updateSnipe(snipeId, {
+            kolAirdrop: out,
+            kolAirdropRetroactiveAt: new Date().toISOString(),
+          });
+        }
+      } catch { /* non-fatal */ }
+    }
+    res.json({ ok: true, result: out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
