@@ -18,6 +18,13 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { apiUrl } from '../apiBase.js';
+import {
+  lamportsFromSolStr,
+  simulateBundle,
+  pctOfSupply,
+  formatPct,
+  formatTokensCompact,
+} from '../lib/pump-curve.js';
 
 const SKY = '#35C5E0';
 const INK = '#0C0C0C';
@@ -591,6 +598,43 @@ function LaunchTab({ adminPk, onLaunched }) {
     const avg = (Number(choreoAbsorberBuyMinSol) + Number(choreoAbsorberBuyMaxSol)) / 2;
     return choreoAbsorberIds.length * avg;
   }, [choreoAbsorberIds, choreoAbsorberBuyMinSol, choreoAbsorberBuyMaxSol]);
+
+  // Live "% of supply" estimate for the launch bundle. Order matters on a
+  // Pump bonding curve: dev fires first (cheapest fill), then snipers in
+  // bundle order (each ~3-5% smaller than the previous because the curve
+  // moves with each fill). Result is conservative — within ≤1 raw token
+  // of the on-chain outcome. Hidden when both buys are zero so the panel
+  // doesn't add noise to the empty state.
+  const bundleEstimate = useMemo(() => {
+    const devLam = lamportsFromSolStr(devBuySol);
+    const perSnipeLam = lamportsFromSolStr(sniperSolPerWallet);
+    // Bundle ordering matches what jito-bundle.js actually constructs:
+    // create + dev buy first, then up to N sniper buys in the same bundle
+    // (anything past the bundle size limit gets staggered post-launch and
+    // hits the curve later, so we count them too — the dev's % stays the
+    // same regardless of how many snipers we have, but the cumulative
+    // bundle % only matches reality if every sniper actually fires).
+    const buys = [];
+    if (devLam > 0n) buys.push(devLam);
+    for (let i = 0; i < sniperIds.length; i++) {
+      if (perSnipeLam > 0n) buys.push(perSnipeLam);
+    }
+    if (buys.length === 0) return null;
+    const sim = simulateBundle(buys);
+    const devResult = devLam > 0n ? sim.results[0] : null;
+    const snipeResults = devLam > 0n ? sim.results.slice(1) : sim.results;
+    const snipeTotal = snipeResults.reduce((acc, r) => acc + r.tokensOut, 0n);
+    const snipeAvgPct = snipeResults.length > 0
+      ? pctOfSupply(snipeTotal) / snipeResults.length
+      : 0;
+    return {
+      dev: devResult ? { tokens: devResult.tokensOut, pct: pctOfSupply(devResult.tokensOut) } : null,
+      sniperCount: snipeResults.length,
+      sniperTotal: { tokens: snipeTotal, pct: pctOfSupply(snipeTotal) },
+      sniperAvgPct,
+      total: { tokens: sim.totalTokensOut, pct: pctOfSupply(sim.totalTokensOut) },
+    };
+  }, [devBuySol, sniperSolPerWallet, sniperIds.length]);
   // Dev picker: include unfunded wallets if the toggle is on (so a freshly
   // imported wallet shows up before you've topped it up). Sniper picker stays
   // funded-only — pre-flight will reject the launch otherwise.
@@ -1011,6 +1055,60 @@ function LaunchTab({ adminPk, onLaunched }) {
             <input type="number" step="100" min="100" max="9000" value={slippageBps} onChange={(e) => setSlippageBps(e.target.value)} style={inputStyle} />
           </Field>
         </div>
+
+        {bundleEstimate && (
+          <div
+            style={{
+              marginTop: 12,
+              padding: '10px 12px',
+              border: '1px solid #E5E7EB',
+              borderRadius: 8,
+              background: '#FAFAFA',
+              fontSize: 12,
+              color: SUB,
+              lineHeight: 1.55,
+            }}
+          >
+            <div style={{ fontWeight: 700, color: INK, marginBottom: 6 }}>
+              Expected bundle fill <span style={{ fontWeight: 400, color: MUTED }}>(fresh-curve estimate · 1% pump fee applied · ±1 raw token)</span>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+              <div>
+                <div style={{ color: MUTED, fontSize: 11 }}>Dev buy</div>
+                <div style={{ fontFamily: 'monospace', color: INK }}>
+                  {bundleEstimate.dev
+                    ? `${formatPct(bundleEstimate.dev.pct)} · ${formatTokensCompact(bundleEstimate.dev.tokens)}`
+                    : '—'}
+                </div>
+              </div>
+              <div>
+                <div style={{ color: MUTED, fontSize: 11 }}>
+                  {bundleEstimate.sniperCount} sniper{bundleEstimate.sniperCount === 1 ? '' : 's'} (cumulative)
+                </div>
+                <div style={{ fontFamily: 'monospace', color: INK }}>
+                  {bundleEstimate.sniperCount > 0
+                    ? `${formatPct(bundleEstimate.sniperTotal.pct)} · ${formatTokensCompact(bundleEstimate.sniperTotal.tokens)}`
+                    : '—'}
+                  {bundleEstimate.sniperCount > 1 && (
+                    <span style={{ color: MUTED, fontSize: 11, marginLeft: 6 }}>
+                      ({formatPct(bundleEstimate.sniperAvgPct)} avg)
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div>
+                <div style={{ color: MUTED, fontSize: 11 }}>Bundle total</div>
+                <div style={{ fontFamily: 'monospace', color: INK }}>
+                  {formatPct(bundleEstimate.total.pct)} · {formatTokensCompact(bundleEstimate.total.tokens)}
+                  <span style={{ color: MUTED, fontSize: 11, marginLeft: 6 }}>
+                    leaves {formatPct(79.31 - bundleEstimate.total.pct)} on curve
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         <Field label="Reward mode" style={{ marginTop: 12 }}>
           <select value={rewardMode} onChange={(e) => setRewardMode(e.target.value)} style={inputStyle}>
             <option value="sol">SOL (wsol-rewards) — most launches</option>

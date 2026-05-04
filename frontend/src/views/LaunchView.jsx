@@ -1,9 +1,10 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useMemo } from 'react';
 import { Buffer } from 'buffer';
 import { Transaction, VersionedTransaction } from '@solana/web3.js';
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { apiUrl } from '../apiBase.js';
 import { confirmWithFallback } from '../lib/confirm.js';
+import { estimateBuyImpact } from '../lib/pump-curve.js';
 
 const LOCK_TIERS = [
   { days: 1, mult: '1.00×', color: '#94A3B8' },
@@ -177,6 +178,10 @@ export default function LaunchView({
   const [imageFile, setImageFile] = useState(null);
   const [imagePreview, setImagePreview] = useState('');
   const [initialBuy, setInitialBuy] = useState('0');
+  // Live "% of supply" estimate for the dev's first buy. Pump's bonding
+  // curve is fixed at launch, so this is a closed-form calc — purely
+  // informational, not validated server-side.
+  const initialBuyImpact = useMemo(() => estimateBuyImpact(initialBuy), [initialBuy]);
   const [autoStake, setAutoStake] = useState(false);
   const [lockDays, setLockDays] = useState(7);
   const [rewardMode, setRewardMode] = useState('sol');
@@ -729,6 +734,11 @@ export default function LaunchView({
             step={0.01}
             placeholder="0"
           />
+          {initialBuyImpact.tokensOut > 0n && (
+            <div style={{ marginTop: 6, fontSize: 12, color: '#666', fontFamily: "'DM Mono', monospace" }}>
+              {initialBuyImpact.label} <span style={{ color: '#999' }}>· fresh-curve estimate, after Pump's 1% fee</span>
+            </div>
+          )}
         </div>
 
         {!forceAutoStakeOff && (
