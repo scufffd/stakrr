@@ -63,6 +63,15 @@ export default function UserDashboardView({ wallet, onSelectToken }) {
   const [prefsBusy, setPrefsBusy] = useState(false);
   const [prefsMsg, setPrefsMsg] = useState(null);
 
+  // Pending KOL airdrop claims for this wallet — drives the "KOL Claims"
+  // tab. Each entry represents an earmarked dev-wallet bag the user can
+  // accept via signed message; the worker then materialises the staked
+  // position from the dev's vault keypair (user pays no SOL).
+  const [kolClaims, setKolClaims] = useState([]);
+  const [kolClaimsLoading, setKolClaimsLoading] = useState(false);
+  const [kolAcceptBusy, setKolAcceptBusy] = useState(null);
+  const [kolMsg, setKolMsg] = useState(null);
+
   const pk = wallet?.publicKey?.toBase58?.() || null;
 
   const rewardRows = useMemo(() => {
@@ -203,6 +212,75 @@ export default function UserDashboardView({ wallet, onSelectToken }) {
     [pk, fullWallet],
   );
 
+  // Load pending KOL claims for this wallet. Returns only entries with
+  // status='pending' AND not-yet-expired (server already filters); the
+  // dashboard never surfaces claimed/expired rows since they're not
+  // actionable.
+  const loadKolClaims = useCallback(async () => {
+    if (!pk) {
+      setKolClaims([]);
+      return;
+    }
+    setKolClaimsLoading(true);
+    try {
+      const r = await fetch(apiUrl(`/api/kol-claims/${pk}`));
+      const d = await r.json();
+      if (!r.ok || !d.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setKolClaims(Array.isArray(d.claims) ? d.claims : []);
+    } catch (e) {
+      console.warn('kol-claims load failed', e);
+      setKolClaims([]);
+    } finally {
+      setKolClaimsLoading(false);
+    }
+  }, [pk]);
+
+  useEffect(() => {
+    loadKolClaims();
+  }, [loadKolClaims]);
+
+  // Accept a pending KOL claim. Wallet signs a canonical message; the
+  // worker then signs + sends `stake_for(beneficiary=this wallet)` from
+  // the dev's vault keypair, so the user pays no SOL and never sees a
+  // wallet-adapter tx prompt — just a single message-sign prompt.
+  const onAcceptKolClaim = useCallback(
+    async (claim) => {
+      setKolMsg(null);
+      if (!pk) return;
+      if (claim.wallet !== pk) {
+        setKolMsg({ ok: false, text: 'Connected wallet does not match the claim' });
+        return;
+      }
+      if (!fullWallet?.signMessage) {
+        setKolMsg({ ok: false, text: 'This wallet does not support message signing — try Phantom, Backpack, or Solflare.' });
+        return;
+      }
+      setKolAcceptBusy(claim.id);
+      try {
+        const signedAt = new Date().toISOString();
+        const message = `stakrr-kol-accept:${claim.id}:${signedAt}`;
+        const sig = await fullWallet.signMessage(new TextEncoder().encode(message));
+        const r = await fetch(apiUrl(`/api/kol-claims/${claim.id}/accept`), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ signedAt, signature: bs58.encode(sig) }),
+        });
+        const d = await r.json();
+        if (!r.ok || !d.ok) throw new Error(d.error || `HTTP ${r.status}`);
+        setKolMsg({
+          ok: true,
+          text: `Accepted — staked position created (${d.txSig?.slice(0, 8) || '?'}…). Locked ${claim.stakeLockDays}d.`,
+        });
+        await Promise.all([loadKolClaims(), load()]);
+      } catch (e) {
+        setKolMsg({ ok: false, text: e.message || String(e) });
+      } finally {
+        setKolAcceptBusy(null);
+      }
+    },
+    [pk, fullWallet, loadKolClaims, load],
+  );
+
   if (!pk) {
     return (
       <div style={{ maxWidth: 520, margin: '0 auto', textAlign: 'center', padding: '48px 16px' }}>
@@ -290,6 +368,7 @@ export default function UserDashboardView({ wallet, onSelectToken }) {
         {tabBtn('launched', 'Launched tokens')}
         {tabBtn('rewards', 'Rewards')}
         {tabBtn('activity', 'Activity')}
+        {tabBtn('kolClaims', kolClaims.length > 0 ? `KOL Claims (${kolClaims.length})` : 'KOL Claims')}
         {tabBtn('settings', 'Settings')}
       </div>
 
@@ -529,6 +608,95 @@ export default function UserDashboardView({ wallet, onSelectToken }) {
               </div>
             ))
           )}
+        </div>
+      )}
+
+      {!loading && data && tab === 'kolClaims' && (
+        <div style={{ display: 'grid', gap: 12, maxWidth: 860 }}>
+          <div style={{ background: '#fff', border: '1px solid #E8E8E8', borderRadius: 12, padding: 16 }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 8 }}>
+              <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700 }}>Pending KOL Allocations</h3>
+              <button
+                onClick={loadKolClaims}
+                disabled={kolClaimsLoading}
+                style={{
+                  background: 'transparent', border: 'none', color: '#666',
+                  fontSize: 12, cursor: 'pointer', textDecoration: 'underline',
+                }}
+              >
+                {kolClaimsLoading ? 'refreshing…' : 'refresh'}
+              </button>
+            </div>
+            <p style={{ fontSize: 12, color: MUTED, margin: '0 0 12px 0' }}>
+              You've been allocated a slice of one or more token launches by the team. Sign once below to materialise the staked position; you'll never be prompted to send a transaction (we sign + pay from the dev wallet). Unclaimed slots auto-expire after the listed window and revert to the dev — review terms before accepting.
+            </p>
+
+            {kolMsg && (
+              <div style={{
+                marginBottom: 12, padding: 10, borderRadius: 8, fontSize: 12,
+                background: kolMsg.ok ? '#dcfce7' : '#fee2e2',
+                color: kolMsg.ok ? '#166534' : '#991b1b',
+              }}>
+                {kolMsg.text}
+              </div>
+            )}
+
+            {kolClaims.length === 0 ? (
+              <div style={{ fontSize: 13, color: MUTED, padding: 20, textAlign: 'center' }}>
+                No pending KOL allocations for this wallet.
+              </div>
+            ) : (
+              <div style={{ display: 'grid', gap: 10 }}>
+                {kolClaims.map((c) => {
+                  const expiresMs = new Date(c.expiresAt).getTime();
+                  const daysLeft = Math.max(0, Math.ceil((expiresMs - Date.now()) / 86400000));
+                  return (
+                    <div
+                      key={c.id}
+                      style={{
+                        border: '1px solid #E8E8E8',
+                        borderRadius: 10,
+                        padding: 12,
+                        display: 'grid',
+                        gridTemplateColumns: '1fr auto',
+                        gap: 12,
+                        alignItems: 'center',
+                      }}
+                    >
+                      <div>
+                        <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>
+                          {c.symbol || 'Token'} <span style={{ color: MUTED, fontSize: 12 }}>· {shorten(c.mint, 4, 4)}</span>
+                        </div>
+                        <div style={{ fontSize: 12, color: MUTED, lineHeight: 1.6 }}>
+                          {fmtRaw(c.tokensRaw, 6)} tokens · stakes for {c.stakeLockDays} days on accept
+                          <br />
+                          Window: <strong style={{ color: daysLeft <= 3 ? '#991b1b' : '#374151' }}>{daysLeft}d left</strong> (expires {new Date(c.expiresAt).toLocaleDateString()})
+                          {c.label && <> · {c.label}</>}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => onAcceptKolClaim(c)}
+                        disabled={kolAcceptBusy === c.id}
+                        style={{
+                          padding: '10px 18px',
+                          border: 'none',
+                          borderRadius: 8,
+                          background: '#000',
+                          color: '#fff',
+                          fontSize: 13,
+                          fontWeight: 600,
+                          cursor: kolAcceptBusy === c.id ? 'wait' : 'pointer',
+                          opacity: kolAcceptBusy === c.id ? 0.6 : 1,
+                        }}
+                      >
+                        {kolAcceptBusy === c.id ? 'Signing…' : 'Accept & stake'}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       )}
 

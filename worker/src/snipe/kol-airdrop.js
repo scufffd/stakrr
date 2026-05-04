@@ -31,6 +31,7 @@ import {
 import { signAndPollConfirm } from '../confirm.js';
 import { getKeypairById } from './wallet-vault.js';
 import { ensureAutoPushDefault } from '../user-prefs.js';
+import { createPendingClaims } from '../kol-claims.js';
 
 // Fits 2 (stake_for + prime_checkpoint × N rewardMints) per tx safely under
 // the 1232 byte versioned-tx ceiling, with compute-budget ix overhead.
@@ -64,6 +65,59 @@ async function listPoolRewardMints({ connection, stakeMint, pool }) {
     if (rm) out.push(mintPk);
   }
   return out;
+}
+
+/**
+ * Equal-split convenience: every KOL gets `floor(total / N)`, with the
+ * remainder (≤ N − 1 raw units) distributed deterministically to the first
+ * wallets in the input order. Use when the caller wants strict equal share
+ * rather than per-wallet weights.
+ *
+ * Returns the same shape as `allocateByWeight` so the rest of the pipeline
+ * doesn't have to branch.
+ */
+function allocateEqual(wallets, tokenTotalRaw) {
+  const total = BigInt(tokenTotalRaw);
+  if (total <= 0n || wallets.length === 0) return [];
+  const n = BigInt(wallets.length);
+  const base = total / n;
+  let remainder = total - base * n;
+  return wallets.map((w, i) => {
+    let share = base;
+    if (remainder > 0n) {
+      share += 1n;
+      remainder -= 1n;
+    }
+    return {
+      wallet: w.wallet,
+      weight: 1,
+      label: w.label || null,
+      tokensRaw: share,
+      shareBps: share > 0n ? Number((share * 10_000n) / total) : 0,
+    };
+  }).filter((r) => r.tokensRaw > 0n);
+}
+
+/**
+ * De-duplicate by wallet (case-sensitive base58). When the same wallet
+ * appears multiple times in the input list (typo / paste-twice / curated
+ * list overlap), the first occurrence wins and subsequent rows are dropped
+ * with a `_duplicateDropped` log entry. Returns `{ unique, duplicates }`.
+ */
+function dedupeWallets(wallets) {
+  const seen = new Set();
+  const unique = [];
+  const duplicates = [];
+  for (const w of wallets) {
+    if (!w || !w.wallet) continue;
+    if (seen.has(w.wallet)) {
+      duplicates.push(w);
+      continue;
+    }
+    seen.add(w.wallet);
+    unique.push(w);
+  }
+  return { unique, duplicates };
 }
 
 /**
@@ -141,26 +195,59 @@ async function readDevTokenBalance({ connection, devPubkey, mintPk }) {
  */
 export async function runKolAirdrop({
   mint,
+  symbol,                 // optional — included in pending-claim records for UI
   devWalletId,
   wallets,
   lockDays = 7,
   tokenAllocationRaw,    // optional — defaults to entire dev-buy bag
   tokenAllocationPct,    // optional — % of dev bag (1-100), used if tokenAllocationRaw omitted
+  mode = 'pending-claim', // 'push' | 'pending-claim' (default).
+  equalSplit = true,     // when true: split equally regardless of weights.
+  claimWindowDays = 30,  // pending-claim: how long the KOL has to accept.
+  excludeWallets = [],   // strip wallets that are also presale contributors
+                         // (or any other dedupe upstream wants to apply)
+  launchSnipeId = null,  // back-link for admin reporting on pending claims
   log = () => {},
 }) {
   if (!mint) throw new Error('mint required');
   if (!devWalletId) throw new Error('devWalletId required');
   if (!Array.isArray(wallets) || wallets.length === 0) throw new Error('wallets list is empty');
+  if (mode !== 'push' && mode !== 'pending-claim') {
+    throw new Error(`runKolAirdrop: invalid mode ${mode} (expected 'push' or 'pending-claim')`);
+  }
+
+  // Dedupe within the KOL list itself, then drop any wallet that's already
+  // a presale contributor (caller passes `excludeWallets`). Empty result
+  // is a no-op rather than an error so the unified launch flow can route
+  // 100% to contributors when every KOL was a contributor too.
+  const excludeSet = new Set(excludeWallets);
+  const { unique, duplicates } = dedupeWallets(wallets);
+  const filtered = unique.filter((w) => !excludeSet.has(w.wallet));
+  const collisions = unique.filter((w) => excludeSet.has(w.wallet));
+  if (filtered.length === 0) {
+    log('no eligible KOL wallets after dedupe', {
+      inputCount: wallets.length,
+      duplicates: duplicates.length,
+      collisionsWithExclude: collisions.length,
+    });
+    return {
+      ok: true,
+      mode,
+      skipped: 'no_eligible_wallets',
+      duplicates: duplicates.map((w) => w.wallet),
+      collisionsWithExclude: collisions.map((w) => w.wallet),
+      allocations: [],
+      batches: [],
+      pendingClaims: [],
+      totals: { walletCount: 0, batchCount: 0, tokensAllocatedRaw: '0', tokensSentRaw: '0', lockDays: Number(lockDays), rewardMints: [] },
+    };
+  }
 
   const connection = getConnection();
   const stakeMint = new PublicKey(mint);
   const devKp = getKeypairById(devWalletId);
   const devPk = devKp.publicKey;
 
-  // Resolve the pool — if it doesn't exist yet we can't airdrop. Caller
-  // should ensure pool init has confirmed before invoking us.
-  const pool = await fetchPool({ connection, stakeMint });
-  if (!pool) throw new Error(`stake pool not yet initialized for ${mint}`);
   await detectTokenProgram(connection, stakeMint);
 
   const devBag = await readDevTokenBalance({ connection, devPubkey: devPk, mintPk: stakeMint });
@@ -182,10 +269,77 @@ export async function runKolAirdrop({
     allocRaw = (devBagRaw * BigInt(pct)) / 100n;
   }
 
-  const allocations = allocateByWeight(wallets, allocRaw);
+  const allocations = equalSplit
+    ? allocateEqual(filtered, allocRaw)
+    : allocateByWeight(filtered, allocRaw);
   if (allocations.length === 0) {
-    throw new Error('allocateByWeight produced 0 allocations (check weights)');
+    throw new Error('allocation produced 0 entries (check weights / wallet list)');
   }
+
+  // === pending-claim mode: don't touch the chain. Just earmark the bag. ===
+  //
+  // The dev wallet keeps the carved tokens until the KOL accepts. If they
+  // never do, the daily sweep cron flips the entries to `expired` and the
+  // dev keeps the tokens — no on-chain reclaim needed since they never
+  // moved. The pool DOESN'T need to exist yet for this branch (we don't
+  // call stake_for here), so this is safe to invoke immediately after the
+  // launch bundle confirms, even before pool init.
+  if (mode === 'pending-claim') {
+    const pendingRows = allocations.map((a) => ({
+      wallet: a.wallet,
+      mint,
+      symbol: symbol || null,
+      tokensRaw: a.tokensRaw.toString(),
+      devWalletId,
+      stakeLockDays: Number(lockDays),
+      claimWindowDays: Number(claimWindowDays),
+      launchSnipeId,
+      label: a.label || null,
+    }));
+    const inserted = createPendingClaims(pendingRows);
+    log('pending-claim entries created', {
+      count: inserted.length,
+      claimWindowDays,
+      stakeLockDays: Number(lockDays),
+    });
+    const tokensTotalEarmarked = allocations.reduce((acc, a) => acc + a.tokensRaw, 0n);
+    return {
+      ok: true,
+      mode,
+      duplicates: duplicates.map((w) => w.wallet),
+      collisionsWithExclude: collisions.map((w) => w.wallet),
+      allocations: allocations.map((a) => ({
+        wallet: a.wallet,
+        label: a.label,
+        weight: a.weight,
+        tokensRaw: a.tokensRaw.toString(),
+        shareBps: a.shareBps,
+      })),
+      batches: [],
+      pendingClaims: inserted.map((r) => ({
+        id: r.id,
+        wallet: r.wallet,
+        tokensRaw: r.tokensRaw,
+        expiresAt: r.expiresAt,
+        stakeLockDays: r.stakeLockDays,
+      })),
+      totals: {
+        walletCount: allocations.length,
+        batchCount: 0,
+        tokensAllocatedRaw: allocRaw.toString(),
+        tokensSentRaw: '0',
+        tokensEarmarkedRaw: tokensTotalEarmarked.toString(),
+        lockDays: Number(lockDays),
+        claimWindowDays: Number(claimWindowDays),
+        rewardMints: [],
+      },
+    };
+  }
+
+  // === push mode: original behaviour — stake_for on-chain immediately. ===
+  // Resolve the pool — required since stake_for needs it to exist.
+  const pool = await fetchPool({ connection, stakeMint });
+  if (!pool) throw new Error(`stake pool not yet initialized for ${mint}`);
 
   const rewardMints = await listPoolRewardMints({ connection, stakeMint, pool });
   if (rewardMints.length === 0) {

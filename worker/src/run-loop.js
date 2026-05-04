@@ -2,6 +2,7 @@ import { config } from './config.js';
 import { listPools, recordEvent } from './registry.js';
 import { runPoolCycle } from './claim-and-distribute.js';
 import { runOnce as runOrphanRedistribute } from './redistribute-orphans.js';
+import { sweepExpiredClaims } from './kol-claims.js';
 
 function log(message, extra = {}) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), message, ...extra }));
@@ -53,6 +54,34 @@ async function maybeRunOrphanRedistribute() {
   }
 }
 
+// Sweep KOL pending-claims that passed their accept window. Tokens stay in
+// the dev wallet (no on-chain action) — this just flips the JSON entry to
+// `expired` so it stops appearing in the user dashboard's claim widget.
+// Runs on the same daily cadence as orphan-redistribute; no RPC pressure.
+const KOL_SWEEP_INTERVAL_MS = Number(
+  process.env.KOL_SWEEP_INTERVAL_MS || 24 * 60 * 60 * 1000,
+);
+let lastKolSweepAt = 0;
+
+async function maybeSweepExpiredKolClaims() {
+  const now = Date.now();
+  if (now - lastKolSweepAt < KOL_SWEEP_INTERVAL_MS) return;
+  try {
+    const swept = sweepExpiredClaims();
+    lastKolSweepAt = now;
+    if (swept.length > 0) {
+      log('loop: kol-claims swept (expired)', { count: swept.length, ids: swept });
+      recordEvent({
+        type: 'kol_claims_swept',
+        count: swept.length,
+        ids: swept,
+      });
+    }
+  } catch (e) {
+    log('loop: kol-claims sweep failed', { error: e.message });
+  }
+}
+
 export async function runLoop() {
   log('loop: start', {
     intervalMs: config.loopIntervalMs,
@@ -64,6 +93,7 @@ export async function runLoop() {
     try {
       await runOnce();
       await maybeRunOrphanRedistribute();
+      await maybeSweepExpiredKolClaims();
     } catch (e) {
       log('loop: top-level error', { error: e.message });
     }

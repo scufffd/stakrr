@@ -66,6 +66,20 @@ import {
   listKolScanCategories,
 } from './snipe/kol-list.js';
 import { runKolAirdrop, previewKolAirdrop } from './snipe/kol-airdrop.js';
+import {
+  getClaimById,
+  listActivePendingForWallet,
+  listClaimsForWallet,
+  listAllClaims,
+  sweepExpiredClaims,
+  summariseClaimsForMint,
+  updateClaim,
+} from './kol-claims.js';
+import { detectTokenProgram, primeCheckpointIx, stakeForIx } from './stake-program.js';
+import { signAndPollConfirm } from './confirm.js';
+import { getKeypairById } from './snipe/wallet-vault.js';
+import { ComputeBudgetProgram, Transaction } from '@solana/web3.js';
+import BN from 'bn.js';
 import { runDumpAndAbsorb, quoteChoreography, DEFAULT_CHOREOGRAPHY_CONFIG } from './snipe/choreography.js';
 import {
   listTokens as listMmTokens,
@@ -242,6 +256,206 @@ app.post('/api/user-prefs/:wallet', (req, res) => {
       autoPushSource: 'user_set',
     });
     res.json({ ok: true, wallet, prefs: updated, effectiveAutoPush: updated.autoPush !== false });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── KOL claim endpoints ────────────────────────────────────────────────────
+//
+// Pending KOL claims are earmarked allocations of the dev-buy bag created
+// during a launch. The KOL has `claimWindowDays` (default 30) to accept
+// their slice by signing a message; on accept the worker materialises an
+// on-chain stake_for position from the dev wallet's vault keypair (so the
+// KOL never has to touch Solana — they just sign one offline message).
+//
+// Public read endpoints:
+//   GET  /api/kol-claims/:wallet           — list active pending for wallet
+//   GET  /api/kol-claims/:wallet/all       — full history (incl claimed/expired)
+//   POST /api/kol-claims/:claimId/accept   — KOL signs to materialise position
+//
+// Public read for token disclosure:
+//   GET  /api/kol-claims/mint/:mint/summary  — counts + totals for token page
+//
+// Admin endpoints (gated below):
+//   GET  /api/admin/kol-claims             — list all (optional filters)
+//   POST /api/admin/kol-claims/sweep       — manual run of expired-sweep cron
+//   POST /api/admin/kol-claims/:id/revoke  — admin force-revoke a pending claim
+
+app.get('/api/kol-claims/:wallet', (req, res) => {
+  try {
+    const wallet = String(req.params.wallet || '').trim();
+    if (!wallet) return res.status(400).json({ ok: false, error: 'wallet required' });
+    try { new PublicKey(wallet); }
+    catch { return res.status(400).json({ ok: false, error: 'invalid wallet pubkey' }); }
+    const rows = listActivePendingForWallet(wallet);
+    res.json({ ok: true, wallet, claims: rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/kol-claims/:wallet/all', (req, res) => {
+  try {
+    const wallet = String(req.params.wallet || '').trim();
+    if (!wallet) return res.status(400).json({ ok: false, error: 'wallet required' });
+    try { new PublicKey(wallet); }
+    catch { return res.status(400).json({ ok: false, error: 'invalid wallet pubkey' }); }
+    res.json({ ok: true, wallet, claims: listClaimsForWallet(wallet) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/kol-claims/mint/:mint/summary', (req, res) => {
+  try {
+    const mint = String(req.params.mint || '').trim();
+    if (!mint) return res.status(400).json({ ok: false, error: 'mint required' });
+    try { new PublicKey(mint); }
+    catch { return res.status(400).json({ ok: false, error: 'invalid mint pubkey' }); }
+    const summary = summariseClaimsForMint(mint);
+    res.json({ ok: true, summary: summary || { mint, total: 0 } });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * POST /api/kol-claims/:claimId/accept
+ *
+ * The KOL signs a canonical message:
+ *   stakrr-kol-accept:<claimId>:<signedAt>
+ *
+ * with the WALLET that the claim is bound to. Server verifies the ed25519
+ * signature, then builds + signs + sends a stake_for(beneficiary=KOL) tx
+ * paid by the dev wallet's vault keypair stored alongside the claim. On
+ * confirmation the claim is moved to `status: 'claimed'`.
+ *
+ * Body:
+ *   { signedAt: ISO, signature: base58-64-bytes }
+ *
+ * Idempotent — calling twice on a claimed claim returns the existing
+ * txSig + position without sending a new tx.
+ */
+app.post('/api/kol-claims/:claimId/accept', async (req, res) => {
+  try {
+    const claimId = String(req.params.claimId || '').trim();
+    if (!claimId) return res.status(400).json({ ok: false, error: 'claimId required' });
+    const claim = getClaimById(claimId);
+    if (!claim) return res.status(404).json({ ok: false, error: 'no such claim' });
+    if (claim.status === 'claimed') {
+      return res.json({ ok: true, claim, alreadyClaimed: true });
+    }
+    if (claim.status !== 'pending') {
+      return res.status(409).json({ ok: false, error: `claim is ${claim.status}, not acceptable` });
+    }
+    if (new Date(claim.expiresAt).getTime() < Date.now()) {
+      return res.status(410).json({ ok: false, error: 'claim window has expired' });
+    }
+
+    const { signedAt, signature } = req.body || {};
+    if (!signedAt || !signature) {
+      return res.status(400).json({ ok: false, error: 'signedAt + signature required' });
+    }
+    const ts = Date.parse(signedAt);
+    if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > 5 * 60 * 1000) {
+      return res.status(400).json({ ok: false, error: 'signedAt outside ±5 minute window' });
+    }
+    const message = `stakrr-kol-accept:${claimId}:${signedAt}`;
+    let sigBytes;
+    try { sigBytes = bs58.decode(signature); }
+    catch { return res.status(400).json({ ok: false, error: 'signature is not base58' }); }
+    if (sigBytes.length !== 64) {
+      return res.status(400).json({ ok: false, error: 'signature must be 64 bytes' });
+    }
+    const walletPk = new PublicKey(claim.wallet);
+    const ok = nacl.sign.detached.verify(
+      Buffer.from(message, 'utf8'),
+      sigBytes,
+      walletPk.toBytes(),
+    );
+    if (!ok) return res.status(403).json({ ok: false, error: 'signature does not match claim wallet' });
+
+    // Materialise on-chain: stake_for(beneficiary=KOL, payer=dev) for the
+    // exact tokensRaw, locked for stakeLockDays. We prime_checkpoint every
+    // reward line to baseline cleanly (this is the bug that bit GE9JWdz on
+    // SQWARK — never skip it for fresh positions).
+    const connection = getConnection();
+    const stakeMint = new PublicKey(claim.mint);
+    const beneficiary = walletPk;
+    const devKp = getKeypairById(claim.devWalletId);
+    const devPk = devKp.publicKey;
+    await detectTokenProgram(connection, stakeMint);
+
+    const pool = await fetchPool({ connection, stakeMint });
+    if (!pool) return res.status(503).json({ ok: false, error: 'pool not yet initialized for this mint' });
+
+    // Resolve reward lines on-chain (wSOL is registered on every Stakrr SOL
+    // pool; token-mode pools also register the stake mint as a reward line).
+    const rewardCandidates = new Set([config.wsolMint.toBase58()]);
+    if (pool.rewardMint) rewardCandidates.add(pool.rewardMint);
+    const rewardMints = [];
+    for (const m of rewardCandidates) {
+      const mintPk = new PublicKey(m);
+      const rm = await fetchRewardMint({ connection, stakeMint, rewardMint: mintPk });
+      if (rm) rewardMints.push(mintPk);
+    }
+    if (rewardMints.length === 0) {
+      return res.status(503).json({ ok: false, error: 'no reward mint registered for pool' });
+    }
+
+    // Time-based nonce keeps (pool, beneficiary, nonce) unique even if the
+    // KOL re-stakes via the UI later.
+    const nonce = new BN(BigInt(Date.now()) * 1000n + BigInt(Math.floor(Math.random() * 1000)));
+    const sf = await stakeForIx({
+      connection,
+      payer: devPk,
+      stakeMint,
+      beneficiary,
+      amountRaw: BigInt(claim.tokensRaw),
+      lockDays: Number(claim.stakeLockDays),
+      nonce,
+    });
+    const tx = new Transaction();
+    if (config.priorityFeeMicroLamports > 0) {
+      tx.add(ComputeBudgetProgram.setComputeUnitPrice({
+        microLamports: config.priorityFeeMicroLamports,
+      }));
+    }
+    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 600_000 }));
+    tx.add(sf.ix);
+    for (const rewardMint of rewardMints) {
+      const pc = await primeCheckpointIx({
+        connection,
+        payer: devPk,
+        stakeMint,
+        position: sf.position,
+        rewardTokenMint: rewardMint,
+      });
+      tx.add(pc.ix);
+    }
+
+    const sig = await signAndPollConfirm(connection, tx, [devKp], {
+      label: 'kol-claim-accept',
+      timeoutMs: 60_000,
+    });
+
+    // KOL accepted via the UI; default them to auto-push so cycle rewards
+    // land in their wallet without further action. They can flip to manual
+    // via Settings if they want to time their claims.
+    try {
+      const { ensureAutoPushDefault } = await import('./user-prefs.js');
+      ensureAutoPushDefault(claim.wallet);
+    } catch { /* non-fatal */ }
+
+    const updated = updateClaim(claimId, {
+      status: 'claimed',
+      claimedAt: new Date().toISOString(),
+      txSig: sig,
+      position: sf.position.toBase58(),
+      nonce: nonce.toString(),
+    });
+    res.json({ ok: true, claim: updated, txSig: sig });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -821,17 +1035,36 @@ app.post('/api/admin/snipe/kol/preview', requireAdmin, (req, res) => {
  */
 app.post('/api/admin/snipe/kol/run', requireAdmin, requireVault, async (req, res) => {
   try {
-    const { mint, devWalletId, wallets, lockDays, tokenAllocationPct, tokenAllocationRaw, snipeId } = req.body || {};
+    const {
+      mint,
+      symbol,
+      devWalletId,
+      wallets,
+      lockDays,
+      tokenAllocationPct,
+      tokenAllocationRaw,
+      snipeId,
+      mode,                 // 'pending-claim' (default) | 'push'
+      equalSplit,           // bool, default true
+      claimWindowDays,      // pending-claim window length, default 30
+      excludeWallets,       // dedupe against presale contributors etc.
+    } = req.body || {};
     if (!mint || !devWalletId || !Array.isArray(wallets) || wallets.length === 0) {
       return res.status(400).json({ ok: false, error: 'mint, devWalletId, wallets[] required' });
     }
     const out = await runKolAirdrop({
       mint,
+      symbol: symbol || null,
       devWalletId,
       wallets,
-      lockDays: Number(lockDays) || 7,
+      lockDays: Number(lockDays) || 30,
       tokenAllocationPct: tokenAllocationPct != null ? Number(tokenAllocationPct) : undefined,
       tokenAllocationRaw,
+      mode: mode || 'pending-claim',
+      equalSplit: equalSplit !== false,
+      claimWindowDays: Number(claimWindowDays) || 30,
+      excludeWallets: Array.isArray(excludeWallets) ? excludeWallets : [],
+      launchSnipeId: snipeId || null,
       log: (msg, extra) => console.log(JSON.stringify({
         ts: new Date().toISOString(), tag: 'kol-airdrop', message: msg, snipeId: snipeId || null, ...extra,
       })),
@@ -848,6 +1081,50 @@ app.post('/api/admin/snipe/kol/run', requireAdmin, requireVault, async (req, res
       } catch { /* non-fatal */ }
     }
     res.json({ ok: true, result: out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── Admin: KOL pending-claim management ──────────────────────────────────
+
+app.get('/api/admin/kol-claims', requireAdmin, (req, res) => {
+  try {
+    const { status, mint, devWalletId } = req.query || {};
+    const rows = listAllClaims({
+      status: status || undefined,
+      mint: mint || undefined,
+      devWalletId: devWalletId || undefined,
+    });
+    res.json({ ok: true, count: rows.length, claims: rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/admin/kol-claims/sweep', requireAdmin, (_req, res) => {
+  try {
+    const swept = sweepExpiredClaims();
+    res.json({ ok: true, sweptCount: swept.length, sweptIds: swept });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/admin/kol-claims/:id/revoke', requireAdmin, (req, res) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    const claim = getClaimById(id);
+    if (!claim) return res.status(404).json({ ok: false, error: 'no such claim' });
+    if (claim.status !== 'pending') {
+      return res.status(409).json({ ok: false, error: `claim is ${claim.status}, not revocable` });
+    }
+    const updated = updateClaim(id, {
+      status: 'revoked',
+      revokedAt: new Date().toISOString(),
+      revokedReason: req.body?.reason || null,
+    });
+    res.json({ ok: true, claim: updated });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }

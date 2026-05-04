@@ -619,20 +619,31 @@ export async function stealthLaunch(params) {
   let kolResult = null;
   if (params.kolAirdrop && Array.isArray(params.kolAirdrop.wallets) && params.kolAirdrop.wallets.length > 0) {
     try {
+      const kolMode = params.kolAirdrop.mode || 'pending-claim';
+      const kolEqualSplit = params.kolAirdrop.equalSplit !== false; // default true
       log('kol airdrop starting', {
         snipeId: snipeRow.id,
         mint: bundle.mint,
         walletCount: params.kolAirdrop.wallets.length,
         lockDays: params.kolAirdrop.lockDays,
         allocationPct: params.kolAirdrop.tokenAllocationPct,
+        mode: kolMode,
+        equalSplit: kolEqualSplit,
+        claimWindowDays: params.kolAirdrop.claimWindowDays,
       });
       kolResult = await runKolAirdrop({
         mint: bundle.mint,
+        symbol: metadata.symbol,
         devWalletId,
         wallets: params.kolAirdrop.wallets,
-        lockDays: params.kolAirdrop.lockDays || 7,
+        lockDays: params.kolAirdrop.lockDays || 30,
         tokenAllocationPct: params.kolAirdrop.tokenAllocationPct,
         tokenAllocationRaw: params.kolAirdrop.tokenAllocationRaw,
+        mode: kolMode,
+        equalSplit: kolEqualSplit,
+        claimWindowDays: params.kolAirdrop.claimWindowDays || 30,
+        excludeWallets: Array.isArray(params.kolAirdrop.excludeWallets) ? params.kolAirdrop.excludeWallets : [],
+        launchSnipeId: snipeRow.id,
         log: (msg, extra) => log(`kol-airdrop: ${msg}`, { snipeId: snipeRow.id, ...extra }),
       });
       updateSnipe(snipeRow.id, { kolAirdrop: kolResult });
@@ -640,8 +651,10 @@ export async function stealthLaunch(params) {
         snipeId: snipeRow.id,
         mint: bundle.mint,
         ok: kolResult.ok,
+        mode: kolResult.mode,
         batches: kolResult.totals.batchCount,
         wallets: kolResult.totals.walletCount,
+        pendingClaims: kolResult.pendingClaims?.length || 0,
       });
     } catch (e) {
       // Non-fatal — the launch is already complete; admin can retry KOL

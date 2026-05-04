@@ -506,6 +506,15 @@ function LaunchTab({ adminPk, onLaunched }) {
   const [kolScanLimit, setKolScanLimit] = useState(20);
   const [kolScanLoading, setKolScanLoading] = useState(false);
   const [kolScanErr, setKolScanErr] = useState(null);
+  // Pending-claim is the default — tokens stay earmarked in the dev wallet
+  // until the KOL signs an accept message. Push mode = the legacy "stake
+  // for them right away without their consent" behaviour, kept for cases
+  // where conviction signal matters more than consent.
+  const [kolMode, setKolMode] = useState('pending-claim');
+  const [kolClaimWindowDays, setKolClaimWindowDays] = useState(30);
+  // Reserved for future per-launch override; the worker also dedupes against
+  // its own list (KOL CSV containing the same wallet twice).
+  const [kolExcludeWalletsText, setKolExcludeWalletsText] = useState('');
 
   // MM seed bootstrap (optional). MM wallet buys at creator price as part
   // of the launch bundle, then the daemon picks the mint up automatically
@@ -723,10 +732,18 @@ function LaunchTab({ adminPk, onLaunched }) {
       fd.append('rewardMode', rewardMode);
 
       if (kolEnabled && kolWallets.length > 0) {
+        const excludeWallets = kolExcludeWalletsText
+          .split(/[\s,;\n]+/)
+          .map((s) => s.trim())
+          .filter(Boolean);
         fd.append('kolAirdrop', JSON.stringify({
           wallets: kolWallets,
-          lockDays: Number(kolLockDays) || 7,
+          lockDays: Number(kolLockDays) || 30,
           tokenAllocationPct: Number(kolAllocPct) || 25,
+          mode: kolMode,
+          equalSplit: true,
+          claimWindowDays: Number(kolClaimWindowDays) || 30,
+          excludeWallets,
         }));
       }
 
@@ -781,7 +798,7 @@ function LaunchTab({ adminPk, onLaunched }) {
     } finally {
       setSubmitting(false);
     }
-  }, [adminPk, name, symbol, description, twitter, telegram, website, imageFile, imageUrl, metadataUri, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol, slippageBps, rewardMode, kolEnabled, kolWallets, kolLockDays, kolAllocPct, mmEnabled, mmWalletId, mmEntrySol, mmBankrollSol, mmDrawdownPct, mmMinBuySol, mmMaxBuySol, mmMinIntervalSec, mmMaxIntervalSec, mmSlippage, choreoEnabled, choreoAbsorberIds, choreoDevStakePct, choreoDevStakeLockDays, choreoDevSellPct, choreoDevSellDelayBlocks, choreoAbsorberWaveDelayBlocks, choreoAbsorberWaveSize, choreoAbsorberBuyMinSol, choreoAbsorberBuyMaxSol, choreoAbsorberAutoStakePct, choreoAbsorberStakeLockDays, choreoDripWindowSec, choreoDripIntervalMinMs, choreoDripIntervalMaxMs, onLaunched]);
+  }, [adminPk, name, symbol, description, twitter, telegram, website, imageFile, imageUrl, metadataUri, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol, slippageBps, rewardMode, kolEnabled, kolWallets, kolLockDays, kolAllocPct, kolMode, kolClaimWindowDays, kolExcludeWalletsText, mmEnabled, mmWalletId, mmEntrySol, mmBankrollSol, mmDrawdownPct, mmMinBuySol, mmMaxBuySol, mmMinIntervalSec, mmMaxIntervalSec, mmSlippage, choreoEnabled, choreoAbsorberIds, choreoDevStakePct, choreoDevStakeLockDays, choreoDevSellPct, choreoDevSellDelayBlocks, choreoAbsorberWaveDelayBlocks, choreoAbsorberWaveSize, choreoAbsorberBuyMinSol, choreoAbsorberBuyMaxSol, choreoAbsorberAutoStakePct, choreoAbsorberStakeLockDays, choreoDripWindowSec, choreoDripIntervalMinMs, choreoDripIntervalMaxMs, onLaunched]);
 
   return (
     <form onSubmit={handleSubmit}>
@@ -1001,20 +1018,38 @@ function LaunchTab({ adminPk, onLaunched }) {
           </label>
         </div>
         <div style={{ fontSize: 11, color: MUTED, marginBottom: kolEnabled ? 12 : 0 }}>
-          Wallets will receive <em>staked positions</em> (not raw tokens) — they unstake on the public site to claim. Same flow as the presale auto-stake.
+          Slice of the dev-buy bag is split <strong>equally</strong> across the listed wallets. Default mode is <em>pending-claim</em>: tokens stay in the dev wallet until each KOL signs an accept message; unclaimed slots auto-expire and revert to the dev after the window. Push mode creates positions immediately without consent (legacy).
         </div>
 
         {kolEnabled && (
           <>
-            <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
-              <Field label="Lock duration">
+            <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 1fr 1fr 0.9fr', gap: 12, marginBottom: 12 }}>
+              <Field label="Delivery mode">
+                <select value={kolMode} onChange={(e) => setKolMode(e.target.value)} style={inputStyle}>
+                  <option value="pending-claim">Pending-claim (recommended)</option>
+                  <option value="push">Push (no consent)</option>
+                </select>
+              </Field>
+              <Field label="Lock duration (after claim)">
                 <select value={kolLockDays} onChange={(e) => setKolLockDays(Number(e.target.value))} style={inputStyle}>
-                  <option value={1}>1 day</option>
-                  <option value={3}>3 days</option>
                   <option value={7}>7 days</option>
                   <option value={14}>14 days</option>
                   <option value={21}>21 days</option>
                   <option value={30}>30 days</option>
+                  <option value={60}>60 days</option>
+                </select>
+              </Field>
+              <Field label={kolMode === 'pending-claim' ? 'Claim window' : 'Claim window (n/a for push)'}>
+                <select
+                  value={kolClaimWindowDays}
+                  onChange={(e) => setKolClaimWindowDays(Number(e.target.value))}
+                  style={inputStyle}
+                  disabled={kolMode === 'push'}
+                >
+                  <option value={7}>7 days</option>
+                  <option value={14}>14 days</option>
+                  <option value={30}>30 days</option>
+                  <option value={60}>60 days</option>
                 </select>
               </Field>
               <Field label="% of dev buy bag">
@@ -1027,6 +1062,18 @@ function LaunchTab({ adminPk, onLaunched }) {
                   style={inputStyle}
                 />
               </Field>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+              <Field label="Exclude wallets (optional, dedupe vs presale contributors etc.)">
+                <textarea
+                  rows={2}
+                  value={kolExcludeWalletsText}
+                  onChange={(e) => setKolExcludeWalletsText(e.target.value)}
+                  placeholder="paste pubkeys to skip (comma/space/newline separated)"
+                  style={{ ...inputStyle, fontFamily: 'monospace', fontSize: 11, resize: 'vertical' }}
+                />
+              </Field>
               <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
                 <div style={{ fontSize: 11, color: MUTED, marginBottom: 4 }}>Wallets parsed</div>
                 <div style={{
@@ -1036,7 +1083,10 @@ function LaunchTab({ adminPk, onLaunched }) {
                   {kolWallets.length} {kolWallets.length === 1 ? 'wallet' : 'wallets'}
                   {kolWallets.length > 0 && (
                     <span style={{ color: MUTED, fontWeight: 400, fontSize: 11, marginLeft: 6 }}>
-                      ≈ {Math.ceil(kolWallets.length / 2)} batches
+                      · equal split
+                      {kolMode === 'pending-claim'
+                        ? ' · earmarked, no on-chain action until claimed'
+                        : ` · ≈ ${Math.ceil(kolWallets.length / 2)} batches`}
                     </span>
                   )}
                 </div>
@@ -1097,7 +1147,15 @@ function LaunchTab({ adminPk, onLaunched }) {
 
             {kolWallets.length > 0 && (
               <div style={{ fontSize: 11, color: MUTED, padding: 8, background: '#f9fafb', borderRadius: 6 }}>
-                Will create <strong style={{ color: INK }}>{kolWallets.length} stake positions</strong> across <strong style={{ color: INK }}>{Math.ceil(kolWallets.length / 2)} txs</strong>, locked for <strong style={{ color: INK }}>{kolLockDays} days</strong>, using <strong style={{ color: INK }}>{kolAllocPct}%</strong> of the dev wallet's post-bundle bag.
+                {kolMode === 'pending-claim' ? (
+                  <>
+                    Will earmark <strong style={{ color: INK }}>{kolAllocPct}%</strong> of the dev wallet's post-bundle bag, split <strong style={{ color: INK }}>equally</strong> across <strong style={{ color: INK }}>{kolWallets.length} wallets</strong>. Each KOL has <strong style={{ color: INK }}>{kolClaimWindowDays} days</strong> to sign an accept message; on accept their position is locked <strong style={{ color: INK }}>{kolLockDays} days</strong>. Unclaimed slots auto-expire and revert to the dev — no on-chain action either way.
+                  </>
+                ) : (
+                  <>
+                    Will create <strong style={{ color: INK }}>{kolWallets.length} stake positions</strong> across <strong style={{ color: INK }}>{Math.ceil(kolWallets.length / 2)} txs</strong>, locked for <strong style={{ color: INK }}>{kolLockDays} days</strong>, using <strong style={{ color: INK }}>{kolAllocPct}%</strong> of the dev wallet's post-bundle bag (equal split, no consent required).
+                  </>
+                )}
               </div>
             )}
           </>
