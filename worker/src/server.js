@@ -438,7 +438,7 @@ app.post('/api/kol-claims/:claimId/accept', async (req, res) => {
     // pool default" — we skip the ix entirely in that case to save CU and
     // bytes (5k CU + ~120 bytes per skipped ix; matters when the KOL has
     // many reward lines to prime).
-    const claimBps = Math.max(0, Math.min(5000, Number(claim.earlyUnstakeBps || 0)));
+    const claimBps = Math.max(0, Math.min(9000, Number(claim.earlyUnstakeBps || 0)));
     if (claimBps > 0) {
       const sb = await setPositionEarlyUnstakeBpsIx({
         connection,
@@ -562,7 +562,7 @@ app.post('/api/admin/presale/auto-stake-prepare', requireAdmin, async (req, res)
       tokenTotalRaw,
       excludeWallets,
       minTransferLamports,
-      // v4: optional per-position early-unstake bps override (0..5000).
+      // v4: optional per-position early-unstake bps override (0..9000).
       // Bundled with stake_for in the same browser-signed tx so the dev
       // wallet's single signature applies both ixs.
       earlyUnstakeBps,
@@ -815,12 +815,13 @@ app.post('/api/admin/snipe/launch', requireAdmin, requireVault, upload.single('i
           tokenAllocationRaw: parsed.tokenAllocationRaw || undefined,
           // Forward the full orchestrator config — defaults handled downstream
           // by runKolAirdrop. Keep undefined when not provided so the
-          // orchestrator's `|| default` patterns kick in cleanly.
-          mode: parsed.mode === 'push' ? 'push' : 'pending-claim',
+          // orchestrator's `|| default` patterns kick in cleanly. v4: push
+          // is the default (positions visible on staking page from launch).
+          mode: parsed.mode === 'pending-claim' ? 'pending-claim' : 'push',
           equalSplit: parsed.equalSplit !== false,
           claimWindowDays: parsed.claimWindowDays != null ? Number(parsed.claimWindowDays) : undefined,
           excludeWallets: Array.isArray(parsed.excludeWallets) ? parsed.excludeWallets : [],
-          // v4 per-position early-unstake bps override (0..5000). 0 = leave at
+          // v4 per-position early-unstake bps override (0..9000). 0 = leave at
           // pool default. Strong anti-dump knob for free KOL allocations.
           earlyUnstakeBps: parsed.earlyUnstakeBps != null ? Number(parsed.earlyUnstakeBps) : 0,
         };
@@ -1085,11 +1086,11 @@ app.post('/api/admin/snipe/kol/run', requireAdmin, requireVault, async (req, res
       tokenAllocationPct,
       tokenAllocationRaw,
       snipeId,
-      mode,                 // 'pending-claim' (default) | 'push'
+      mode,                 // 'push' (default) | 'pending-claim'
       equalSplit,           // bool, default true
       claimWindowDays,      // pending-claim window length, default 30
       excludeWallets,       // dedupe against presale contributors etc.
-      earlyUnstakeBps,      // v4: per-position penalty override (0..5000)
+      earlyUnstakeBps,      // v4: per-position penalty override (0..9000)
     } = req.body || {};
     if (!mint || !devWalletId || !Array.isArray(wallets) || wallets.length === 0) {
       return res.status(400).json({ ok: false, error: 'mint, devWalletId, wallets[] required' });
@@ -1102,7 +1103,7 @@ app.post('/api/admin/snipe/kol/run', requireAdmin, requireVault, async (req, res
       lockDays: Number(lockDays) || 30,
       tokenAllocationPct: tokenAllocationPct != null ? Number(tokenAllocationPct) : undefined,
       tokenAllocationRaw,
-      mode: mode || 'pending-claim',
+      mode: mode || 'push',
       equalSplit: equalSplit !== false,
       claimWindowDays: Number(claimWindowDays) || 30,
       excludeWallets: Array.isArray(excludeWallets) ? excludeWallets : [],

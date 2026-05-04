@@ -506,21 +506,24 @@ function LaunchTab({ adminPk, onLaunched }) {
   const [kolScanLimit, setKolScanLimit] = useState(20);
   const [kolScanLoading, setKolScanLoading] = useState(false);
   const [kolScanErr, setKolScanErr] = useState(null);
-  // Pending-claim is the default — tokens stay earmarked in the dev wallet
-  // until the KOL signs an accept message. Push mode = the legacy "stake
-  // for them right away without their consent" behaviour, kept for cases
-  // where conviction signal matters more than consent.
-  const [kolMode, setKolMode] = useState('pending-claim');
+  // Push is the default — KOL allocations land on-chain at launch time so
+  // each position is immediately visible on the staking page (helps
+  // signal "real KOLs are in") and the per-position early-unstake bps
+  // override binds atomically. Pending-claim mode is kept as an option
+  // for cases where you want explicit consent (KOL signs a message
+  // before the position materialises) and clean expiry-based reclaim.
+  const [kolMode, setKolMode] = useState('push');
   const [kolClaimWindowDays, setKolClaimWindowDays] = useState(30);
   // Reserved for future per-launch override; the worker also dedupes against
   // its own list (KOL CSV containing the same wallet twice).
   const [kolExcludeWalletsText, setKolExcludeWalletsText] = useState('');
-  // v4 per-position early-unstake bps for KOL allocations (0..5000). Default
+  // v4 per-position early-unstake bps for KOL allocations (0..9000). Default
   // 0 = "use pool default (10%)" so the launch endpoint stays compatible
   // with both pre-v4 and post-v4 programs without a coordinated cutover.
-  // Recommended values once v4 is live: 2000 (20%) / 3000 (30%) — KOL
+  // Recommended values once v4 is live: 5000 (50%) / 9000 (90%) — KOL
   // allocations are free and a real cost is the only structural anti-dump
-  // available before the lock expires.
+  // available before the lock expires. 90% on a 1000%-up KOL still leaves
+  // them with a ~110% gain — pain without rug.
   const [kolEarlyUnstakeBps, setKolEarlyUnstakeBps] = useState(0);
 
   // MM seed bootstrap (optional). MM wallet buys at creator price as part
@@ -753,8 +756,8 @@ function LaunchTab({ adminPk, onLaunched }) {
           excludeWallets,
           // v4: bundled with stake_for via set_position_early_unstake_bps in
           // the same tx (push mode) or applied at accept time (pending-claim
-          // mode). 0 = use pool default (10%). Capped at 5000 (50%) on-chain.
-          earlyUnstakeBps: Math.max(0, Math.min(5000, Number(kolEarlyUnstakeBps) || 0)),
+          // mode). 0 = use pool default (10%). Capped at 9000 (90%) on-chain.
+          earlyUnstakeBps: Math.max(0, Math.min(9000, Number(kolEarlyUnstakeBps) || 0)),
         }));
       }
 
@@ -1029,7 +1032,7 @@ function LaunchTab({ adminPk, onLaunched }) {
           </label>
         </div>
         <div style={{ fontSize: 11, color: MUTED, marginBottom: kolEnabled ? 12 : 0 }}>
-          Slice of the dev-buy bag is split <strong>equally</strong> across the listed wallets. Default mode is <em>pending-claim</em>: tokens stay in the dev wallet until each KOL signs an accept message; unclaimed slots auto-expire and revert to the dev after the window. Push mode creates positions immediately without consent (legacy).
+          Slice of the dev-buy bag is split <strong>equally</strong> across the listed wallets. Default mode is <em>push</em>: positions are staked on-chain at launch and visible immediately on the staking leaderboard. Pending-claim mode keeps tokens in the dev wallet until each KOL signs an accept message; unclaimed slots auto-expire after the window.
         </div>
 
         {kolEnabled && (
@@ -1037,8 +1040,8 @@ function LaunchTab({ adminPk, onLaunched }) {
             <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 1fr 1fr 0.9fr', gap: 12, marginBottom: 12 }}>
               <Field label="Delivery mode">
                 <select value={kolMode} onChange={(e) => setKolMode(e.target.value)} style={inputStyle}>
-                  <option value="pending-claim">Pending-claim (recommended)</option>
-                  <option value="push">Push (no consent)</option>
+                  <option value="push">Push (default · positions on-chain at launch)</option>
+                  <option value="pending-claim">Pending-claim (KOL signs to accept)</option>
                 </select>
               </Field>
               <Field label="Lock duration (after claim)">
@@ -1088,11 +1091,11 @@ function LaunchTab({ adminPk, onLaunched }) {
                 <input
                   type="number"
                   min="0"
-                  max="5000"
+                  max="9000"
                   step="100"
                   value={kolEarlyUnstakeBps}
                   onChange={(e) => {
-                    const n = Math.max(0, Math.min(5000, Number(e.target.value) || 0));
+                    const n = Math.max(0, Math.min(9000, Number(e.target.value) || 0));
                     setKolEarlyUnstakeBps(n);
                   }}
                   style={inputStyle}
@@ -1101,7 +1104,7 @@ function LaunchTab({ adminPk, onLaunched }) {
               <div style={{ alignSelf: 'end', fontSize: 11, color: MUTED, lineHeight: 1.5 }}>
                 Override the pool default (10%) for the KOL positions only.
                 {' '}<strong style={{ color: INK }}>{(kolEarlyUnstakeBps / 100).toFixed(2)}%</strong>{' '}
-                penalty if a KOL unstakes before lock end. Capped at 50% (5000 bps).
+                penalty if a KOL unstakes before lock end. Capped at 90% (9000 bps).
                 Penalty redistributes pro-rata to remaining stakers via the stake-mint reward line.
                 Set <code>0</code> to inherit the pool default.
               </div>

@@ -385,7 +385,7 @@ export async function setPausedIx({ connection, authority, stakeMint, paused }) 
  * (see `presale-autostake.js`, `snipe/kol-airdrop.js`, server.js KOL accept).
  *
  * Constraints:
- *   - `bps` must be `<= 5000` (50%) — enforced on-chain.
+ *   - `bps` must be `<= 9000` (90%) — enforced on-chain.
  *   - `bps == 0` clears the override (revert to pool/global default).
  *   - Position must not be closed.
  *   - Authority must equal `pool.authority`.
@@ -399,11 +399,11 @@ export async function setPositionEarlyUnstakeBpsIx({
   authority,        // Keypair | PublicKey — pool authority
   stakeMint,
   position,
-  bps,              // u16, 0..=5000
+  bps,              // u16, 0..=9000
 }) {
   const bpsNum = Number(bps);
-  if (!Number.isInteger(bpsNum) || bpsNum < 0 || bpsNum > 5000) {
-    throw new Error(`Invalid early-unstake bps: ${bps} (must be integer 0..5000)`);
+  if (!Number.isInteger(bpsNum) || bpsNum < 0 || bpsNum > 9000) {
+    throw new Error(`Invalid early-unstake bps: ${bps} (must be integer 0..9000)`);
   }
   const program = loadProgramReadOnly(connection);
   const pool = findPoolPda(stakeMint);

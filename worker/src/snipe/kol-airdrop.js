@@ -207,12 +207,18 @@ export async function runKolAirdrop({
   lockDays = 7,
   tokenAllocationRaw,    // optional — defaults to entire dev-buy bag
   tokenAllocationPct,    // optional — % of dev bag (1-100), used if tokenAllocationRaw omitted
-  mode = 'pending-claim', // 'push' | 'pending-claim' (default).
+  mode = 'push',          // 'push' (default) | 'pending-claim'.
+                          // push: stake_for runs at launch, position is
+                          //   on-chain immediately and visible on the
+                          //   staking leaderboard / token page.
+                          // pending-claim: tokens stay in dev wallet,
+                          //   KOL signs to materialise; sweepable on
+                          //   expiry. Kept for explicit-consent flows.
   equalSplit = true,     // when true: split equally regardless of weights.
   claimWindowDays = 30,  // pending-claim: how long the KOL has to accept.
   excludeWallets = [],   // strip wallets that are also presale contributors
                          // (or any other dedupe upstream wants to apply)
-  earlyUnstakeBps = 0,   // v4 per-position penalty override (0..5000).
+  earlyUnstakeBps = 0,   // v4 per-position penalty override (0..9000).
                          // 0 = use pool default (10%).
                          // - push mode: appended via set_position_early_unstake_bps
                          //   ix immediately after each stake_for in the same tx.
@@ -230,7 +236,7 @@ export async function runKolAirdrop({
   if (mode !== 'push' && mode !== 'pending-claim') {
     throw new Error(`runKolAirdrop: invalid mode ${mode} (expected 'push' or 'pending-claim')`);
   }
-  const bpsOverride = Math.max(0, Math.min(5000, Number(earlyUnstakeBps || 0)));
+  const bpsOverride = Math.max(0, Math.min(9000, Number(earlyUnstakeBps || 0)));
 
   // Dedupe within the KOL list itself, then drop any wallet that's already
   // a presale contributor (caller passes `excludeWallets`). Empty result

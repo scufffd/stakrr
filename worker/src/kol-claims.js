@@ -3,14 +3,19 @@
 // During an admin launch, the unified flow may carve a slice of the dev-buy
 // bag for promotional partners ("KOLs"). Two delivery modes exist:
 //
-//   - mode='push': position is created on-chain immediately via stake_for,
-//     same code path as `runKolAirdrop`. KOL has no consent step.
-//   - mode='pending-claim' (default): tokens stay earmarked in the dev
-//     wallet for `claimWindowDays` (default 30). The KOL signs a message
-//     within the window to materialise their position (`stake_for` with the
-//     stored allocation, paid + signed by the dev wallet). After the window
+//   - mode='push' (default): position is created on-chain immediately via
+//     stake_for, same code path as `runKolAirdrop` push branch. KOL has no
+//     consent step but their position is visible on the staking page from
+//     the moment of launch — useful as social proof. Reclaim of a still-
+//     unclaimed position only via the all-or-nothing `sweep_reward_vault`
+//     emergency lever (see post-mortem comments there).
+//   - mode='pending-claim': tokens stay earmarked in the dev wallet for
+//     `claimWindowDays` (default 30). The KOL signs a message within the
+//     window to materialise their position (`stake_for` with the stored
+//     allocation, paid + signed by the dev wallet). After the window
 //     expires the entry is marked `expired` and the dev keeps the tokens —
-//     no on-chain action needed since they never moved.
+//     no on-chain action needed since they never moved. Use when explicit
+//     consent matters more than visibility.
 //
 // This module owns the JSON-backed pending-claim store and the helpers to
 // query, accept, and sweep entries. It is INTENTIONALLY decoupled from the
@@ -90,7 +95,7 @@ const VALID_STATUSES = new Set(['pending', 'claimed', 'expired', 'revoked']);
  *     devWalletId: string,        // wallet-vault id holding the tokens
  *     stakeLockDays?: number,     // applied to position once claimed
  *     claimWindowDays?: number,   // window for KOL to accept
- *     earlyUnstakeBps?: number,   // v4 per-position penalty override (0-5000).
+ *     earlyUnstakeBps?: number,   // v4 per-position penalty override (0-9000).
  *                                 // Applied via set_position_early_unstake_bps
  *                                 // bundled with stake_for at accept time.
  *                                 // 0 / undefined = use pool default (10%).
@@ -110,7 +115,7 @@ export function createPendingClaims(rows) {
     const id = newId();
     const claimWindowDays = Number(r.claimWindowDays || DEFAULT_CLAIM_WINDOW_DAYS);
     const stakeLockDays = Number(r.stakeLockDays || DEFAULT_LOCK_DAYS_AFTER_CLAIM);
-    const earlyUnstakeBps = Math.max(0, Math.min(5000, Number(r.earlyUnstakeBps || 0)));
+    const earlyUnstakeBps = Math.max(0, Math.min(9000, Number(r.earlyUnstakeBps || 0)));
     const expiresAt = new Date(now.getTime() + claimWindowDays * 86400 * 1000);
     const rec = {
       id,

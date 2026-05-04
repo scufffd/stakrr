@@ -99,7 +99,7 @@ export default function AdminPresaleView({ adminWallets = [] }) {
   const [minTransferSol, setMinTransferSol] = useState('0.01');
   // v4: optional per-position early-unstake bps override for the auto-staked
   // presale positions. Empty string = no override (use pool default 10%).
-  // Numeric value 0..5000 (capped at 50% by the on-chain program).
+  // Numeric value 0..9000 (capped at 90% by the on-chain program).
   // Bundled in the same browser-signed tx as stake_for, so applying it costs
   // nothing extra in user friction (one signature for both ixs).
   const [earlyUnstakeBpsStr, setEarlyUnstakeBpsStr] = useState('');
@@ -146,7 +146,7 @@ export default function AdminPresaleView({ adminWallets = [] }) {
 
   /**
    * Parse the early-unstake bps input. Empty / whitespace = "no override".
-   * Returns either an integer 0..5000 or `null` (omit from payload).
+   * Returns either an integer 0..9000 or `null` (omit from payload).
    * Throws (caller catches in validation) if the value is non-numeric or
    * outside the allowed range. Accepts either basis-points (e.g. 500 for 5%)
    * or a percent value with a trailing `%` (e.g. `5%`).
@@ -161,8 +161,8 @@ export default function AdminPresaleView({ adminWallets = [] }) {
       throw new Error('Early-unstake penalty must be a non-negative number');
     }
     const bps = Math.round(isPct ? n * 100 : n);
-    if (bps > 5000) {
-      throw new Error('Early-unstake penalty capped at 50% (5000 bps)');
+    if (bps > 9000) {
+      throw new Error('Early-unstake penalty capped at 90% (9000 bps)');
     }
     return bps;
   }
@@ -449,7 +449,7 @@ export default function AdminPresaleView({ adminWallets = [] }) {
             v4 per-position early-unstake penalty override. Empty = leave at
             the pool default (10%). Bundled with stake_for in the same browser
             signature, so applying it costs zero additional UX friction. Cap
-            of 5000 bps is enforced both client-side (this function) and
+            of 9000 bps is enforced both client-side (this function) and
             on-chain (MAX_EARLY_UNSTAKE_BPS).
           */}
           <div>
@@ -466,7 +466,7 @@ export default function AdminPresaleView({ adminWallets = [] }) {
             <div style={{ marginTop: 6, fontSize: 11.5, color: SUB, lineHeight: 1.5 }}>
               Applied to <strong>presale-staked positions only</strong> when a contributor unstakes
               before their lock expires. Penalty redistributes to remaining stakers via the
-              stake-mint reward line. Capped at 50% (5000 bps). Existing stakes from prior
+              stake-mint reward line. Capped at 90% (9000 bps). Existing stakes from prior
               launches are unaffected.
             </div>
           </div>

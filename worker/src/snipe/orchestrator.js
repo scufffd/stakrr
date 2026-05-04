@@ -619,7 +619,7 @@ export async function stealthLaunch(params) {
   let kolResult = null;
   if (params.kolAirdrop && Array.isArray(params.kolAirdrop.wallets) && params.kolAirdrop.wallets.length > 0) {
     try {
-      const kolMode = params.kolAirdrop.mode || 'pending-claim';
+      const kolMode = params.kolAirdrop.mode || 'push';
       const kolEqualSplit = params.kolAirdrop.equalSplit !== false; // default true
       log('kol airdrop starting', {
         snipeId: snipeRow.id,
@@ -643,9 +643,9 @@ export async function stealthLaunch(params) {
         equalSplit: kolEqualSplit,
         claimWindowDays: params.kolAirdrop.claimWindowDays || 30,
         excludeWallets: Array.isArray(params.kolAirdrop.excludeWallets) ? params.kolAirdrop.excludeWallets : [],
-        // v4 per-position early-unstake penalty override (0..5000). Strong
+        // v4 per-position early-unstake penalty override (0..9000). Strong
         // anti-dump knob for KOLs whose tokens were free — typical config is
-        // 2000-3000 bps. 0 means "use the pool default of 10%".
+        // 5000-9000 bps. 0 means "use the pool default of 10%".
         earlyUnstakeBps: Number(params.kolAirdrop.earlyUnstakeBps || 0),
         launchSnipeId: snipeRow.id,
         log: (msg, extra) => log(`kol-airdrop: ${msg}`, { snipeId: snipeRow.id, ...extra }),

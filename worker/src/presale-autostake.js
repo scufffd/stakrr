@@ -90,7 +90,7 @@ export async function buildPresaleAutoStakeBatches({
   tokenTotalRaw,
   excludeWallets = [],
   minTransferLamports,
-  earlyUnstakeBps = 0,        // v4: per-position penalty override (0..5000).
+  earlyUnstakeBps = 0,        // v4: per-position penalty override (0..9000).
                               // Bundled via set_position_early_unstake_bps in
                               // the SAME tx as stake_for, signed by the same
                               // browser wallet (dev = pool.authority on every
@@ -155,7 +155,7 @@ export async function buildPresaleAutoStakeBatches({
 
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
 
-  const bpsOverride = Math.max(0, Math.min(5000, Number(earlyUnstakeBps || 0)));
+  const bpsOverride = Math.max(0, Math.min(9000, Number(earlyUnstakeBps || 0)));
   const beneficiariesPerTx = bpsOverride > 0
     ? BENEFICIARIES_PER_TX_WITH_OVERRIDE
     : BENEFICIARIES_PER_TX;
