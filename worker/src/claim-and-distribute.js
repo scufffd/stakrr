@@ -61,13 +61,27 @@ async function getSolBalance(connection, pubkey) {
 // run for 26+ hours despite real volume).
 //
 // MIN: hard floor — below this the cycle skips entirely with a clear alert.
-// TARGET: cycles top treasury up to this if claimed funds allow, holding back
-//         from the staker portion (NEVER from platform fee — that's revenue).
+// TARGET: every cycle must leave treasury balance ≥ TARGET after the cycle's
+//         distribution + tx costs settle. We achieve this by computing a
+//         forward-looking `maxDistributable` (treasury_after_claim −
+//         TARGET − cycle_tx_cushion) and holding back whatever can't fit.
+//         Holdback comes off the staker portion first, then the platform
+//         fee if even a 100% staker holdback isn't enough — operational
+//         expense before profit-sharing, since a drained treasury blocks
+//         every future cycle for every pool until it's manually topped up.
+// CYCLE_TX_COST_CUSHION: conservative estimate of all in-flight txs this
+//         cycle still has to land (claim + deposit + sweep, or claim + buy
+//         + deposit + sweep for token mode) at our current priority fee
+//         settings. Without this cushion we'd distribute exactly down to
+//         TARGET and end the cycle slightly below by the time fees clear.
 const TREASURY_MIN_RESERVE_LAMPORTS = BigInt(
   Math.round((parseFloat(process.env.TREASURY_MIN_RESERVE_SOL || '0.005')) * 1e9),
 );
 const TREASURY_TARGET_RESERVE_LAMPORTS = BigInt(
   Math.round((parseFloat(process.env.TREASURY_TARGET_RESERVE_SOL || '0.05')) * 1e9),
+);
+const TREASURY_CYCLE_TX_COST_CUSHION_LAMPORTS = BigInt(
+  Math.round((parseFloat(process.env.TREASURY_CYCLE_TX_COST_CUSHION_SOL || '0.002')) * 1e9),
 );
 
 /**
@@ -521,38 +535,102 @@ export async function runPoolCycle({ pool }) {
   }
 
   // 2) Split fees.
-  const { platform, stakers: stakersBeforeReserve } = splitFees(claimedLamports);
+  const splitResult = splitFees(claimedLamports);
+  const platformBeforeReserve = splitResult.platform;
+  const stakersBeforeReserve = splitResult.stakers;
 
-  // Operational reserve top-up: if the treasury is below the target reserve,
-  // hold back lamports from the STAKER portion (never from platform — that's
-  // the user's revenue) to refill it. This makes cycles self-sustaining over
-  // the long run: after the first cycle following a near-empty treasury, we
-  // back-fill the reserve from one cycle's stakers, and every subsequent
-  // cycle is net-zero on reserve (so 100% of stakers portion goes to stakers).
+  // === Reserve protection (forward-looking) ============================
   //
-  // We re-measure treasury balance AFTER the claim — claimedLamports just
-  // landed there, so it might already be above target without holdback.
+  // The OLD logic only held back when the treasury was already below TARGET
+  // at the moment we measured — it didn't model what the balance would BE
+  // after we sent `platform + stakers` out the door. That meant a cycle
+  // could claim 1 SOL into a treasury holding 0.07 SOL (now 1.07 SOL,
+  // comfortably above the 0.05 SOL target → no holdback), then send out
+  // ~1 SOL leaving 0.07 SOL again. After a few cycles' worth of tx fees
+  // and ATA rents the treasury slipped below MIN and every pool's cycle
+  // started failing preflight (the `treasury_underfunded` state).
+  //
+  // The NEW logic computes `maxDistributable` as everything ABOVE the
+  // reserve floor (target + cycle-tx cushion) and caps the outgoing
+  // payment to that. Anything that can't fit is held back, prioritising:
+  //
+  //   1. Staker portion first  — variable revenue-share, can be paid next
+  //                              cycle without breaking anyone.
+  //   2. Platform fee second   — only if a 100% staker holdback isn't
+  //                              enough; protects the reserve absolutely.
+  //   3. Skip entirely         — if even both portions can't cover the
+  //                              shortfall, hold the full claim and let
+  //                              the next cycle pay it forward (treasury
+  //                              just goes UP this round).
+  //
+  // Net effect: treasury balance after the cycle settles is always
+  // ≥ TARGET_RESERVE, so the underfunded state becomes unreachable as
+  // long as `claimedLamports > 0` keeps arriving and gross creator fees
+  // exceed gross cycle costs (which they always do — fees are dollars,
+  // costs are sub-cent).
   const treasuryAfterClaim = await getSolBalance(connection, treasury.publicKey);
-  let reserveTopupLamports = 0n;
-  if (treasuryAfterClaim < TREASURY_TARGET_RESERVE_LAMPORTS) {
-    const needed = TREASURY_TARGET_RESERVE_LAMPORTS - treasuryAfterClaim;
-    // Cap the holdback at 80% of the staker portion so a single tiny cycle
-    // can't consume the entire claimed amount. Stakers always receive
-    // something. After 2-3 cycles the reserve is fully topped up regardless.
-    const maxHoldback = (stakersBeforeReserve * 8n) / 10n;
-    reserveTopupLamports = needed > maxHoldback ? maxHoldback : needed;
+  const reserveFloor = TREASURY_TARGET_RESERVE_LAMPORTS + TREASURY_CYCLE_TX_COST_CUSHION_LAMPORTS;
+  const maxDistributable = treasuryAfterClaim > reserveFloor
+    ? treasuryAfterClaim - reserveFloor
+    : 0n;
+
+  let platform = platformBeforeReserve;
+  let stakers = stakersBeforeReserve;
+  let reserveTopupFromStakers = 0n;
+  let reserveTopupFromPlatform = 0n;
+
+  const intendedSpend = platformBeforeReserve + stakersBeforeReserve;
+  if (intendedSpend > maxDistributable) {
+    const shortfall = intendedSpend - maxDistributable;
+    if (shortfall <= stakersBeforeReserve) {
+      reserveTopupFromStakers = shortfall;
+      stakers = stakersBeforeReserve - shortfall;
+    } else {
+      reserveTopupFromStakers = stakersBeforeReserve;
+      stakers = 0n;
+      const remainingShortfall = shortfall - stakersBeforeReserve;
+      reserveTopupFromPlatform =
+        remainingShortfall < platformBeforeReserve ? remainingShortfall : platformBeforeReserve;
+      platform = platformBeforeReserve - reserveTopupFromPlatform;
+    }
   }
-  const stakers = stakersBeforeReserve - reserveTopupLamports;
+  const reserveTopupLamports = reserveTopupFromStakers + reserveTopupFromPlatform;
+  // Sanity check — projected balance after this cycle's outflows must
+  // sit at or above the floor. If not, our math drifted; refuse to
+  // distribute and surface a clear error rather than risk underfunding.
+  const projectedTreasuryAfter = treasuryAfterClaim - platform - stakers;
+  if (projectedTreasuryAfter < TREASURY_TARGET_RESERVE_LAMPORTS) {
+    log('cycle: reserve-protection assertion failed — refusing to distribute', {
+      stakeMint: pool.stakeMint,
+      treasuryAfterClaim: treasuryAfterClaim.toString(),
+      platform: platform.toString(),
+      stakers: stakers.toString(),
+      projectedTreasuryAfter: projectedTreasuryAfter.toString(),
+      targetReserve: TREASURY_TARGET_RESERVE_LAMPORTS.toString(),
+    });
+    return {
+      status: 'reserve_protected',
+      claimedLamports: claimedLamports.toString(),
+      treasuryAfterClaim: treasuryAfterClaim.toString(),
+      heldBackLamports: (platformBeforeReserve + stakersBeforeReserve).toString(),
+    };
+  }
 
   log('cycle: split', {
     stakeMint: pool.stakeMint,
     rewardMode,
     platform: platform.toString(),
+    platformBeforeReserve: platformBeforeReserve.toString(),
     stakers: stakers.toString(),
     stakersBeforeReserve: stakersBeforeReserve.toString(),
     reserveTopupLamports: reserveTopupLamports.toString(),
+    reserveTopupFromStakers: reserveTopupFromStakers.toString(),
+    reserveTopupFromPlatform: reserveTopupFromPlatform.toString(),
     treasuryAfterClaim: treasuryAfterClaim.toString(),
     treasuryTargetReserve: TREASURY_TARGET_RESERVE_LAMPORTS.toString(),
+    treasuryCycleTxCostCushion: TREASURY_CYCLE_TX_COST_CUSHION_LAMPORTS.toString(),
+    maxDistributable: maxDistributable.toString(),
+    projectedTreasuryAfter: projectedTreasuryAfter.toString(),
   });
 
   let depositSig = null;
