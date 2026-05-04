@@ -1198,6 +1198,71 @@ app.post('/api/admin/snipe/kol/run', requireAdmin, requireVault, async (req, res
   }
 });
 
+// Manual presale auto-stake — same orchestration as the inline launch
+// path but invoked standalone, e.g. to retry a snipe whose presale step
+// failed mid-flight (failed simulation, RPC 429, etc.). Body:
+//   {
+//     mint, devWalletId, presaleWallet, cutoffSignature,
+//     lockDays?, tokenTotalRaw, excludeWallets?[], minTransferLamports?,
+//     earlyUnstakeBps?, snipeId?,
+//   }
+// `tokenTotalRaw` should be the (live) presale slice — usually the
+// snipe row's bagCarve.presaleRaw or the dev wallet's current ATA
+// balance. The runner re-caps internally against the live ATA so
+// passing a slightly stale number is safe (it'll just stake what's
+// actually there).
+app.post('/api/admin/snipe/presale/run', requireAdmin, requireVault, async (req, res) => {
+  try {
+    const {
+      mint,
+      devWalletId,
+      presaleWallet,
+      cutoffSignature,
+      lockDays,
+      tokenTotalRaw,
+      excludeWallets,
+      minTransferLamports,
+      earlyUnstakeBps,
+      snipeId,
+    } = req.body || {};
+    if (!mint || !devWalletId || !presaleWallet || !cutoffSignature || !tokenTotalRaw) {
+      return res.status(400).json({
+        ok: false,
+        error: 'mint, devWalletId, presaleWallet, cutoffSignature, tokenTotalRaw required',
+      });
+    }
+    const { runPresaleAutoStake } = await import('./snipe/presale-airdrop.js');
+    const out = await runPresaleAutoStake({
+      mint,
+      devWalletId,
+      presaleWallet,
+      cutoffSignature,
+      lockDays: Number(lockDays) || 7,
+      tokenTotalRaw: String(tokenTotalRaw),
+      excludeWallets: Array.isArray(excludeWallets) ? excludeWallets : [],
+      ...(minTransferLamports != null && { minTransferLamports: BigInt(minTransferLamports) }),
+      earlyUnstakeBps: Number(earlyUnstakeBps || 0),
+      log: (msg, extra) => console.log(JSON.stringify({
+        ts: new Date().toISOString(), tag: 'presale-airdrop', message: msg, snipeId: snipeId || null, ...extra,
+      })),
+    });
+    if (snipeId) {
+      try {
+        const snipe = getSnipe(snipeId);
+        if (snipe) {
+          updateSnipe(snipeId, {
+            presaleAirdrop: out,
+            presaleAirdropRetroactiveAt: new Date().toISOString(),
+          });
+        }
+      } catch { /* non-fatal */ }
+    }
+    res.json({ ok: true, result: out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── Admin: KOL pending-claim management ──────────────────────────────────
 
 app.get('/api/admin/kol-claims', requireAdmin, (req, res) => {
