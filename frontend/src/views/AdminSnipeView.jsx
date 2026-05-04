@@ -624,7 +624,7 @@ function LaunchTab({ adminPk, onLaunched }) {
     const devResult = devLam > 0n ? sim.results[0] : null;
     const snipeResults = devLam > 0n ? sim.results.slice(1) : sim.results;
     const snipeTotal = snipeResults.reduce((acc, r) => acc + r.tokensOut, 0n);
-    const snipeAvgPct = snipeResults.length > 0
+    const sniperAvgPct = snipeResults.length > 0
       ? pctOfSupply(snipeTotal) / snipeResults.length
       : 0;
     return {
