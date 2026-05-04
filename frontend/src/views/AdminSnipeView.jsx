@@ -524,14 +524,16 @@ function LaunchTab({ adminPk, onLaunched }) {
   // Reserved for future per-launch override; the worker also dedupes against
   // its own list (KOL CSV containing the same wallet twice).
   const [kolExcludeWalletsText, setKolExcludeWalletsText] = useState('');
-  // v4 per-position early-unstake bps for KOL allocations (0..9000). Default
-  // 0 = "use pool default (10%)" so the launch endpoint stays compatible
-  // with both pre-v4 and post-v4 programs without a coordinated cutover.
-  // Recommended values once v4 is live: 5000 (50%) / 9000 (90%) — KOL
-  // allocations are free and a real cost is the only structural anti-dump
-  // available before the lock expires. 90% on a 1000%-up KOL still leaves
-  // them with a ~110% gain — pain without rug.
-  const [kolEarlyUnstakeBps, setKolEarlyUnstakeBps] = useState(0);
+  // v4 per-position early-unstake penalty for KOL allocations. Stored as
+  // PERCENT (0..90) for friendly UX — converted to bps (0..9000) only at
+  // the moment we serialise the launch payload. 0 = "use pool default
+  // (10%)" so the launch endpoint stays compatible with both pre-v4 and
+  // post-v4 programs without a coordinated cutover. Recommended values
+  // once v4 is live: 50 / 90 — KOL allocations are free and a real cost
+  // is the only structural anti-dump available before the lock expires.
+  // 90% on a 1000%-up KOL still leaves them with a ~110% gain — pain
+  // without rug.
+  const [kolEarlyUnstakePct, setKolEarlyUnstakePct] = useState(0);
 
   // Presale auto-stake (optional). After the launch + KOL carve, the dev
   // wallet's REMAINING bag is distributed pro-rata to wallets that
@@ -549,10 +551,11 @@ function LaunchTab({ adminPk, onLaunched }) {
   );
   const [presaleLockDays, setPresaleLockDays] = useState(7);
   const [presaleMinTransferSol, setPresaleMinTransferSol] = useState('0.01');
-  // 0 = leave at pool default (10%). Same 0..9000 cap as KOL — we typically
-  // run presale at a softer 0-2000 since contributors actually paid for
-  // their tokens, but the field is here for symmetry.
-  const [presaleEarlyUnstakeBps, setPresaleEarlyUnstakeBps] = useState(0);
+  // 0 = leave at pool default (10%). Same 0..90% cap as KOL — we typically
+  // run presale at a softer 0-20% since contributors actually paid for
+  // their tokens, but the field is here for symmetry. Stored as PERCENT
+  // (0..90); converted to bps (0..9000) at payload time.
+  const [presaleEarlyUnstakePct, setPresaleEarlyUnstakePct] = useState(0);
   // Comma/whitespace-separated list of wallets to skip during the scan
   // (in addition to the dev wallet itself, which the server always excludes
   // automatically).
@@ -826,7 +829,8 @@ function LaunchTab({ adminPk, onLaunched }) {
           // v4: bundled with stake_for via set_position_early_unstake_bps in
           // the same tx (push mode) or applied at accept time (pending-claim
           // mode). 0 = use pool default (10%). Capped at 9000 (90%) on-chain.
-          earlyUnstakeBps: Math.max(0, Math.min(9000, Number(kolEarlyUnstakeBps) || 0)),
+          // UI captures percent for friendliness, convert to bps here.
+          earlyUnstakeBps: Math.max(0, Math.min(9000, Math.round((Number(kolEarlyUnstakePct) || 0) * 100))),
         }));
       }
 
@@ -844,7 +848,7 @@ function LaunchTab({ adminPk, onLaunched }) {
           cutoffSignature: presaleCutoffSig.trim(),
           lockDays: Number(presaleLockDays) || 7,
           minTransferSol: Number(presaleMinTransferSol) || 0.01,
-          earlyUnstakeBps: Math.max(0, Math.min(9000, Number(presaleEarlyUnstakeBps) || 0)),
+          earlyUnstakeBps: Math.max(0, Math.min(9000, Math.round((Number(presaleEarlyUnstakePct) || 0) * 100))),
           excludeWallets,
         }));
       }
@@ -900,7 +904,7 @@ function LaunchTab({ adminPk, onLaunched }) {
     } finally {
       setSubmitting(false);
     }
-  }, [adminPk, name, symbol, description, twitter, telegram, website, imageFile, imageUrl, metadataUri, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol, slippageBps, rewardMode, kolEnabled, kolWallets, kolLockDays, kolAllocPct, kolMode, kolClaimWindowDays, kolExcludeWalletsText, kolEarlyUnstakeBps, presaleEnabled, presaleWalletAddr, presaleCutoffSig, presaleLockDays, presaleMinTransferSol, presaleEarlyUnstakeBps, presaleExcludeText, mmEnabled, mmWalletId, mmEntrySol, mmBankrollSol, mmDrawdownPct, mmMinBuySol, mmMaxBuySol, mmMinIntervalSec, mmMaxIntervalSec, mmSlippage, choreoEnabled, choreoAbsorberIds, choreoDevStakePct, choreoDevStakeLockDays, choreoDevSellPct, choreoDevSellDelayBlocks, choreoAbsorberWaveDelayBlocks, choreoAbsorberWaveSize, choreoAbsorberBuyMinSol, choreoAbsorberBuyMaxSol, choreoAbsorberAutoStakePct, choreoAbsorberStakeLockDays, choreoDripWindowSec, choreoDripIntervalMinMs, choreoDripIntervalMaxMs, onLaunched]);
+  }, [adminPk, name, symbol, description, twitter, telegram, website, imageFile, imageUrl, metadataUri, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol, slippageBps, rewardMode, kolEnabled, kolWallets, kolLockDays, kolAllocPct, kolMode, kolClaimWindowDays, kolExcludeWalletsText, kolEarlyUnstakePct, presaleEnabled, presaleWalletAddr, presaleCutoffSig, presaleLockDays, presaleMinTransferSol, presaleEarlyUnstakePct, presaleExcludeText, mmEnabled, mmWalletId, mmEntrySol, mmBankrollSol, mmDrawdownPct, mmMinBuySol, mmMaxBuySol, mmMinIntervalSec, mmMaxIntervalSec, mmSlippage, choreoEnabled, choreoAbsorberIds, choreoDevStakePct, choreoDevStakeLockDays, choreoDevSellPct, choreoDevSellDelayBlocks, choreoAbsorberWaveDelayBlocks, choreoAbsorberWaveSize, choreoAbsorberBuyMinSol, choreoAbsorberBuyMaxSol, choreoAbsorberAutoStakePct, choreoAbsorberStakeLockDays, choreoDripWindowSec, choreoDripIntervalMinMs, choreoDripIntervalMaxMs, onLaunched]);
 
   return (
     <form onSubmit={handleSubmit}>
@@ -1221,32 +1225,37 @@ function LaunchTab({ adminPk, onLaunched }) {
             </div>
 
             {/*
-              v4 KOL early-unstake bps. Per-position override applied via
+              v4 KOL early-unstake penalty. Per-position override applied via
               set_position_early_unstake_bps either bundled with stake_for
-              (push mode) or at accept time (pending-claim). Capped at 50%
-              on-chain. Default 2000 (20%) — KOL allocations are free, so a
-              meaningful penalty is the only thing keeping them locked
-              before they hit unlock.
+              (push mode) or at accept time (pending-claim). Capped at 90%
+              on-chain. UI captures percent (0..90) for friendliness, payload
+              sender converts to bps just before the API call. KOL allocations
+              are free, so a meaningful penalty is the only thing keeping them
+              locked before they hit unlock.
             */}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: 12, marginBottom: 12 }}>
-              <Field label="Early-unstake penalty (bps)">
+              <Field label="Early-unstake penalty (%)">
                 <input
                   type="number"
                   min="0"
-                  max="9000"
-                  step="100"
-                  value={kolEarlyUnstakeBps}
+                  max="90"
+                  step="0.1"
+                  value={kolEarlyUnstakePct}
                   onChange={(e) => {
-                    const n = Math.max(0, Math.min(9000, Number(e.target.value) || 0));
-                    setKolEarlyUnstakeBps(n);
+                    // Allow blank-during-typing without throwing the cursor.
+                    const raw = e.target.value;
+                    if (raw === '') { setKolEarlyUnstakePct(0); return; }
+                    const n = Number(raw);
+                    if (!Number.isFinite(n)) return;
+                    setKolEarlyUnstakePct(Math.max(0, Math.min(90, n)));
                   }}
                   style={inputStyle}
                 />
               </Field>
               <div style={{ alignSelf: 'end', fontSize: 11, color: MUTED, lineHeight: 1.5 }}>
                 Override the pool default (10%) for the KOL positions only.
-                {' '}<strong style={{ color: INK }}>{(kolEarlyUnstakeBps / 100).toFixed(2)}%</strong>{' '}
-                penalty if a KOL unstakes before lock end. Capped at 90% (9000 bps).
+                {' '}<strong style={{ color: INK }}>{Number(kolEarlyUnstakePct).toFixed(2)}%</strong>{' '}
+                penalty if a KOL unstakes before lock end. Capped at 90% on-chain.
                 Penalty redistributes pro-rata to remaining stakers via the stake-mint reward line.
                 Set <code>0</code> to inherit the pool default.
               </div>
@@ -1337,11 +1346,11 @@ function LaunchTab({ adminPk, onLaunched }) {
               <div style={{ fontSize: 11, color: MUTED, padding: 8, background: '#f9fafb', borderRadius: 6 }}>
                 {kolMode === 'pending-claim' ? (
                   <>
-                    Will earmark <strong style={{ color: INK }}>{kolAllocPct}%</strong> of the dev wallet's post-bundle bag, split <strong style={{ color: INK }}>equally</strong> across <strong style={{ color: INK }}>{kolWallets.length} wallets</strong>. Each KOL has <strong style={{ color: INK }}>{kolClaimWindowDays} days</strong> to sign an accept message; on accept their position is locked <strong style={{ color: INK }}>{kolLockDays} days</strong> with a <strong style={{ color: INK }}>{(kolEarlyUnstakeBps / 100).toFixed(2)}% early-unstake penalty</strong>{kolEarlyUnstakeBps === 0 && ' (pool default)'}. Unclaimed slots auto-expire and revert to the dev — no on-chain action either way.
+                    Will earmark <strong style={{ color: INK }}>{kolAllocPct}%</strong> of the dev wallet's post-bundle bag, split <strong style={{ color: INK }}>equally</strong> across <strong style={{ color: INK }}>{kolWallets.length} wallets</strong>. Each KOL has <strong style={{ color: INK }}>{kolClaimWindowDays} days</strong> to sign an accept message; on accept their position is locked <strong style={{ color: INK }}>{kolLockDays} days</strong> with a <strong style={{ color: INK }}>{Number(kolEarlyUnstakePct).toFixed(2)}% early-unstake penalty</strong>{Number(kolEarlyUnstakePct) === 0 && ' (pool default)'}. Unclaimed slots auto-expire and revert to the dev — no on-chain action either way.
                   </>
                 ) : (
                   <>
-                    Will create <strong style={{ color: INK }}>{kolWallets.length} stake positions</strong> across <strong style={{ color: INK }}>{Math.ceil(kolWallets.length / (kolEarlyUnstakeBps > 0 ? 1 : 2))} txs</strong>, locked for <strong style={{ color: INK }}>{kolLockDays} days</strong> with a <strong style={{ color: INK }}>{(kolEarlyUnstakeBps / 100).toFixed(2)}% early-unstake penalty</strong>{kolEarlyUnstakeBps === 0 && ' (pool default)'}, using <strong style={{ color: INK }}>{kolAllocPct}%</strong> of the dev wallet's post-bundle bag (equal split, no consent required).
+                    Will create <strong style={{ color: INK }}>{kolWallets.length} stake positions</strong> across <strong style={{ color: INK }}>{Math.ceil(kolWallets.length / (Number(kolEarlyUnstakePct) > 0 ? 1 : 2))} txs</strong>, locked for <strong style={{ color: INK }}>{kolLockDays} days</strong> with a <strong style={{ color: INK }}>{Number(kolEarlyUnstakePct).toFixed(2)}% early-unstake penalty</strong>{Number(kolEarlyUnstakePct) === 0 && ' (pool default)'}, using <strong style={{ color: INK }}>{kolAllocPct}%</strong> of the dev wallet's post-bundle bag (equal split, no consent required).
                   </>
                 )}
               </div>
@@ -1403,16 +1412,19 @@ function LaunchTab({ adminPk, onLaunched }) {
                   style={inputStyle}
                 />
               </Field>
-              <Field label="Early-unstake penalty (bps)" hint="0..9000 (90%). 0 = leave at pool default of 10%. For paid-in-SOL contributors a soft 0-2000 is typical; KOL slices use a much higher cap.">
+              <Field label="Early-unstake penalty (%)" hint="0..90 (capped on-chain at 90%). 0 = leave at pool default of 10%. For paid-in-SOL contributors a soft 0-20% is typical; KOL slices use a much higher cap.">
                 <input
                   type="number"
-                  step="100"
+                  step="0.1"
                   min="0"
-                  max="9000"
-                  value={presaleEarlyUnstakeBps}
+                  max="90"
+                  value={presaleEarlyUnstakePct}
                   onChange={(e) => {
-                    const n = Math.max(0, Math.min(9000, Number(e.target.value) || 0));
-                    setPresaleEarlyUnstakeBps(n);
+                    const raw = e.target.value;
+                    if (raw === '') { setPresaleEarlyUnstakePct(0); return; }
+                    const n = Number(raw);
+                    if (!Number.isFinite(n)) return;
+                    setPresaleEarlyUnstakePct(Math.max(0, Math.min(90, n)));
                   }}
                   style={inputStyle}
                 />
@@ -1446,9 +1458,9 @@ function LaunchTab({ adminPk, onLaunched }) {
               then split <strong style={{ color: INK }}>{kolEnabled ? `${100 - kolAllocPct}%` : '100%'}</strong> of the dev's
               post-bundle bag pro-rata across contributors. Each position is locked{' '}
               <strong style={{ color: INK }}>{presaleLockDays} days</strong> with a{' '}
-              <strong style={{ color: INK }}>{(presaleEarlyUnstakeBps / 100).toFixed(2)}%</strong>{' '}
+              <strong style={{ color: INK }}>{Number(presaleEarlyUnstakePct).toFixed(2)}%</strong>{' '}
               early-unstake penalty
-              {presaleEarlyUnstakeBps === 0 && ' (pool default)'}.
+              {Number(presaleEarlyUnstakePct) === 0 && ' (pool default)'}.
             </div>
           </>
         )}
