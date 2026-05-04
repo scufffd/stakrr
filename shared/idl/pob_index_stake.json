@@ -850,6 +850,56 @@
       ]
     },
     {
+      "name": "set_position_early_unstake_bps",
+      "docs": [
+        "Authority-gated per-position early-unstake penalty override.",
+        "Lets the platform configure differentiated penalties per attribution",
+        "category (presale vs KOL vs organic) without redeploying. Capped at",
+        "`MAX_EARLY_UNSTAKE_BPS` (50%). See",
+        "`set_position_early_unstake_bps.rs` for the full rationale."
+      ],
+      "discriminator": [
+        128,
+        214,
+        39,
+        37,
+        76,
+        7,
+        180,
+        51
+      ],
+      "accounts": [
+        {
+          "name": "pool",
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "position",
+          "docs": [
+            "The position whose override is being mutated. Must belong to `pool`.",
+            "Re-asserts non-closed because a closed position is rent-reclaimed; we",
+            "don't want to dirty-write to a soon-to-be-zero account."
+          ],
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "pool"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "bps",
+          "type": "u16"
+        }
+      ]
+    },
+    {
       "name": "stake",
       "discriminator": [
         206,
@@ -1394,6 +1444,19 @@
       ]
     },
     {
+      "name": "PositionEarlyUnstakeBpsChanged",
+      "discriminator": [
+        9,
+        88,
+        63,
+        27,
+        236,
+        237,
+        2,
+        253
+      ]
+    },
+    {
       "name": "RewardMintAdminReset",
       "discriminator": [
         28,
@@ -1565,6 +1628,16 @@
       "code": 6015,
       "name": "InsufficientVaultForRedistribute",
       "msg": "Vault balance is less than the post-bump outstanding entitlement; specified amount exceeds the true orphan"
+    },
+    {
+      "code": 6016,
+      "name": "EarlyUnstakeBpsTooHigh",
+      "msg": "Early-unstake bps override exceeds the protocol-level safety cap (50%)"
+    },
+    {
+      "code": 6017,
+      "name": "PositionAlreadyClosed",
+      "msg": "Cannot modify a closed position"
     }
   ],
   "types": [
@@ -1720,6 +1793,30 @@
           {
             "name": "new_paused",
             "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PositionEarlyUnstakeBpsChanged",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "position",
+            "type": "pubkey"
+          },
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "old_bps",
+            "type": "u16"
+          },
+          {
+            "name": "new_bps",
+            "type": "u16"
           }
         ]
       }
@@ -2144,6 +2241,15 @@
           {
             "name": "pool_total_effective_after",
             "type": "u128"
+          },
+          {
+            "name": "penalty_bps_applied",
+            "docs": [
+              "v4: the bps actually applied to the principal (resolved via",
+              "`effective_early_unstake_bps`). Older clients ignore this field; new",
+              "indexers can use it to break out per-attribution-category fee revenue."
+            ],
+            "type": "u32"
           }
         ]
       }

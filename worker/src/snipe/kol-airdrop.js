@@ -26,6 +26,7 @@ import {
   fetchPool,
   fetchRewardMint,
   primeCheckpointIx,
+  setPositionEarlyUnstakeBpsIx,
   stakeForIx,
 } from '../stake-program.js';
 import { signAndPollConfirm } from '../confirm.js';
@@ -35,7 +36,12 @@ import { createPendingClaims } from '../kol-claims.js';
 
 // Fits 2 (stake_for + prime_checkpoint × N rewardMints) per tx safely under
 // the 1232 byte versioned-tx ceiling, with compute-budget ix overhead.
+// When a per-position early-unstake bps override is also being written, each
+// beneficiary adds an extra `set_position_early_unstake_bps` ix (~120 bytes,
+// 3 accounts) — we drop the batch size to 1 in that case via
+// `BENEFICIARIES_PER_TX_WITH_OVERRIDE` to stay safely under the ceiling.
 const BENEFICIARIES_PER_TX = 2;
+const BENEFICIARIES_PER_TX_WITH_OVERRIDE = 1;
 
 function priorityFeeIx() {
   const micro = config.priorityFeeMicroLamports;
@@ -206,6 +212,15 @@ export async function runKolAirdrop({
   claimWindowDays = 30,  // pending-claim: how long the KOL has to accept.
   excludeWallets = [],   // strip wallets that are also presale contributors
                          // (or any other dedupe upstream wants to apply)
+  earlyUnstakeBps = 0,   // v4 per-position penalty override (0..5000).
+                         // 0 = use pool default (10%).
+                         // - push mode: appended via set_position_early_unstake_bps
+                         //   ix immediately after each stake_for in the same tx.
+                         // - pending-claim mode: persisted on the pending row;
+                         //   applied at accept-time by the API handler.
+                         // The dev wallet's vault keypair must be the pool
+                         //   authority (in stealth-launch flow it always is —
+                         //   initialize_pool was signed by the same vault).
   launchSnipeId = null,  // back-link for admin reporting on pending claims
   log = () => {},
 }) {
@@ -215,6 +230,7 @@ export async function runKolAirdrop({
   if (mode !== 'push' && mode !== 'pending-claim') {
     throw new Error(`runKolAirdrop: invalid mode ${mode} (expected 'push' or 'pending-claim')`);
   }
+  const bpsOverride = Math.max(0, Math.min(5000, Number(earlyUnstakeBps || 0)));
 
   // Dedupe within the KOL list itself, then drop any wallet that's already
   // a presale contributor (caller passes `excludeWallets`). Empty result
@@ -293,6 +309,7 @@ export async function runKolAirdrop({
       devWalletId,
       stakeLockDays: Number(lockDays),
       claimWindowDays: Number(claimWindowDays),
+      earlyUnstakeBps: bpsOverride,
       launchSnipeId,
       label: a.label || null,
     }));
@@ -331,6 +348,7 @@ export async function runKolAirdrop({
         tokensEarmarkedRaw: tokensTotalEarmarked.toString(),
         lockDays: Number(lockDays),
         claimWindowDays: Number(claimWindowDays),
+        earlyUnstakeBps: bpsOverride,
         rewardMints: [],
       },
     };
@@ -346,13 +364,20 @@ export async function runKolAirdrop({
     throw new Error(`no reward mint registered for pool ${stakeMint.toBase58()}`);
   }
 
+  // When we're going to append a `set_position_early_unstake_bps` ix per
+  // beneficiary, drop the batch size so we stay safely under 1232 bytes.
+  const beneficiariesPerTx = bpsOverride > 0
+    ? BENEFICIARIES_PER_TX_WITH_OVERRIDE
+    : BENEFICIARIES_PER_TX;
+
   const batches = [];
-  for (let bi = 0; bi < allocations.length; bi += BENEFICIARIES_PER_TX) {
-    const slice = allocations.slice(bi, bi + BENEFICIARIES_PER_TX);
+  for (let bi = 0; bi < allocations.length; bi += beneficiariesPerTx) {
+    const slice = allocations.slice(bi, bi + beneficiariesPerTx);
     const tx = new Transaction();
     const fee = priorityFeeIx();
     if (fee) tx.add(fee);
-    // Bump compute since each beneficiary adds 2-3 invokes.
+    // Bump compute since each beneficiary adds 2-3 invokes (plus +1 ix when
+    // a per-position bps override is being written).
     tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 600_000 }));
 
     const meta = [];
@@ -370,6 +395,22 @@ export async function runKolAirdrop({
         nonce,
       });
       tx.add(sf.ix);
+
+      // v4: optional per-position early-unstake penalty override. Bundled in
+      // the SAME tx as stake_for so the override is atomic with the position
+      // creation — if either ix fails, neither lands. Authority is the dev
+      // wallet (which is also pool.authority on every Stakrr-launched pool).
+      if (bpsOverride > 0) {
+        const sb = await setPositionEarlyUnstakeBpsIx({
+          connection,
+          authority: devPk,
+          stakeMint,
+          position: sf.position,
+          bps: bpsOverride,
+        });
+        tx.add(sb.ix);
+      }
+
       for (const rewardMint of rewardMints) {
         const pc = await primeCheckpointIx({
           connection,
@@ -388,6 +429,7 @@ export async function runKolAirdrop({
         weight: a.weight,
         nonce: nonce.toString(),
         position: sf.position.toBase58(),
+        earlyUnstakeBps: bpsOverride,
       });
 
       // KOL airdrop recipients didn't visit our UI — default to auto-push so
@@ -437,6 +479,7 @@ export async function runKolAirdrop({
       tokensAllocatedRaw: allocRaw.toString(),
       tokensSentRaw: tokensTotalSent.toString(),
       lockDays: Number(lockDays),
+      earlyUnstakeBps: bpsOverride,
       rewardMints: rewardMints.map((m) => m.toBase58()),
     },
   };

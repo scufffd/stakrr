@@ -515,6 +515,13 @@ function LaunchTab({ adminPk, onLaunched }) {
   // Reserved for future per-launch override; the worker also dedupes against
   // its own list (KOL CSV containing the same wallet twice).
   const [kolExcludeWalletsText, setKolExcludeWalletsText] = useState('');
+  // v4 per-position early-unstake bps for KOL allocations (0..5000). Default
+  // 0 = "use pool default (10%)" so the launch endpoint stays compatible
+  // with both pre-v4 and post-v4 programs without a coordinated cutover.
+  // Recommended values once v4 is live: 2000 (20%) / 3000 (30%) — KOL
+  // allocations are free and a real cost is the only structural anti-dump
+  // available before the lock expires.
+  const [kolEarlyUnstakeBps, setKolEarlyUnstakeBps] = useState(0);
 
   // MM seed bootstrap (optional). MM wallet buys at creator price as part
   // of the launch bundle, then the daemon picks the mint up automatically
@@ -744,6 +751,10 @@ function LaunchTab({ adminPk, onLaunched }) {
           equalSplit: true,
           claimWindowDays: Number(kolClaimWindowDays) || 30,
           excludeWallets,
+          // v4: bundled with stake_for via set_position_early_unstake_bps in
+          // the same tx (push mode) or applied at accept time (pending-claim
+          // mode). 0 = use pool default (10%). Capped at 5000 (50%) on-chain.
+          earlyUnstakeBps: Math.max(0, Math.min(5000, Number(kolEarlyUnstakeBps) || 0)),
         }));
       }
 
@@ -798,7 +809,7 @@ function LaunchTab({ adminPk, onLaunched }) {
     } finally {
       setSubmitting(false);
     }
-  }, [adminPk, name, symbol, description, twitter, telegram, website, imageFile, imageUrl, metadataUri, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol, slippageBps, rewardMode, kolEnabled, kolWallets, kolLockDays, kolAllocPct, kolMode, kolClaimWindowDays, kolExcludeWalletsText, mmEnabled, mmWalletId, mmEntrySol, mmBankrollSol, mmDrawdownPct, mmMinBuySol, mmMaxBuySol, mmMinIntervalSec, mmMaxIntervalSec, mmSlippage, choreoEnabled, choreoAbsorberIds, choreoDevStakePct, choreoDevStakeLockDays, choreoDevSellPct, choreoDevSellDelayBlocks, choreoAbsorberWaveDelayBlocks, choreoAbsorberWaveSize, choreoAbsorberBuyMinSol, choreoAbsorberBuyMaxSol, choreoAbsorberAutoStakePct, choreoAbsorberStakeLockDays, choreoDripWindowSec, choreoDripIntervalMinMs, choreoDripIntervalMaxMs, onLaunched]);
+  }, [adminPk, name, symbol, description, twitter, telegram, website, imageFile, imageUrl, metadataUri, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol, slippageBps, rewardMode, kolEnabled, kolWallets, kolLockDays, kolAllocPct, kolMode, kolClaimWindowDays, kolExcludeWalletsText, kolEarlyUnstakeBps, mmEnabled, mmWalletId, mmEntrySol, mmBankrollSol, mmDrawdownPct, mmMinBuySol, mmMaxBuySol, mmMinIntervalSec, mmMaxIntervalSec, mmSlippage, choreoEnabled, choreoAbsorberIds, choreoDevStakePct, choreoDevStakeLockDays, choreoDevSellPct, choreoDevSellDelayBlocks, choreoAbsorberWaveDelayBlocks, choreoAbsorberWaveSize, choreoAbsorberBuyMinSol, choreoAbsorberBuyMaxSol, choreoAbsorberAutoStakePct, choreoAbsorberStakeLockDays, choreoDripWindowSec, choreoDripIntervalMinMs, choreoDripIntervalMaxMs, onLaunched]);
 
   return (
     <form onSubmit={handleSubmit}>
@@ -1064,6 +1075,38 @@ function LaunchTab({ adminPk, onLaunched }) {
               </Field>
             </div>
 
+            {/*
+              v4 KOL early-unstake bps. Per-position override applied via
+              set_position_early_unstake_bps either bundled with stake_for
+              (push mode) or at accept time (pending-claim). Capped at 50%
+              on-chain. Default 2000 (20%) — KOL allocations are free, so a
+              meaningful penalty is the only thing keeping them locked
+              before they hit unlock.
+            */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: 12, marginBottom: 12 }}>
+              <Field label="Early-unstake penalty (bps)">
+                <input
+                  type="number"
+                  min="0"
+                  max="5000"
+                  step="100"
+                  value={kolEarlyUnstakeBps}
+                  onChange={(e) => {
+                    const n = Math.max(0, Math.min(5000, Number(e.target.value) || 0));
+                    setKolEarlyUnstakeBps(n);
+                  }}
+                  style={inputStyle}
+                />
+              </Field>
+              <div style={{ alignSelf: 'end', fontSize: 11, color: MUTED, lineHeight: 1.5 }}>
+                Override the pool default (10%) for the KOL positions only.
+                {' '}<strong style={{ color: INK }}>{(kolEarlyUnstakeBps / 100).toFixed(2)}%</strong>{' '}
+                penalty if a KOL unstakes before lock end. Capped at 50% (5000 bps).
+                Penalty redistributes pro-rata to remaining stakers via the stake-mint reward line.
+                Set <code>0</code> to inherit the pool default.
+              </div>
+            </div>
+
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
               <Field label="Exclude wallets (optional, dedupe vs presale contributors etc.)">
                 <textarea
@@ -1149,11 +1192,11 @@ function LaunchTab({ adminPk, onLaunched }) {
               <div style={{ fontSize: 11, color: MUTED, padding: 8, background: '#f9fafb', borderRadius: 6 }}>
                 {kolMode === 'pending-claim' ? (
                   <>
-                    Will earmark <strong style={{ color: INK }}>{kolAllocPct}%</strong> of the dev wallet's post-bundle bag, split <strong style={{ color: INK }}>equally</strong> across <strong style={{ color: INK }}>{kolWallets.length} wallets</strong>. Each KOL has <strong style={{ color: INK }}>{kolClaimWindowDays} days</strong> to sign an accept message; on accept their position is locked <strong style={{ color: INK }}>{kolLockDays} days</strong>. Unclaimed slots auto-expire and revert to the dev — no on-chain action either way.
+                    Will earmark <strong style={{ color: INK }}>{kolAllocPct}%</strong> of the dev wallet's post-bundle bag, split <strong style={{ color: INK }}>equally</strong> across <strong style={{ color: INK }}>{kolWallets.length} wallets</strong>. Each KOL has <strong style={{ color: INK }}>{kolClaimWindowDays} days</strong> to sign an accept message; on accept their position is locked <strong style={{ color: INK }}>{kolLockDays} days</strong> with a <strong style={{ color: INK }}>{(kolEarlyUnstakeBps / 100).toFixed(2)}% early-unstake penalty</strong>{kolEarlyUnstakeBps === 0 && ' (pool default)'}. Unclaimed slots auto-expire and revert to the dev — no on-chain action either way.
                   </>
                 ) : (
                   <>
-                    Will create <strong style={{ color: INK }}>{kolWallets.length} stake positions</strong> across <strong style={{ color: INK }}>{Math.ceil(kolWallets.length / 2)} txs</strong>, locked for <strong style={{ color: INK }}>{kolLockDays} days</strong>, using <strong style={{ color: INK }}>{kolAllocPct}%</strong> of the dev wallet's post-bundle bag (equal split, no consent required).
+                    Will create <strong style={{ color: INK }}>{kolWallets.length} stake positions</strong> across <strong style={{ color: INK }}>{Math.ceil(kolWallets.length / (kolEarlyUnstakeBps > 0 ? 1 : 2))} txs</strong>, locked for <strong style={{ color: INK }}>{kolLockDays} days</strong> with a <strong style={{ color: INK }}>{(kolEarlyUnstakeBps / 100).toFixed(2)}% early-unstake penalty</strong>{kolEarlyUnstakeBps === 0 && ' (pool default)'}, using <strong style={{ color: INK }}>{kolAllocPct}%</strong> of the dev wallet's post-bundle bag (equal split, no consent required).
                   </>
                 )}
               </div>

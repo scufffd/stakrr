@@ -97,6 +97,12 @@ export default function AdminPresaleView({ adminWallets = [] }) {
   const [lockDays, setLockDays] = useState(3);
   const [excludeRaw, setExcludeRaw] = useState('');
   const [minTransferSol, setMinTransferSol] = useState('0.01');
+  // v4: optional per-position early-unstake bps override for the auto-staked
+  // presale positions. Empty string = no override (use pool default 10%).
+  // Numeric value 0..5000 (capped at 50% by the on-chain program).
+  // Bundled in the same browser-signed tx as stake_for, so applying it costs
+  // nothing extra in user friction (one signature for both ixs).
+  const [earlyUnstakeBpsStr, setEarlyUnstakeBpsStr] = useState('');
 
   // Live progress state for the chained pipeline.
   const [phase, setPhase] = useState('idle'); // idle | scanning | preparing | signing | sending | done | error
@@ -138,6 +144,29 @@ export default function AdminPresaleView({ adminWallets = [] }) {
     return Math.round(n * 1e9);
   }
 
+  /**
+   * Parse the early-unstake bps input. Empty / whitespace = "no override".
+   * Returns either an integer 0..5000 or `null` (omit from payload).
+   * Throws (caller catches in validation) if the value is non-numeric or
+   * outside the allowed range. Accepts either basis-points (e.g. 500 for 5%)
+   * or a percent value with a trailing `%` (e.g. `5%`).
+   */
+  function parseEarlyUnstakeBps(raw) {
+    const s = String(raw || '').trim();
+    if (!s) return null;
+    const isPct = s.endsWith('%');
+    const numStr = isPct ? s.slice(0, -1).trim() : s;
+    const n = Number(numStr);
+    if (!Number.isFinite(n) || n < 0) {
+      throw new Error('Early-unstake penalty must be a non-negative number');
+    }
+    const bps = Math.round(isPct ? n * 100 : n);
+    if (bps > 5000) {
+      throw new Error('Early-unstake penalty capped at 50% (5000 bps)');
+    }
+    return bps;
+  }
+
   async function adminFetch(path, body) {
     const res = await fetch(apiUrl(path), {
       method: 'POST',
@@ -166,6 +195,8 @@ export default function AdminPresaleView({ adminWallets = [] }) {
     if (!VALID_LOCK_DAYS.includes(Number(lockDays))) {
       throw new Error('Lock duration must be one of 1, 3, 7, 14, 21, 30');
     }
+    // Re-uses parseEarlyUnstakeBps so the same validation message wins.
+    parseEarlyUnstakeBps(earlyUnstakeBpsStr);
   }
 
   // --- Chained pipeline -----------------------------------------------------
@@ -213,6 +244,7 @@ export default function AdminPresaleView({ adminWallets = [] }) {
 
       setPhase('preparing');
       appendLog(`Preparing ${scan.contributorCount} stake_for instructions...`);
+      const earlyBps = parseEarlyUnstakeBps(earlyUnstakeBpsStr);
       const prep = await adminFetch('/api/admin/presale/auto-stake-prepare', {
         mint,
         devWallet: wallet.publicKey.toBase58(),
@@ -222,6 +254,7 @@ export default function AdminPresaleView({ adminWallets = [] }) {
         tokenTotalRaw: bag.ataBalanceRaw,
         excludeWallets: getExcludeWallets(),
         minTransferLamports: String(minTransferLamports()),
+        ...(earlyBps != null && { earlyUnstakeBps: earlyBps }),
       });
       setPrepared(prep);
       appendLog(
@@ -410,6 +443,32 @@ export default function AdminPresaleView({ adminWallets = [] }) {
               onChange={(e) => setExcludeRaw(e.target.value)}
               placeholder="optional — extra wallets to skip (e.g. team / treasury / market-maker)"
             />
+          </div>
+
+          {/*
+            v4 per-position early-unstake penalty override. Empty = leave at
+            the pool default (10%). Bundled with stake_for in the same browser
+            signature, so applying it costs zero additional UX friction. Cap
+            of 5000 bps is enforced both client-side (this function) and
+            on-chain (MAX_EARLY_UNSTAKE_BPS).
+          */}
+          <div>
+            <label style={labelStyle}>
+              Early-unstake penalty override · presale positions <span style={{ color: SUB, fontWeight: 400 }}>(optional)</span>
+            </label>
+            <input
+              style={inputStyle}
+              value={earlyUnstakeBpsStr}
+              onChange={(e) => setEarlyUnstakeBpsStr(e.target.value)}
+              placeholder="leave blank for pool default (10%) · e.g. 500 for 5% or '5%' for 5%"
+              inputMode="decimal"
+            />
+            <div style={{ marginTop: 6, fontSize: 11.5, color: SUB, lineHeight: 1.5 }}>
+              Applied to <strong>presale-staked positions only</strong> when a contributor unstakes
+              before their lock expires. Penalty redistributes to remaining stakers via the
+              stake-mint reward line. Capped at 50% (5000 bps). Existing stakes from prior
+              launches are unaffected.
+            </div>
           </div>
         </div>
 

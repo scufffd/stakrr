@@ -75,7 +75,12 @@ import {
   summariseClaimsForMint,
   updateClaim,
 } from './kol-claims.js';
-import { detectTokenProgram, primeCheckpointIx, stakeForIx } from './stake-program.js';
+import {
+  detectTokenProgram,
+  primeCheckpointIx,
+  setPositionEarlyUnstakeBpsIx,
+  stakeForIx,
+} from './stake-program.js';
 import { signAndPollConfirm } from './confirm.js';
 import { getKeypairById } from './snipe/wallet-vault.js';
 import { ComputeBudgetProgram, Transaction } from '@solana/web3.js';
@@ -424,6 +429,27 @@ app.post('/api/kol-claims/:claimId/accept', async (req, res) => {
     }
     tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 600_000 }));
     tx.add(sf.ix);
+
+    // v4: apply the per-position early-unstake bps that was set when the
+    // pending claim was created. Bundled in the same tx as stake_for so the
+    // override is atomic with the position. The dev wallet IS pool.authority
+    // for every Stakrr-launched pool, so the existing devKp signature
+    // covers this ix without a second signer. `bps == 0` means "leave at
+    // pool default" — we skip the ix entirely in that case to save CU and
+    // bytes (5k CU + ~120 bytes per skipped ix; matters when the KOL has
+    // many reward lines to prime).
+    const claimBps = Math.max(0, Math.min(5000, Number(claim.earlyUnstakeBps || 0)));
+    if (claimBps > 0) {
+      const sb = await setPositionEarlyUnstakeBpsIx({
+        connection,
+        authority: devPk,
+        stakeMint,
+        position: sf.position,
+        bps: claimBps,
+      });
+      tx.add(sb.ix);
+    }
+
     for (const rewardMint of rewardMints) {
       const pc = await primeCheckpointIx({
         connection,
@@ -536,6 +562,10 @@ app.post('/api/admin/presale/auto-stake-prepare', requireAdmin, async (req, res)
       tokenTotalRaw,
       excludeWallets,
       minTransferLamports,
+      // v4: optional per-position early-unstake bps override (0..5000).
+      // Bundled with stake_for in the same browser-signed tx so the dev
+      // wallet's single signature applies both ixs.
+      earlyUnstakeBps,
     } = req.body || {};
     if (!mint || !devWallet || !presaleWallet || !cutoffSignature || !lockDays || !tokenTotalRaw) {
       return res.status(400).json({
@@ -552,6 +582,7 @@ app.post('/api/admin/presale/auto-stake-prepare', requireAdmin, async (req, res)
       tokenTotalRaw,
       excludeWallets: Array.isArray(excludeWallets) ? excludeWallets : [],
       ...(minTransferLamports != null && { minTransferLamports: BigInt(minTransferLamports) }),
+      ...(earlyUnstakeBps != null && { earlyUnstakeBps: Number(earlyUnstakeBps) }),
     });
     res.json({ ok: true, ...result });
   } catch (e) {
@@ -782,6 +813,16 @@ app.post('/api/admin/snipe/launch', requireAdmin, requireVault, upload.single('i
           lockDays: Number(parsed.lockDays) || 7,
           tokenAllocationPct: parsed.tokenAllocationPct != null ? Number(parsed.tokenAllocationPct) : undefined,
           tokenAllocationRaw: parsed.tokenAllocationRaw || undefined,
+          // Forward the full orchestrator config — defaults handled downstream
+          // by runKolAirdrop. Keep undefined when not provided so the
+          // orchestrator's `|| default` patterns kick in cleanly.
+          mode: parsed.mode === 'push' ? 'push' : 'pending-claim',
+          equalSplit: parsed.equalSplit !== false,
+          claimWindowDays: parsed.claimWindowDays != null ? Number(parsed.claimWindowDays) : undefined,
+          excludeWallets: Array.isArray(parsed.excludeWallets) ? parsed.excludeWallets : [],
+          // v4 per-position early-unstake bps override (0..5000). 0 = leave at
+          // pool default. Strong anti-dump knob for free KOL allocations.
+          earlyUnstakeBps: parsed.earlyUnstakeBps != null ? Number(parsed.earlyUnstakeBps) : 0,
         };
       }
     }
@@ -1048,6 +1089,7 @@ app.post('/api/admin/snipe/kol/run', requireAdmin, requireVault, async (req, res
       equalSplit,           // bool, default true
       claimWindowDays,      // pending-claim window length, default 30
       excludeWallets,       // dedupe against presale contributors etc.
+      earlyUnstakeBps,      // v4: per-position penalty override (0..5000)
     } = req.body || {};
     if (!mint || !devWalletId || !Array.isArray(wallets) || wallets.length === 0) {
       return res.status(400).json({ ok: false, error: 'mint, devWalletId, wallets[] required' });
@@ -1064,6 +1106,7 @@ app.post('/api/admin/snipe/kol/run', requireAdmin, requireVault, async (req, res
       equalSplit: equalSplit !== false,
       claimWindowDays: Number(claimWindowDays) || 30,
       excludeWallets: Array.isArray(excludeWallets) ? excludeWallets : [],
+      earlyUnstakeBps: Number(earlyUnstakeBps || 0),
       launchSnipeId: snipeId || null,
       log: (msg, extra) => console.log(JSON.stringify({
         ts: new Date().toISOString(), tag: 'kol-airdrop', message: msg, snipeId: snipeId || null, ...extra,

@@ -19,6 +19,7 @@ import {
   fetchPool,
   fetchRewardMint,
   primeCheckpointIx,
+  setPositionEarlyUnstakeBpsIx,
   stakeForIx,
 } from './stake-program.js';
 import { allocateAllocations, scanPresaleContributions } from './presale-scan.js';
@@ -28,7 +29,13 @@ import { ensureAutoPushDefault } from './user-prefs.js';
 // unique accounts; 2 beneficiaries fits comfortably under the 1232 byte
 // versioned-tx ceiling with a compute budget ix added. Bump only after
 // measuring actual serialized size on mainnet.
+//
+// When a per-position early-unstake bps override is also being written, each
+// beneficiary adds an extra `set_position_early_unstake_bps` ix (~120 bytes,
+// 3 accounts) — drop the batch size to 1 in that case so we stay under the
+// versioned-tx ceiling.
 const BENEFICIARIES_PER_TX = 2;
+const BENEFICIARIES_PER_TX_WITH_OVERRIDE = 1;
 
 function priorityFeeIx() {
   const micro = config.priorityFeeMicroLamports;
@@ -83,6 +90,12 @@ export async function buildPresaleAutoStakeBatches({
   tokenTotalRaw,
   excludeWallets = [],
   minTransferLamports,
+  earlyUnstakeBps = 0,        // v4: per-position penalty override (0..5000).
+                              // Bundled via set_position_early_unstake_bps in
+                              // the SAME tx as stake_for, signed by the same
+                              // browser wallet (dev = pool.authority on every
+                              // Stakrr-launched pool). 0 = leave at the pool
+                              // default (10%).
 }) {
   const connection = getConnection();
   const stakeMint = new PublicKey(mint);
@@ -142,9 +155,14 @@ export async function buildPresaleAutoStakeBatches({
 
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
 
+  const bpsOverride = Math.max(0, Math.min(5000, Number(earlyUnstakeBps || 0)));
+  const beneficiariesPerTx = bpsOverride > 0
+    ? BENEFICIARIES_PER_TX_WITH_OVERRIDE
+    : BENEFICIARIES_PER_TX;
+
   const batches = [];
-  for (let bi = 0; bi < allocs.length; bi += BENEFICIARIES_PER_TX) {
-    const slice = allocs.slice(bi, bi + BENEFICIARIES_PER_TX);
+  for (let bi = 0; bi < allocs.length; bi += beneficiariesPerTx) {
+    const slice = allocs.slice(bi, bi + beneficiariesPerTx);
     const tx = new Transaction();
     const fee = priorityFeeIx();
     if (fee) tx.add(fee);
@@ -166,6 +184,22 @@ export async function buildPresaleAutoStakeBatches({
       });
       tx.add(sf.ix);
 
+      // v4: optional per-position early-unstake penalty override. Bundled in
+      // the same tx so it's atomic with stake_for. The dev wallet is
+      // pool.authority on every Stakrr-launched pool, and the dev wallet is
+      // also the browser-side signer of this tx — so no extra signature is
+      // needed.
+      if (bpsOverride > 0) {
+        const sb = await setPositionEarlyUnstakeBpsIx({
+          connection,
+          authority: devPk,
+          stakeMint,
+          position: sf.position,
+          bps: bpsOverride,
+        });
+        tx.add(sb.ix);
+      }
+
       for (const rewardMint of rewardMints) {
         const pc = await primeCheckpointIx({
           connection,
@@ -184,6 +218,7 @@ export async function buildPresaleAutoStakeBatches({
         shareBps: a.shareBps,
         nonce: nonce.toString(),
         position: sf.position.toBase58(),
+        earlyUnstakeBps: bpsOverride,
       });
 
       // Presale beneficiaries didn't visit our UI to opt into staking — they
@@ -224,6 +259,7 @@ export async function buildPresaleAutoStakeBatches({
       lastValidBlockHeight,
       rewardMints: rewardMints.map((m) => m.toBase58()),
       lockDays: Number(lockDays),
+      earlyUnstakeBps: bpsOverride,
     },
     scan,
   };

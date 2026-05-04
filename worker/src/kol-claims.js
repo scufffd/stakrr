@@ -90,6 +90,10 @@ const VALID_STATUSES = new Set(['pending', 'claimed', 'expired', 'revoked']);
  *     devWalletId: string,        // wallet-vault id holding the tokens
  *     stakeLockDays?: number,     // applied to position once claimed
  *     claimWindowDays?: number,   // window for KOL to accept
+ *     earlyUnstakeBps?: number,   // v4 per-position penalty override (0-5000).
+ *                                 // Applied via set_position_early_unstake_bps
+ *                                 // bundled with stake_for at accept time.
+ *                                 // 0 / undefined = use pool default (10%).
  *     launchSnipeId?: string,     // back-link to admin snipe row
  *     label?: string,
  *   }
@@ -106,6 +110,7 @@ export function createPendingClaims(rows) {
     const id = newId();
     const claimWindowDays = Number(r.claimWindowDays || DEFAULT_CLAIM_WINDOW_DAYS);
     const stakeLockDays = Number(r.stakeLockDays || DEFAULT_LOCK_DAYS_AFTER_CLAIM);
+    const earlyUnstakeBps = Math.max(0, Math.min(5000, Number(r.earlyUnstakeBps || 0)));
     const expiresAt = new Date(now.getTime() + claimWindowDays * 86400 * 1000);
     const rec = {
       id,
@@ -116,6 +121,7 @@ export function createPendingClaims(rows) {
       devWalletId: String(r.devWalletId),
       stakeLockDays,
       claimWindowDays,
+      earlyUnstakeBps,
       launchSnipeId: r.launchSnipeId || null,
       label: r.label || null,
       status: 'pending',

@@ -373,6 +373,48 @@ export async function setPausedIx({ connection, authority, stakeMint, paused }) 
 }
 
 /**
+ * v4: Build a `set_position_early_unstake_bps` instruction.
+ *
+ * Pool authority writes a per-position early-unstake penalty override into
+ * `position.reserved[0..2]` (LE u16). The override takes precedence over the
+ * pool default and the global 10% constant when `unstake_early` is called.
+ *
+ * Typical use: bundle this ix immediately after `stake_for` in the same tx so
+ * the override is applied atomically with the stake itself. That's what the
+ * presale-autostake batcher and the KOL airdrop / KOL claim accept flows do
+ * (see `presale-autostake.js`, `snipe/kol-airdrop.js`, server.js KOL accept).
+ *
+ * Constraints:
+ *   - `bps` must be `<= 5000` (50%) — enforced on-chain.
+ *   - `bps == 0` clears the override (revert to pool/global default).
+ *   - Position must not be closed.
+ *   - Authority must equal `pool.authority`.
+ *
+ * Cost: ~3.5k CU and ~120 bytes added to the tx; cheap enough to pair with
+ * stake_for + prime_checkpoint × N without exceeding the 1232-byte tx limit
+ * for typical 1-2 positions per tx batches.
+ */
+export async function setPositionEarlyUnstakeBpsIx({
+  connection,
+  authority,        // Keypair | PublicKey — pool authority
+  stakeMint,
+  position,
+  bps,              // u16, 0..=5000
+}) {
+  const bpsNum = Number(bps);
+  if (!Number.isInteger(bpsNum) || bpsNum < 0 || bpsNum > 5000) {
+    throw new Error(`Invalid early-unstake bps: ${bps} (must be integer 0..5000)`);
+  }
+  const program = loadProgramReadOnly(connection);
+  const pool = findPoolPda(stakeMint);
+  const ix = await program.methods
+    .setPositionEarlyUnstakeBps(bpsNum)
+    .accounts({ pool, position, authority: pubkeyOf(authority) })
+    .instruction();
+  return { ix, pool, position };
+}
+
+/**
  * Drain a reward vault to a recipient ATA. `amount = 0` sweeps everything.
  * Caller must have already created `recipientAta` (use
  * `createAssociatedTokenAccountIdempotentInstruction` if unsure).
