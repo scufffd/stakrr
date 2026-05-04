@@ -29,7 +29,8 @@ import { buildBuyTokenTx } from '../pumpdev.js';
 import { launchBundle, MAX_BUNDLE_TXS } from './jito-bundle.js';
 import { getKeypairById, listWallets, generateWallet, updateWallet } from './wallet-vault.js';
 import { createSnipe, updateSnipe, getSnipe } from './snipe-store.js';
-import { runKolAirdrop } from './kol-airdrop.js';
+import { runKolAirdrop, readDevTokenBalance } from './kol-airdrop.js';
+import { runPresaleAutoStake } from './presale-airdrop.js';
 import { upsertToken as upsertMmToken } from '../mm/store.js';
 import { runDumpAndAbsorb, deriveLaunchSlot } from './choreography.js';
 
@@ -612,59 +613,201 @@ export async function stealthLaunch(params) {
     }
   }
 
-  // Optional KOL airdrop — auto-stake a slice of the dev-buy bag across a
-  // curated KOL wallet list. Runs AFTER pool init confirms so the on-chain
-  // pool exists. Failure here is logged but doesn't roll back the launch
-  // (admin can retry the airdrop separately).
+  // ── Optional KOL airdrop + presale auto-stake ─────────────────────────
+  //
+  // Both run AFTER pool init confirms so the on-chain pool exists. To keep
+  // the carve deterministic (and avoid an ATA re-read race between steps)
+  // we snapshot the dev-buy bag ONCE, compute KOL + presale shares from
+  // the same number, then fire each runner with its pre-allocated raw
+  // amount. KOL gets % off the top, presale gets the remainder pro-rata
+  // to SOL contributed.
+  //
+  // Either step is optional; the snapshot is only taken if at least one
+  // is enabled (avoids a needless RPC for plain "snipe-only" launches).
+  // Both steps are non-fatal — a failure here logs + persists the error
+  // but doesn't roll back the launch, since the on-chain mint + pool are
+  // already live and the admin can retry via the standalone runners.
+
+  const kolEnabled = !!(
+    params.kolAirdrop
+    && Array.isArray(params.kolAirdrop.wallets)
+    && params.kolAirdrop.wallets.length > 0
+  );
+  const presaleEnabled = !!(
+    params.presale
+    && params.presale.presaleWallet
+    && params.presale.cutoffSignature
+  );
+
   let kolResult = null;
-  if (params.kolAirdrop && Array.isArray(params.kolAirdrop.wallets) && params.kolAirdrop.wallets.length > 0) {
+  let presaleResult = null;
+  let bagCarve = null;
+
+  if (kolEnabled || presaleEnabled) {
     try {
-      const kolMode = params.kolAirdrop.mode || 'push';
-      const kolEqualSplit = params.kolAirdrop.equalSplit !== false; // default true
-      log('kol airdrop starting', {
+      const connection = getConnection();
+      const stakeMintPk = new PublicKey(bundle.mint);
+      const devPk = devKeypair.publicKey;
+      const bag = await readDevTokenBalance({ connection, devPubkey: devPk, mintPk: stakeMintPk });
+      const bagRaw = BigInt(bag.amountRaw);
+      if (bagRaw <= 0n) {
+        throw new Error(
+          `dev wallet ${devPk.toBase58()} has 0 tokens of ${bundle.mint} — bundle may not have propagated yet`,
+        );
+      }
+
+      // KOL carve: percent-of-bag off the top. tokenAllocationRaw, if the
+      // caller supplied it, wins over the pct (lets the admin pin an exact
+      // raw amount for testing). Both = 0 → no KOL carve, presale gets the
+      // whole bag.
+      let kolRaw = 0n;
+      if (kolEnabled) {
+        if (params.kolAirdrop.tokenAllocationRaw != null) {
+          kolRaw = BigInt(params.kolAirdrop.tokenAllocationRaw);
+          if (kolRaw > bagRaw) kolRaw = bagRaw;
+        } else {
+          const pct = Math.max(0, Math.min(100, Number(params.kolAirdrop.tokenAllocationPct ?? 25)));
+          kolRaw = (bagRaw * BigInt(pct)) / 100n;
+        }
+      }
+      const presaleRaw = bagRaw - kolRaw;
+
+      bagCarve = {
+        bagRaw: bagRaw.toString(),
+        kolRaw: kolRaw.toString(),
+        presaleRaw: presaleRaw.toString(),
+      };
+      log('bag carve computed', {
         snipeId: snipeRow.id,
         mint: bundle.mint,
-        walletCount: params.kolAirdrop.wallets.length,
-        lockDays: params.kolAirdrop.lockDays,
-        allocationPct: params.kolAirdrop.tokenAllocationPct,
-        mode: kolMode,
-        equalSplit: kolEqualSplit,
-        claimWindowDays: params.kolAirdrop.claimWindowDays,
+        bagRaw: bagCarve.bagRaw,
+        kolRaw: bagCarve.kolRaw,
+        presaleRaw: bagCarve.presaleRaw,
       });
-      kolResult = await runKolAirdrop({
-        mint: bundle.mint,
-        symbol: metadata.symbol,
-        devWalletId,
-        wallets: params.kolAirdrop.wallets,
-        lockDays: params.kolAirdrop.lockDays || 30,
-        tokenAllocationPct: params.kolAirdrop.tokenAllocationPct,
-        tokenAllocationRaw: params.kolAirdrop.tokenAllocationRaw,
-        mode: kolMode,
-        equalSplit: kolEqualSplit,
-        claimWindowDays: params.kolAirdrop.claimWindowDays || 30,
-        excludeWallets: Array.isArray(params.kolAirdrop.excludeWallets) ? params.kolAirdrop.excludeWallets : [],
-        // v4 per-position early-unstake penalty override (0..9000). Strong
-        // anti-dump knob for KOLs whose tokens were free — typical config is
-        // 5000-9000 bps. 0 means "use the pool default of 10%".
-        earlyUnstakeBps: Number(params.kolAirdrop.earlyUnstakeBps || 0),
-        launchSnipeId: snipeRow.id,
-        log: (msg, extra) => log(`kol-airdrop: ${msg}`, { snipeId: snipeRow.id, ...extra }),
-      });
-      updateSnipe(snipeRow.id, { kolAirdrop: kolResult });
-      log('kol airdrop complete', {
-        snipeId: snipeRow.id,
-        mint: bundle.mint,
-        ok: kolResult.ok,
-        mode: kolResult.mode,
-        batches: kolResult.totals.batchCount,
-        wallets: kolResult.totals.walletCount,
-        pendingClaims: kolResult.pendingClaims?.length || 0,
-      });
+      updateSnipe(snipeRow.id, { bagCarve });
+
+      // ── KOL airdrop ───────────────────────────────────────────────────
+      if (kolEnabled && kolRaw > 0n) {
+        try {
+          const kolMode = params.kolAirdrop.mode || 'push';
+          const kolEqualSplit = params.kolAirdrop.equalSplit !== false;
+          log('kol airdrop starting', {
+            snipeId: snipeRow.id,
+            mint: bundle.mint,
+            walletCount: params.kolAirdrop.wallets.length,
+            lockDays: params.kolAirdrop.lockDays,
+            allocationPct: params.kolAirdrop.tokenAllocationPct,
+            allocationRaw: kolRaw.toString(),
+            mode: kolMode,
+            equalSplit: kolEqualSplit,
+            claimWindowDays: params.kolAirdrop.claimWindowDays,
+          });
+          kolResult = await runKolAirdrop({
+            mint: bundle.mint,
+            symbol: metadata.symbol,
+            devWalletId,
+            wallets: params.kolAirdrop.wallets,
+            lockDays: params.kolAirdrop.lockDays || 30,
+            // Always pin the pre-computed raw amount so the carve maths
+            // line up with what we just wrote to bagCarve. The pct is
+            // only used as a fallback when the orchestrator wasn't run
+            // (i.e. someone hits /api/admin/snipe/kol/run directly).
+            tokenAllocationRaw: kolRaw.toString(),
+            mode: kolMode,
+            equalSplit: kolEqualSplit,
+            claimWindowDays: params.kolAirdrop.claimWindowDays || 30,
+            excludeWallets: Array.isArray(params.kolAirdrop.excludeWallets) ? params.kolAirdrop.excludeWallets : [],
+            // v4 per-position early-unstake penalty override (0..9000). Strong
+            // anti-dump knob for KOLs whose tokens were free — typical config
+            // is 5000-9000 bps. 0 means "use the pool default of 10%".
+            earlyUnstakeBps: Number(params.kolAirdrop.earlyUnstakeBps || 0),
+            launchSnipeId: snipeRow.id,
+            log: (msg, extra) => log(`kol-airdrop: ${msg}`, { snipeId: snipeRow.id, ...extra }),
+          });
+          updateSnipe(snipeRow.id, { kolAirdrop: kolResult });
+          log('kol airdrop complete', {
+            snipeId: snipeRow.id,
+            mint: bundle.mint,
+            ok: kolResult.ok,
+            mode: kolResult.mode,
+            batches: kolResult.totals.batchCount,
+            wallets: kolResult.totals.walletCount,
+            pendingClaims: kolResult.pendingClaims?.length || 0,
+          });
+        } catch (e) {
+          log('kol airdrop failed (non-fatal)', { snipeId: snipeRow.id, error: e.message });
+          updateSnipe(snipeRow.id, { kolAirdrop: { ok: false, error: e.message } });
+        }
+      }
+
+      // ── Presale auto-stake ────────────────────────────────────────────
+      // Runs after KOL so any KOL transfers have already left the dev's
+      // ATA. We pre-computed presaleRaw against the snapshot, but we
+      // never want to attempt to stake more than the dev currently holds
+      // (e.g. if a lingering manual transfer drained part of the bag);
+      // re-cap against the live balance just before submitting.
+      if (presaleEnabled && presaleRaw > 0n) {
+        try {
+          const presaleNow = await readDevTokenBalance({
+            connection,
+            devPubkey: devPk,
+            mintPk: stakeMintPk,
+          });
+          let usableRaw = presaleRaw;
+          const liveRaw = BigInt(presaleNow.amountRaw);
+          if (liveRaw < usableRaw) {
+            log('presale-autostake: capped to live balance', {
+              snipeId: snipeRow.id,
+              wantedRaw: usableRaw.toString(),
+              liveRaw: liveRaw.toString(),
+            });
+            usableRaw = liveRaw;
+          }
+          if (usableRaw <= 0n) {
+            log('presale-autostake skipped (live bag empty)', { snipeId: snipeRow.id });
+            presaleResult = { ok: true, skipped: 'empty_after_kol', mode: 'push', totals: {} };
+          } else {
+            log('presale auto-stake starting', {
+              snipeId: snipeRow.id,
+              mint: bundle.mint,
+              presaleWallet: params.presale.presaleWallet,
+              cutoffSignature: params.presale.cutoffSignature,
+              tokenTotalRaw: usableRaw.toString(),
+              lockDays: params.presale.lockDays,
+            });
+            presaleResult = await runPresaleAutoStake({
+              mint: bundle.mint,
+              devWalletId,
+              presaleWallet: params.presale.presaleWallet,
+              cutoffSignature: params.presale.cutoffSignature,
+              lockDays: params.presale.lockDays || 7,
+              tokenTotalRaw: usableRaw.toString(),
+              excludeWallets: Array.isArray(params.presale.excludeWallets) ? params.presale.excludeWallets : [],
+              minTransferLamports: params.presale.minTransferLamports || 10_000_000n,
+              earlyUnstakeBps: Number(params.presale.earlyUnstakeBps || 0),
+              log: (msg, extra) => log(`presale-autostake: ${msg}`, { snipeId: snipeRow.id, ...extra }),
+            });
+            updateSnipe(snipeRow.id, { presaleAirdrop: presaleResult });
+            log('presale auto-stake complete', {
+              snipeId: snipeRow.id,
+              mint: bundle.mint,
+              ok: presaleResult.ok,
+              skipped: presaleResult.skipped || null,
+              contributors: presaleResult.totals?.contributorCount || 0,
+              batches: presaleResult.totals?.batchCount || 0,
+              sentBatches: presaleResult.totals?.sentCount || 0,
+            });
+          }
+        } catch (e) {
+          log('presale auto-stake failed (non-fatal)', { snipeId: snipeRow.id, error: e.message });
+          presaleResult = { ok: false, error: e.message };
+          updateSnipe(snipeRow.id, { presaleAirdrop: presaleResult });
+        }
+      }
     } catch (e) {
-      // Non-fatal — the launch is already complete; admin can retry KOL
-      // airdrop standalone via /api/admin/snipe/kol/run.
-      log('kol airdrop failed (non-fatal)', { snipeId: snipeRow.id, error: e.message });
-      updateSnipe(snipeRow.id, { kolAirdrop: { ok: false, error: e.message } });
+      // Snapshot-level failure (couldn't read the dev bag at all). Still
+      // non-fatal — the on-chain launch already succeeded.
+      log('bag carve failed (non-fatal)', { snipeId: snipeRow.id, error: e.message });
     }
   }
 
@@ -746,6 +889,8 @@ export async function stealthLaunch(params) {
     metadataImageUrl: resolvedImageUrl,
     finalize: finalizeOut,
     kolAirdrop: kolResult,
+    presaleAirdrop: presaleResult,
+    bagCarve,
     mmBootstrap,
     choreography: choreographyResult,
   };

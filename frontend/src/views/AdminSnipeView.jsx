@@ -533,6 +533,31 @@ function LaunchTab({ adminPk, onLaunched }) {
   // them with a ~110% gain — pain without rug.
   const [kolEarlyUnstakeBps, setKolEarlyUnstakeBps] = useState(0);
 
+  // Presale auto-stake (optional). After the launch + KOL carve, the dev
+  // wallet's REMAINING bag is distributed pro-rata to wallets that
+  // contributed SOL to `presaleWallet` since `cutoffSignature`. Server
+  // signs each batch with the dev's vault keypair (same pattern as KOL),
+  // so this happens fully autonomously — no extra browser round-trip.
+  // Defaults match the standalone /admin/presale view so the same
+  // presale round can be wired here without re-typing.
+  const [presaleEnabled, setPresaleEnabled] = useState(false);
+  const [presaleWalletAddr, setPresaleWalletAddr] = useState(
+    'AVhaEWooja5nUuihbYNs1oVDHFb2Y3oAZ3bu6SZApAS4',
+  );
+  const [presaleCutoffSig, setPresaleCutoffSig] = useState(
+    '5ETwZm7w6Si59i4Qirwqo5desoMgFYhqo4vQuFLQGgJ8Xrfvwr3ZCisc7FuDJ8UNP8qerxFFDEFATHXWxr6fXWcS',
+  );
+  const [presaleLockDays, setPresaleLockDays] = useState(7);
+  const [presaleMinTransferSol, setPresaleMinTransferSol] = useState('0.01');
+  // 0 = leave at pool default (10%). Same 0..9000 cap as KOL — we typically
+  // run presale at a softer 0-2000 since contributors actually paid for
+  // their tokens, but the field is here for symmetry.
+  const [presaleEarlyUnstakeBps, setPresaleEarlyUnstakeBps] = useState(0);
+  // Comma/whitespace-separated list of wallets to skip during the scan
+  // (in addition to the dev wallet itself, which the server always excludes
+  // automatically).
+  const [presaleExcludeText, setPresaleExcludeText] = useState('');
+
   // MM seed bootstrap (optional). MM wallet buys at creator price as part
   // of the launch bundle, then the daemon picks the mint up automatically
   // and starts cycling buys/sells with bankroll/drawdown kill switches.
@@ -805,6 +830,25 @@ function LaunchTab({ adminPk, onLaunched }) {
         }));
       }
 
+      if (presaleEnabled && presaleWalletAddr.trim() && presaleCutoffSig.trim()) {
+        // Server adds the dev wallet to the exclude set automatically; we
+        // just forward whatever extras the admin pasted. Empty string
+        // tokenises to an empty array which the server treats as "no
+        // extras", so this is safe to always forward.
+        const excludeWallets = presaleExcludeText
+          .split(/[\s,;\n]+/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        fd.append('presale', JSON.stringify({
+          presaleWallet: presaleWalletAddr.trim(),
+          cutoffSignature: presaleCutoffSig.trim(),
+          lockDays: Number(presaleLockDays) || 7,
+          minTransferSol: Number(presaleMinTransferSol) || 0.01,
+          earlyUnstakeBps: Math.max(0, Math.min(9000, Number(presaleEarlyUnstakeBps) || 0)),
+          excludeWallets,
+        }));
+      }
+
       if (mmEnabled && mmWalletId && Number(mmEntrySol) > 0) {
         fd.append('mm', JSON.stringify({
           walletId: mmWalletId,
@@ -856,7 +900,7 @@ function LaunchTab({ adminPk, onLaunched }) {
     } finally {
       setSubmitting(false);
     }
-  }, [adminPk, name, symbol, description, twitter, telegram, website, imageFile, imageUrl, metadataUri, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol, slippageBps, rewardMode, kolEnabled, kolWallets, kolLockDays, kolAllocPct, kolMode, kolClaimWindowDays, kolExcludeWalletsText, kolEarlyUnstakeBps, mmEnabled, mmWalletId, mmEntrySol, mmBankrollSol, mmDrawdownPct, mmMinBuySol, mmMaxBuySol, mmMinIntervalSec, mmMaxIntervalSec, mmSlippage, choreoEnabled, choreoAbsorberIds, choreoDevStakePct, choreoDevStakeLockDays, choreoDevSellPct, choreoDevSellDelayBlocks, choreoAbsorberWaveDelayBlocks, choreoAbsorberWaveSize, choreoAbsorberBuyMinSol, choreoAbsorberBuyMaxSol, choreoAbsorberAutoStakePct, choreoAbsorberStakeLockDays, choreoDripWindowSec, choreoDripIntervalMinMs, choreoDripIntervalMaxMs, onLaunched]);
+  }, [adminPk, name, symbol, description, twitter, telegram, website, imageFile, imageUrl, metadataUri, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol, slippageBps, rewardMode, kolEnabled, kolWallets, kolLockDays, kolAllocPct, kolMode, kolClaimWindowDays, kolExcludeWalletsText, kolEarlyUnstakeBps, presaleEnabled, presaleWalletAddr, presaleCutoffSig, presaleLockDays, presaleMinTransferSol, presaleEarlyUnstakeBps, presaleExcludeText, mmEnabled, mmWalletId, mmEntrySol, mmBankrollSol, mmDrawdownPct, mmMinBuySol, mmMaxBuySol, mmMinIntervalSec, mmMaxIntervalSec, mmSlippage, choreoEnabled, choreoAbsorberIds, choreoDevStakePct, choreoDevStakeLockDays, choreoDevSellPct, choreoDevSellDelayBlocks, choreoAbsorberWaveDelayBlocks, choreoAbsorberWaveSize, choreoAbsorberBuyMinSol, choreoAbsorberBuyMaxSol, choreoAbsorberAutoStakePct, choreoAbsorberStakeLockDays, choreoDripWindowSec, choreoDripIntervalMinMs, choreoDripIntervalMaxMs, onLaunched]);
 
   return (
     <form onSubmit={handleSubmit}>
@@ -1306,7 +1350,111 @@ function LaunchTab({ adminPk, onLaunched }) {
         )}
       </Card>
 
-      <Card title="6. MM seed (optional — buys at creator price + auto-cycle)" style={{ marginTop: 16 }}>
+      <Card title="6. Presale auto-stake (optional)" style={{ marginTop: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+          <input
+            id="presale-enabled"
+            type="checkbox"
+            checked={presaleEnabled}
+            onChange={(e) => setPresaleEnabled(e.target.checked)}
+          />
+          <label htmlFor="presale-enabled" style={{ fontSize: 13, color: SUB, cursor: 'pointer' }}>
+            Auto-stake the dev wallet's REMAINING bag (after KOL carve) to presale contributors pro-rata
+          </label>
+        </div>
+        <div style={{ fontSize: 11, color: MUTED, marginBottom: presaleEnabled ? 12 : 0 }}>
+          Server scans <code>presaleWallet</code> for inbound SOL since <code>cutoffSignature</code>, then
+          stakes the remainder pro-rata for each contributor — locked, with the same auto-push reward
+          flow as KOL pushes. Runs after KOL airdrop so the carve order is{' '}
+          <strong>KOL slice (off the top) → presale (the rest)</strong>. Both are signed server-side with
+          the dev's vault keypair, so the entire flow is one-click. The dev wallet itself is always
+          excluded from the contributor scan.
+        </div>
+
+        {presaleEnabled && (
+          <>
+            <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
+              <Field label="Presale wallet (where contributors sent SOL)">
+                <input
+                  type="text"
+                  value={presaleWalletAddr}
+                  onChange={(e) => setPresaleWalletAddr(e.target.value)}
+                  placeholder="So11…"
+                  style={{ ...inputStyle, fontFamily: 'monospace', fontSize: 12 }}
+                />
+              </Field>
+              <Field label="Lock duration">
+                <select value={presaleLockDays} onChange={(e) => setPresaleLockDays(Number(e.target.value))} style={inputStyle}>
+                  <option value={1}>1 day</option>
+                  <option value={3}>3 days</option>
+                  <option value={7}>7 days</option>
+                  <option value={14}>14 days</option>
+                  <option value={21}>21 days</option>
+                  <option value={30}>30 days</option>
+                </select>
+              </Field>
+              <Field label="Min contribution (SOL)" hint="Skip dust transfers below this — typically 0.01 SOL filters out wallet pings without dropping any real contribution.">
+                <input
+                  type="number"
+                  step="0.001"
+                  min="0"
+                  value={presaleMinTransferSol}
+                  onChange={(e) => setPresaleMinTransferSol(e.target.value)}
+                  style={inputStyle}
+                />
+              </Field>
+              <Field label="Early-unstake penalty (bps)" hint="0..9000 (90%). 0 = leave at pool default of 10%. For paid-in-SOL contributors a soft 0-2000 is typical; KOL slices use a much higher cap.">
+                <input
+                  type="number"
+                  step="100"
+                  min="0"
+                  max="9000"
+                  value={presaleEarlyUnstakeBps}
+                  onChange={(e) => {
+                    const n = Math.max(0, Math.min(9000, Number(e.target.value) || 0));
+                    setPresaleEarlyUnstakeBps(n);
+                  }}
+                  style={inputStyle}
+                />
+              </Field>
+            </div>
+
+            <Field label="Cutoff signature (start of contribution window)" hint="The first tx whose timestamp the scan should consider — earlier transfers are ignored. Usually the signature of a small marker tx the admin sent right before opening the round.">
+              <input
+                type="text"
+                value={presaleCutoffSig}
+                onChange={(e) => setPresaleCutoffSig(e.target.value)}
+                placeholder="5ETwZm…"
+                style={{ ...inputStyle, fontFamily: 'monospace', fontSize: 12 }}
+              />
+            </Field>
+
+            <Field label="Exclude wallets (optional, comma/space separated)" style={{ marginTop: 12 }}>
+              <textarea
+                value={presaleExcludeText}
+                onChange={(e) => setPresaleExcludeText(e.target.value)}
+                rows={2}
+                placeholder="Wallets that hopped to/from the presale wallet but shouldn't get a stake (e.g. internal hops). Dev wallet is auto-excluded."
+                style={{ ...inputStyle, fontFamily: 'monospace', fontSize: 11, resize: 'vertical' }}
+              />
+            </Field>
+
+            <div style={{ marginTop: 10, padding: '8px 10px', background: '#FFF7ED', border: '1px solid #FED7AA', borderRadius: 6, fontSize: 11, color: SUB, lineHeight: 1.5 }}>
+              Will scan <code style={{ fontFamily: 'monospace' }}>{shortPk(presaleWalletAddr || 'wallet', 6)}</code> for inbound SOL
+              since cutoff <code style={{ fontFamily: 'monospace' }}>{(presaleCutoffSig || '').slice(0, 8)}…</code>,
+              skip transfers under <strong style={{ color: INK }}>{Number(presaleMinTransferSol || 0).toFixed(3)} SOL</strong>,
+              then split <strong style={{ color: INK }}>{kolEnabled ? `${100 - kolAllocPct}%` : '100%'}</strong> of the dev's
+              post-bundle bag pro-rata across contributors. Each position is locked{' '}
+              <strong style={{ color: INK }}>{presaleLockDays} days</strong> with a{' '}
+              <strong style={{ color: INK }}>{(presaleEarlyUnstakeBps / 100).toFixed(2)}%</strong>{' '}
+              early-unstake penalty
+              {presaleEarlyUnstakeBps === 0 && ' (pool default)'}.
+            </div>
+          </>
+        )}
+      </Card>
+
+      <Card title="7. MM seed (optional — buys at creator price + auto-cycle)" style={{ marginTop: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
           <input
             id="mm-enabled"
@@ -1416,7 +1564,7 @@ function LaunchTab({ adminPk, onLaunched }) {
         )}
       </Card>
 
-      <Card title="7. Dump & absorb (anti-sniper choreography)" style={{ marginTop: 16 }}>
+      <Card title="8. Dump & absorb (anti-sniper choreography)" style={{ marginTop: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
           <input
             id="choreo-enabled"
@@ -1557,7 +1705,7 @@ function LaunchTab({ adminPk, onLaunched }) {
         )}
       </Card>
 
-      <Card title="8. Pre-flight quote" style={{ marginTop: 16 }}>
+      <Card title="9. Pre-flight quote" style={{ marginTop: 16 }}>
         {quoteErr && <div style={{ color: ERR, marginBottom: 8 }}>{quoteErr}</div>}
         {quote ? (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
@@ -1601,6 +1749,32 @@ function LaunchTab({ adminPk, onLaunched }) {
               ) : (
                 <span style={{ color: ERR }}>failed: {result.kolAirdrop.error || 'see worker logs'}</span>
               )}
+            </div>
+          )}
+          {result.presaleAirdrop && (
+            <div style={{ marginTop: 12, padding: 10, background: result.presaleAirdrop.ok ? '#dcfce7' : '#fee2e2', borderRadius: 6, fontSize: 12 }}>
+              <strong>Presale auto-stake:</strong>{' '}
+              {result.presaleAirdrop.ok ? (
+                result.presaleAirdrop.skipped ? (
+                  <span style={{ color: SUB }}>skipped — {result.presaleAirdrop.skipped.replace(/_/g, ' ')}</span>
+                ) : (
+                  <>
+                    staked {result.presaleAirdrop.totals?.contributorCount} contributors in {result.presaleAirdrop.totals?.batchCount} txs
+                    ({fmtTokens(result.presaleAirdrop.totals?.tokensSentRaw, 6)} {symbol})
+                    {result.presaleAirdrop.totals?.lockDays != null && ` · ${result.presaleAirdrop.totals.lockDays}d lock`}
+                    {result.presaleAirdrop.totals?.lamports != null && ` · ${(Number(result.presaleAirdrop.totals.lamports) / 1e9).toFixed(3)} SOL contributed`}
+                  </>
+                )
+              ) : (
+                <span style={{ color: ERR }}>failed: {result.presaleAirdrop.error || 'see worker logs'}</span>
+              )}
+            </div>
+          )}
+          {result.bagCarve && (
+            <div style={{ marginTop: 8, padding: 8, background: '#F5F3FF', border: '1px solid #DDD6FE', borderRadius: 6, fontSize: 11, color: SUB, fontFamily: 'monospace' }}>
+              bag carve: {fmtTokens(result.bagCarve.bagRaw, 6)} {symbol} →{' '}
+              KOL {fmtTokens(result.bagCarve.kolRaw, 6)} +{' '}
+              presale {fmtTokens(result.bagCarve.presaleRaw, 6)}
             </div>
           )}
           {result.choreography && (

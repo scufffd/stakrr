@@ -175,7 +175,11 @@ async function detectStakeMintProgram(connection, mintPk) {
  * the airdrop bag (and to flag if dev hasn't received tokens yet — happens
  * if the bundle is still propagating when this runs).
  */
-async function readDevTokenBalance({ connection, devPubkey, mintPk }) {
+// Exported so the orchestrator can take a single bag snapshot before
+// running both KOL airdrop AND presale auto-stake — letting the carve be
+// computed deterministically from one number rather than re-reading the
+// ATA between steps (which could race against any concurrent transfer).
+export async function readDevTokenBalance({ connection, devPubkey, mintPk }) {
   const programId = await detectStakeMintProgram(connection, mintPk);
   const ata = getAssociatedTokenAddressSync(mintPk, devPubkey, false, programId);
   try {

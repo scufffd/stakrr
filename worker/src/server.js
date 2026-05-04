@@ -847,6 +847,38 @@ app.post('/api/admin/snipe/launch', requireAdmin, requireVault, upload.single('i
       }
     }
 
+    // Optional presale auto-stake: { presaleWallet, cutoffSignature,
+    // lockDays, minTransferLamports, earlyUnstakeBps, excludeWallets[] }.
+    // After the launch + KOL carve, the dev wallet's remaining bag is
+    // distributed pro-rata to wallets that contributed SOL to
+    // `presaleWallet` since `cutoffSignature`.
+    let presale = null;
+    if (body.presale) {
+      let parsed = body.presale;
+      if (typeof parsed === 'string') {
+        try { parsed = JSON.parse(parsed); }
+        catch { return res.status(400).json({ ok: false, error: 'presale must be valid JSON' }); }
+      }
+      if (parsed && parsed.presaleWallet && parsed.cutoffSignature) {
+        presale = {
+          presaleWallet: String(parsed.presaleWallet).trim(),
+          cutoffSignature: String(parsed.cutoffSignature).trim(),
+          lockDays: Number(parsed.lockDays) || 7,
+          // Accept either `minTransferLamports` (raw) or `minTransferSol`
+          // (decimal SOL string). Lamports wins when both are present.
+          minTransferLamports: parsed.minTransferLamports != null
+            ? String(parsed.minTransferLamports)
+            : parsed.minTransferSol != null
+              ? String(Math.round(Number(parsed.minTransferSol) * 1e9))
+              : '10000000', // 0.01 SOL default — same as AdminPresaleView
+          earlyUnstakeBps: parsed.earlyUnstakeBps != null
+            ? Math.max(0, Math.min(9000, Number(parsed.earlyUnstakeBps)))
+            : 0,
+          excludeWallets: Array.isArray(parsed.excludeWallets) ? parsed.excludeWallets : [],
+        };
+      }
+    }
+
     // Optional choreography: { absorberWalletIds: [...], config: {...} }.
     // Runs the dev-rug + absorber-wall sequence after pool init confirms.
     let choreography = null;
@@ -881,6 +913,7 @@ app.post('/api/admin/snipe/launch', requireAdmin, requireVault, upload.single('i
       metadataImageUrl: body.metadataImageUrl || null,
       initiatedBy: initiatorPk,
       kolAirdrop,
+      presale,
       mm,
       choreography,
     });
