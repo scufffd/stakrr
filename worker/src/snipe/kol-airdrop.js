@@ -20,7 +20,7 @@ import {
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token';
 import BN from 'bn.js';
-import { config, getConnection } from '../config.js';
+import { authoritySigner, config, getConnection } from '../config.js';
 import {
   detectTokenProgram,
   fetchPool,
@@ -380,6 +380,15 @@ export async function runKolAirdrop({
     ? BENEFICIARIES_PER_TX_WITH_OVERRIDE
     : BENEFICIARIES_PER_TX;
 
+  // Pool-authority keypair for the optional set_position_early_unstake_bps
+  // ix. Resolved once outside the loop since it never changes per-batch.
+  // After the 85cc74b anti-rug rotation, pool.authority is the platform
+  // key, NOT the dev keypair signing the rest of the batch — so without
+  // this signer the override ix returns NotAuthority (0x177c).
+  const platformAuthKp = bpsOverride > 0 ? authoritySigner() : null;
+  const needsPlatformSigner = bpsOverride > 0
+    && !platformAuthKp.publicKey.equals(devPk);
+
   const batches = [];
   for (let bi = 0; bi < allocations.length; bi += beneficiariesPerTx) {
     const slice = allocations.slice(bi, bi + beneficiariesPerTx);
@@ -406,14 +415,20 @@ export async function runKolAirdrop({
       });
       tx.add(sf.ix);
 
-      // v4: optional per-position early-unstake penalty override. Bundled in
-      // the SAME tx as stake_for so the override is atomic with the position
-      // creation — if either ix fails, neither lands. Authority is the dev
-      // wallet (which is also pool.authority on every Stakrr-launched pool).
+      // v4: optional per-position early-unstake penalty override. Bundled
+      // in the SAME tx as stake_for so the override is atomic with the
+      // position creation — if either ix fails, neither lands.
+      //
+      // Authority must be pool.authority. Since commit 85cc74b every
+      // Stakrr-launched pool rotates pool.authority from the deployer to
+      // PLATFORM_AUTHORITY in the same tx initialize_pool runs in, so the
+      // dev keypair we use to sign the rest of the batch is NOT a valid
+      // signer for this ix. We pull the platform keypair (or treasury
+      // fallback) from config and add it to the signer set below.
       if (bpsOverride > 0) {
         const sb = await setPositionEarlyUnstakeBpsIx({
           connection,
-          authority: devPk,
+          authority: platformAuthKp.publicKey,
           stakeMint,
           position: sf.position,
           bps: bpsOverride,
@@ -451,7 +466,8 @@ export async function runKolAirdrop({
     let sig = null;
     let err = null;
     try {
-      sig = await signAndPollConfirm(connection, tx, [devKp], {
+      const signers = needsPlatformSigner ? [devKp, platformAuthKp] : [devKp];
+      sig = await signAndPollConfirm(connection, tx, signers, {
         label: 'kol-airdrop:batch',
         timeoutMs: 60_000,
       });

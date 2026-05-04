@@ -92,10 +92,20 @@ export async function buildPresaleAutoStakeBatches({
   minTransferLamports,
   earlyUnstakeBps = 0,        // v4: per-position penalty override (0..9000).
                               // Bundled via set_position_early_unstake_bps in
-                              // the SAME tx as stake_for, signed by the same
-                              // browser wallet (dev = pool.authority on every
-                              // Stakrr-launched pool). 0 = leave at the pool
-                              // default (10%).
+                              // the SAME tx as stake_for. 0 = leave at the
+                              // pool default (10%).
+  overrideAuthority = null,   // PublicKey of the pool authority that must
+                              // sign the override ix. If null, falls back to
+                              // `devWallet` — only valid when the caller
+                              // KNOWS the dev is still pool.authority (e.g.
+                              // a launch flow where rotation hasn't run
+                              // yet). Modern Stakrr launches rotate to
+                              // PLATFORM_AUTHORITY in the same tx as
+                              // initialize_pool, so callers in those flows
+                              // MUST pass the platform pubkey here AND
+                              // ensure the platform key co-signs the tx
+                              // (server side: include in signers; browser
+                              // side: worker partialSign before returning).
 }) {
   const connection = getConnection();
   const stakeMint = new PublicKey(mint);
@@ -184,15 +194,17 @@ export async function buildPresaleAutoStakeBatches({
       });
       tx.add(sf.ix);
 
-      // v4: optional per-position early-unstake penalty override. Bundled in
-      // the same tx so it's atomic with stake_for. The dev wallet is
-      // pool.authority on every Stakrr-launched pool, and the dev wallet is
-      // also the browser-side signer of this tx — so no extra signature is
-      // needed.
+      // v4: optional per-position early-unstake penalty override. Bundled
+      // in the same tx so it's atomic with stake_for. Authority must be
+      // the live pool.authority — which is the platform key on every
+      // post-85cc74b Stakrr launch (anti-rug rotation runs inside
+      // initialize_pool). Caller passes that pubkey via overrideAuthority;
+      // we fall back to devPk only when caller knows the rotation hasn't
+      // happened yet.
       if (bpsOverride > 0) {
         const sb = await setPositionEarlyUnstakeBpsIx({
           connection,
-          authority: devPk,
+          authority: overrideAuthority || devPk,
           stakeMint,
           position: sf.position,
           bps: bpsOverride,

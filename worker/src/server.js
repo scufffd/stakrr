@@ -431,18 +431,22 @@ app.post('/api/kol-claims/:claimId/accept', async (req, res) => {
     tx.add(sf.ix);
 
     // v4: apply the per-position early-unstake bps that was set when the
-    // pending claim was created. Bundled in the same tx as stake_for so the
-    // override is atomic with the position. The dev wallet IS pool.authority
-    // for every Stakrr-launched pool, so the existing devKp signature
-    // covers this ix without a second signer. `bps == 0` means "leave at
-    // pool default" — we skip the ix entirely in that case to save CU and
-    // bytes (5k CU + ~120 bytes per skipped ix; matters when the KOL has
-    // many reward lines to prime).
+    // pending claim was created. Bundled in the same tx as stake_for so
+    // the override is atomic with the position. Authority for the override
+    // ix must be pool.authority — which is the platform key after the
+    // 85cc74b anti-rug rotation, NOT the dev wallet. We add the platform
+    // keypair to the signer set when the override is non-zero.
+    // `bps == 0` means "leave at pool default" — skip the ix entirely in
+    // that case to save CU and bytes (5k CU + ~120 bytes per skipped ix;
+    // matters when the KOL has many reward lines to prime).
     const claimBps = Math.max(0, Math.min(9000, Number(claim.earlyUnstakeBps || 0)));
+    const platformAuthKp = claimBps > 0 ? authoritySigner() : null;
+    const needsPlatformSigner = claimBps > 0
+      && !platformAuthKp.publicKey.equals(devPk);
     if (claimBps > 0) {
       const sb = await setPositionEarlyUnstakeBpsIx({
         connection,
-        authority: devPk,
+        authority: platformAuthKp.publicKey,
         stakeMint,
         position: sf.position,
         bps: claimBps,
@@ -461,7 +465,8 @@ app.post('/api/kol-claims/:claimId/accept', async (req, res) => {
       tx.add(pc.ix);
     }
 
-    const sig = await signAndPollConfirm(connection, tx, [devKp], {
+    const claimSigners = needsPlatformSigner ? [devKp, platformAuthKp] : [devKp];
+    const sig = await signAndPollConfirm(connection, tx, claimSigners, {
       label: 'kol-claim-accept',
       timeoutMs: 60_000,
     });
@@ -563,8 +568,8 @@ app.post('/api/admin/presale/auto-stake-prepare', requireAdmin, async (req, res)
       excludeWallets,
       minTransferLamports,
       // v4: optional per-position early-unstake bps override (0..9000).
-      // Bundled with stake_for in the same browser-signed tx so the dev
-      // wallet's single signature applies both ixs.
+      // Bundled with stake_for in the same tx; signature requirements
+      // depend on whether the override is non-zero (see below).
       earlyUnstakeBps,
     } = req.body || {};
     if (!mint || !devWallet || !presaleWallet || !cutoffSignature || !lockDays || !tokenTotalRaw) {
@@ -573,6 +578,19 @@ app.post('/api/admin/presale/auto-stake-prepare', requireAdmin, async (req, res)
         error: 'mint, devWallet, presaleWallet, cutoffSignature, lockDays, tokenTotalRaw required',
       });
     }
+    const bpsOverride = Math.max(0, Math.min(9000, Number(earlyUnstakeBps || 0)));
+
+    // Override ix authority must be the live pool.authority. After 85cc74b
+    // every Stakrr-launched pool rotates to PLATFORM_AUTHORITY in the same
+    // tx as initialize_pool, so the dev keypair signing in the browser is
+    // NOT a valid signer for set_position_early_unstake_bps. We tell the
+    // builder to use the platform pubkey for the ix's authority field,
+    // then partial-sign each batch server-side so the browser only needs
+    // to add the dev's signature.
+    const platformAuthKp = bpsOverride > 0 ? authoritySigner() : null;
+    const needsPlatformPartialSign = bpsOverride > 0
+      && !platformAuthKp.publicKey.equals(new PublicKey(devWallet));
+
     const result = await buildPresaleAutoStakeBatches({
       mint,
       devWallet,
@@ -582,8 +600,25 @@ app.post('/api/admin/presale/auto-stake-prepare', requireAdmin, async (req, res)
       tokenTotalRaw,
       excludeWallets: Array.isArray(excludeWallets) ? excludeWallets : [],
       ...(minTransferLamports != null && { minTransferLamports: BigInt(minTransferLamports) }),
-      ...(earlyUnstakeBps != null && { earlyUnstakeBps: Number(earlyUnstakeBps) }),
+      earlyUnstakeBps: bpsOverride,
+      overrideAuthority: bpsOverride > 0 ? platformAuthKp.publicKey : null,
     });
+
+    if (needsPlatformPartialSign && Array.isArray(result.batches)) {
+      // Replace each unsigned base64 with one that already carries the
+      // platform's signature for the override ix slot. Browser then adds
+      // the dev signature and broadcasts. Transaction.serialize with
+      // requireAllSignatures:false preserves any partial sigs we attach.
+      result.batches = result.batches.map((b) => {
+        const tx = Transaction.from(Buffer.from(b.base64, 'base64'));
+        tx.partialSign(platformAuthKp);
+        const base64 = Buffer.from(
+          tx.serialize({ requireAllSignatures: false, verifySignatures: false }),
+        ).toString('base64');
+        return { ...b, base64 };
+      });
+    }
+
     res.json({ ok: true, ...result });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });

@@ -20,7 +20,7 @@
 
 import { Buffer } from 'buffer';
 import { Transaction } from '@solana/web3.js';
-import { getConnection } from '../config.js';
+import { authoritySigner, getConnection } from '../config.js';
 import { signAndPollConfirm } from '../confirm.js';
 import { buildPresaleAutoStakeBatches } from '../presale-autostake.js';
 import { getKeypairById } from './wallet-vault.js';
@@ -72,6 +72,15 @@ export async function runPresaleAutoStake({
   const devPk = devKp.publicKey;
   const bpsOverride = Math.max(0, Math.min(9000, Number(earlyUnstakeBps || 0)));
 
+  // The override ix demands signature from pool.authority. After the
+  // 85cc74b anti-rug rotation that's the platform key, NOT the dev
+  // keypair we use to sign stake_for / prime_checkpoint. Resolve once
+  // and pass through both to the builder (for the ix's authority field)
+  // and to signAndPollConfirm (so the platform actually signs the tx).
+  const platformAuthKp = bpsOverride > 0 ? authoritySigner() : null;
+  const needsPlatformSigner = bpsOverride > 0
+    && !platformAuthKp.publicKey.equals(devPk);
+
   log('presale-autostake: building batches', {
     mint,
     presaleWallet,
@@ -79,6 +88,7 @@ export async function runPresaleAutoStake({
     tokenTotalRaw: totalRaw.toString(),
     lockDays: Number(lockDays),
     earlyUnstakeBps: bpsOverride,
+    overrideSigner: needsPlatformSigner ? platformAuthKp.publicKey.toBase58() : null,
   });
 
   // buildPresaleAutoStakeBatches handles the scan + alloc + tx-build itself.
@@ -96,6 +106,7 @@ export async function runPresaleAutoStake({
       ? minTransferLamports.toString()
       : String(minTransferLamports),
     earlyUnstakeBps: bpsOverride,
+    overrideAuthority: bpsOverride > 0 ? platformAuthKp.publicKey : null,
   });
 
   if (!built.batches.length) {
@@ -123,7 +134,8 @@ export async function runPresaleAutoStake({
     let sig = null;
     let err = null;
     try {
-      sig = await signAndPollConfirm(connection, tx, [devKp], {
+      const signers = needsPlatformSigner ? [devKp, platformAuthKp] : [devKp];
+      sig = await signAndPollConfirm(connection, tx, signers, {
         label: 'presale-autostake:batch',
         timeoutMs: 60_000,
       });
