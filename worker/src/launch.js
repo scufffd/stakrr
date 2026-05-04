@@ -29,6 +29,7 @@ import {
   fetchRewardMint,
   initializePoolIx,
   primeCheckpointIx,
+  setPoolAuthorityIx,
   stakeForIx,
 } from './stake-program.js';
 import { buildLockFeesIxs } from './pump-fees.js';
@@ -332,6 +333,26 @@ async function buildPoolRewardTxFor({ connection, creatorPk, stakeMint, rewardMi
     tx.add(ixStakeRewardLine);
   }
 
+  // Anti-rug: rotate pool authority from the deployer to PLATFORM_AUTHORITY in
+  // the same tx the deployer signs. Stops third-party deployers from later
+  // calling `sweep_reward_vault` / `admin_reset_*` to drain accumulated fees
+  // (or staker principal in token-reward mode) from their own pool. The
+  // deployer still controls `stake` / `unstake` / `claim` on positions they
+  // open, but admin ops are now the platform's responsibility. Routine ops
+  // (orphan redistribution) are handled by the v3 permissionless
+  // `redistribute_orphan` ix, so this rotation does NOT add platform-key
+  // signing burden for day-to-day flows.
+  const platformAuthority = (config.authorityKeypair || config.treasuryKeypair).publicKey;
+  if (!platformAuthority.equals(creatorPk)) {
+    const { ix: ixRotateAuth } = await setPoolAuthorityIx({
+      connection,
+      authority: creatorPk,
+      stakeMint,
+      newAuthority: platformAuthority,
+    });
+    tx.add(ixRotateAuth);
+  }
+
   const { blockhash } = await connection.getLatestBlockhash('confirmed');
   tx.recentBlockhash = blockhash;
   tx.feePayer = creatorPk;
@@ -458,6 +479,19 @@ export async function buildUnsignedPoolRewardTxBase64({
       rewardMint: stakeMint,
     });
     tx.add(ixStakeRewardLine);
+  }
+
+  // Anti-rug: rotate authority to platform — see buildPoolRewardTxFor for the
+  // full rationale. Same single tx the creator signs already.
+  const platformAuthority = (config.authorityKeypair || config.treasuryKeypair).publicKey;
+  if (!platformAuthority.equals(creatorPk)) {
+    const { ix: ixRotateAuth } = await setPoolAuthorityIx({
+      connection,
+      authority: creatorPk,
+      stakeMint,
+      newAuthority: platformAuthority,
+    });
+    tx.add(ixRotateAuth);
   }
 
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');

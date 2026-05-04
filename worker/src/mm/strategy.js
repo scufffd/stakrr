@@ -237,16 +237,19 @@ export async function strategyStep(mint) {
   // Sell ~30-60% of bag (bounded so we don't dump-and-restart). Tunable later.
   const sellPct = Math.max(20, Math.min(80, Math.round(randIn(30, 60))));
   const sellRaw = (bag.raw * BigInt(sellPct)) / 100n;
-  const sellUi = Number(sellRaw) / 10 ** bag.decimals;
-  if (sellUi <= 0) {
-    return { action: 'wait', reason: 'computed sellUi=0' };
+  if (sellRaw <= 0n) {
+    return { action: 'wait', reason: 'computed sellRaw=0' };
   }
+  // CRITICAL: pump's /api/trade-local with denominatedInSol='false' expects
+  // RAW token units, NOT UI float. See note in snipe/post-ops.js for the
+  // bug history (passing UI float caused only 1/10^decimals to actually sell).
+  const sellAmountRaw = Number(sellRaw);
   try {
     const tx = await buildTradeTx({
       publicKey: kp.publicKey.toBase58(),
       action: 'sell',
       mint,
-      amount: sellUi,
+      amount: sellAmountRaw,
       denominatedInSol: 'false',
       slippage: cfg.slippage,
       pool: 'auto',
@@ -270,7 +273,7 @@ export async function strategyStep(mint) {
       error: null,
     };
     appendTrade(mint, entry);
-    return { action: 'sell', sellPct, sellUi, sig };
+    return { action: 'sell', sellPct, sellRaw: sellRaw.toString(), sig };
   } catch (e) {
     appendTrade(mint, { ts, type: 'sell', solSpentLamports: '0', solReceivedLamports: '0', tokensInRaw: '0', tokensOutRaw: '0', sig: null, error: e.message });
     return { action: 'sell', error: e.message };

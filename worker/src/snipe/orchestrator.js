@@ -30,6 +30,8 @@ import { launchBundle, MAX_BUNDLE_TXS } from './jito-bundle.js';
 import { getKeypairById, listWallets, generateWallet, updateWallet } from './wallet-vault.js';
 import { createSnipe, updateSnipe, getSnipe } from './snipe-store.js';
 import { runKolAirdrop } from './kol-airdrop.js';
+import { upsertToken as upsertMmToken } from '../mm/store.js';
+import { runDumpAndAbsorb, deriveLaunchSlot } from './choreography.js';
 
 // Buffer: lock-fees + pool init + reward registration + 1 ATA rent + a small
 // safety margin. Empirically ~0.045 SOL covers it; use 0.06 to be safe.
@@ -50,7 +52,7 @@ async function getSolBalance(connection, pubkey) {
  * Pre-flight: ensure every wallet has enough SOL for what it's about to do.
  * Throws a single descriptive error listing all underfunded wallets.
  */
-async function preflight({ connection, devKeypair, devBuySol, jitoTipSol, snipers, sniperSolPerWallet }) {
+async function preflight({ connection, devKeypair, devBuySol, jitoTipSol, snipers, sniperSolPerWallet, mm = null }) {
   const issues = [];
   const devNeed = devBuySol + jitoTipSol + DEV_POST_BUNDLE_OVERHEAD_SOL;
   const devBal = await getSolBalance(connection, devKeypair.publicKey);
@@ -67,6 +69,18 @@ async function preflight({ connection, devKeypair, devBuySol, jitoTipSol, sniper
       issues.push(
         `sniper ${s.label} (${s.keypair.publicKey.toBase58()}) has ${bal.sol.toFixed(4)} SOL, ` +
         `needs ≥ ${sniperNeed.toFixed(4)} SOL`,
+      );
+    }
+  }
+  if (mm) {
+    // MM seed wallet needs its entry SOL + gas reserve (it'll keep cycling
+    // post-launch so we leave the rest of the bankroll for the daemon).
+    const mmNeed = (Number(mm.entrySol) || 0) + SNIPER_GAS_RESERVE_SOL;
+    const bal = await getSolBalance(connection, mm.keypair.publicKey);
+    if (bal.sol < mmNeed) {
+      issues.push(
+        `mm wallet (${mm.keypair.publicKey.toBase58()}) has ${bal.sol.toFixed(4)} SOL, ` +
+        `needs ≥ ${mmNeed.toFixed(4)} SOL (entrySol ${mm.entrySol} + gas reserve)`,
       );
     }
   }
@@ -214,7 +228,7 @@ async function sendOverflowSnipes({
  * Cheap quote (no on-chain calls beyond getMultipleAccounts) — used by the UI
  * to preview "you'll need ~X SOL across these wallets" before submitting.
  */
-export async function quoteStealthLaunch({ devWalletId, sniperWalletIds, devBuySol, sniperSolPerWallet, jitoTipSol }) {
+export async function quoteStealthLaunch({ devWalletId, sniperWalletIds, devBuySol, sniperSolPerWallet, jitoTipSol, mm = null }) {
   const all = listWallets();
   const wmap = new Map(all.map((w) => [w.id, w]));
   const dev = wmap.get(devWalletId);
@@ -224,9 +238,18 @@ export async function quoteStealthLaunch({ devWalletId, sniperWalletIds, devBuyS
     if (!w) throw new Error(`sniper wallet not in vault: ${id}`);
     return w;
   });
-  const tip = jitoTipSol == null ? parseFloat(process.env.JITO_TIP_SOL || '0.001') : Number(jitoTipSol);
-  const slotsForSnipers = MAX_BUNDLE_TXS - 1 - (devBuySol > 0 ? 1 : 0);
-  const inBundleCount = Math.min(snipers.length, slotsForSnipers);
+  const tip = jitoTipSol == null ? parseFloat(process.env.JITO_TIP_SOL || '0.005') : Number(jitoTipSol);
+  const totalBuyerSlots = MAX_BUNDLE_TXS - 1 - (devBuySol > 0 ? 1 : 0);
+  // MM seed (if present) takes a slot first; remaining go to snipers.
+  let mmWallet = null;
+  let mmInBundle = false;
+  if (mm && mm.walletId) {
+    mmWallet = wmap.get(mm.walletId);
+    if (!mmWallet) throw new Error(`mm wallet not in vault: ${mm.walletId}`);
+    mmInBundle = totalBuyerSlots > 0;
+  }
+  const sniperSlots = totalBuyerSlots - (mmInBundle ? 1 : 0);
+  const inBundleCount = Math.min(snipers.length, sniperSlots);
   const overflowCount = snipers.length - inBundleCount;
   return {
     devWallet: dev,
@@ -239,6 +262,12 @@ export async function quoteStealthLaunch({ devWalletId, sniperWalletIds, devBuyS
     estDevSpend: (Number(devBuySol) || 0) + tip + DEV_POST_BUNDLE_OVERHEAD_SOL,
     estSniperSpend: (Number(sniperSolPerWallet) || 0) + SNIPER_GAS_RESERVE_SOL,
     bundleCap: MAX_BUNDLE_TXS,
+    mm: mmWallet ? {
+      wallet: mmWallet,
+      entrySol: Number(mm.entrySol) || 0,
+      estSpend: (Number(mm.entrySol) || 0) + SNIPER_GAS_RESERVE_SOL,
+      inBundle: mmInBundle,
+    } : null,
   };
 }
 
@@ -276,6 +305,16 @@ export async function stealthLaunch(params) {
     metadataUri: preMetadataUri = null,
     metadataImageUrl = null,
     initiatedBy = null,
+    // Optional MM seed: { walletId, entrySol, config? } — wallet buys at
+    // creator price as part of the bundle, then the MM daemon picks the
+    // mint up on its next tick (every ~10s) and starts cycling buys/sells.
+    // The early-entry bag gives the strategy a real edge vs. starting cold.
+    mm = null,
+    // Optional choreography: { absorberWalletIds: [...], config: {...} }.
+    // When present, runs the dev-rug + absorber-wall sequence after pool
+    // init confirms. Failure here is non-fatal — admin can re-run from the
+    // /api/admin/snipe/choreography/run endpoint.
+    choreography = null,
   } = params;
 
   if (!devWalletId) throw new Error('devWalletId required');
@@ -292,8 +331,21 @@ export async function stealthLaunch(params) {
     label: listWallets().find((w) => w.id === id)?.label || id,
   }));
 
+  // Resolve MM seed wallet (if requested). It must be in the vault — same
+  // requirement as snipers — so the worker can sign the bundle's buy tx.
+  let mmCtx = null;
+  if (mm && mm.walletId && Number(mm.entrySol) > 0) {
+    mmCtx = {
+      walletId: mm.walletId,
+      entrySol: Number(mm.entrySol),
+      config: mm.config || {},
+      keypair: getKeypairById(mm.walletId),
+      label: listWallets().find((w) => w.id === mm.walletId)?.label || mm.walletId,
+    };
+  }
+
   const tipSol = jitoTipSol == null
-    ? parseFloat(process.env.JITO_TIP_SOL || '0.001')
+    ? parseFloat(process.env.JITO_TIP_SOL || '0.005')
     : Number(jitoTipSol);
 
   await preflight({
@@ -303,6 +355,7 @@ export async function stealthLaunch(params) {
     jitoTipSol: tipSol,
     snipers: sniperKeypairs,
     sniperSolPerWallet: Number(sniperSolPerWallet) || 0,
+    mm: mmCtx,
   });
 
   // Reserve a vanity mint keypair (pump-suffix preferred).
@@ -369,6 +422,7 @@ export async function stealthLaunch(params) {
       slippageBps,
       sniperKeypairs: sniperKeypairs.map((s) => s.keypair),
       sniperSolPerWallet: Number(sniperSolPerWallet) || 0,
+      extraBuyers: mmCtx ? [{ keypair: mmCtx.keypair, solAmount: mmCtx.entrySol }] : [],
       jitoTipSol: tipSol,
     });
     log('bundle confirmed', {
@@ -382,8 +436,18 @@ export async function stealthLaunch(params) {
     // No SOL has left dev or sniper wallets. We deliberately do NOT auto-sweep
     // anywhere here; the admin can decide what to do with the funded wallets
     // (re-attempt with a different mint, top-up more, or manually sweep later).
-    updateSnipe(snipeRow.id, { status: 'failed', statusError: `bundle: ${e.message}` });
-    throw e;
+    //
+    // Most common cause of "bundle confirmation timed out" with all three
+    // pollers (jito/rpc/mint) timing out is an inadequate Jito tip — Jito
+    // silently drops bundles below the current floor. Annotate the error
+    // with that hint so the user knows what knob to turn.
+    let hint = null;
+    if (/bundle confirmation timed out/i.test(e.message) && tipSol < 0.005) {
+      hint = `tip ${tipSol} SOL is below Jito's typical floor (0.001-0.005). Bumping to ≥0.005 SOL usually fixes "all 3 pollers timed out" errors.`;
+    }
+    const finalMsg = hint ? `${e.message}\n  hint: ${hint}` : e.message;
+    updateSnipe(snipeRow.id, { status: 'failed', statusError: `bundle: ${finalMsg}` });
+    throw new Error(finalMsg);
   }
 
   // Record per-sniper kind (in-bundle vs overflow) on the persisted snipe row.
@@ -419,6 +483,63 @@ export async function stealthLaunch(params) {
       try { updateWallet(s.walletId, { launchMint: bundle.mint }); } catch { /* ignore */ }
     }
   }
+  // Pin MM wallet too if it's ephemeral (so it shows under the mint in the
+  // vault list rather than floating in the unassigned pool).
+  if (mmCtx) {
+    const w = listWallets().find((row) => row.id === mmCtx.walletId);
+    if (w?.source === 'ephemeral' && !w.launchMint) {
+      try { updateWallet(mmCtx.walletId, { launchMint: bundle.mint }); } catch { /* ignore */ }
+    }
+  }
+
+  // ── PARALLEL launch tail ────────────────────────────────────────────────
+  // Capture the slot the bundle landed in (derived from the confirmation
+  // envelope when possible, fresh getSlot otherwise — that's a few slots
+  // ahead of real launch but waitUntilSlot returns immediately when we're
+  // already past the target, so it's safe).
+  //
+  // Then fire the choreography (dev rug + absorber wave + drip) IN PARALLEL
+  // with postBundleSetup (lock-fees + pool-init). Without this parallelism
+  // the dev rug couldn't possibly land in launchSlot+3 because pool-init
+  // alone takes ~25 slots — choreography would always be 25+ blocks late.
+  //
+  // Dev wallet signs in both branches but each tx has its own blockhash, so
+  // there's no nonce conflict. Lock-fees and pool-init don't touch the dev's
+  // token bag, only the SOL balance + admin instructions.
+  const launchSlot = await deriveLaunchSlot(connection, bundle.confirmation);
+  log('launchSlot resolved', { snipeId: snipeRow.id, launchSlot });
+
+  const wantsChoreography = !!(choreography && (
+    choreography.absorberWalletIds?.length > 0
+    || (choreography.config?.devSellPct ?? 100) > 0
+  ));
+
+  const choreographyPromise = wantsChoreography
+    ? runDumpAndAbsorb({
+        snipeId: snipeRow.id,
+        mint: bundle.mint,
+        devWalletId,
+        absorberWalletIds: choreography.absorberWalletIds || [],
+        filterTier: choreography.filterTier !== false,
+        config: choreography.config || {},
+        launchSlot,
+      }).then((r) => {
+        log('choreography complete', {
+          snipeId: snipeRow.id,
+          mint: bundle.mint,
+          ok: r.ok,
+          waveOk: r.absorberWave?.filter((x) => !x.error).length || 0,
+          dripOk: r.absorberDrip?.filter((x) => !x.error).length || 0,
+        });
+        return r;
+      }).catch((e) => {
+        // Non-fatal — record on snipe row, return a failure stub.
+        log('choreography failed (non-fatal)', { snipeId: snipeRow.id, error: e.message });
+        const stub = { ok: false, error: e.message };
+        try { updateSnipe(snipeRow.id, { choreography: stub }); } catch { /* ignore */ }
+        return stub;
+      })
+    : Promise.resolve(null);
 
   let lockFeesSig = null;
   let poolRewardSig = null;
@@ -438,6 +559,9 @@ export async function stealthLaunch(params) {
     // so the dev's tokens + each sniper's bag are sitting in their wallets.
     // We do NOT auto-sweep — the snipers keep their tokens AND any leftover
     // SOL. Admin can retry lock/pool manually or dispose via the Snipes tab.
+    // Note: choreographyPromise may still be running — we let it complete in
+    // the background since its early phases (dev rug, absorber wave) don't
+    // depend on lock-fees/pool-init. We don't await it on this error path.
     updateSnipe(snipeRow.id, { status: 'failed', statusError: `post-bundle: ${e.message}` });
     throw e;
   }
@@ -453,6 +577,39 @@ export async function stealthLaunch(params) {
       sniperSolPerWallet: Number(sniperSolPerWallet) || 0,
       slippageBps,
     });
+  }
+
+  // Optional MM bootstrap — register this mint with the MM daemon so it
+  // starts cycling buys/sells on the next 10s tick. The seed wallet's bag
+  // (acquired in the create bundle at near-zero price) gives the strategy
+  // a structural edge: every sell now realises real profit vs. spread.
+  // We don't *spend* anything here — just persist the config & mark it
+  // enabled. The daemon (stakrr-mm) takes over from here.
+  let mmBootstrap = null;
+  if (mmCtx) {
+    try {
+      const t = upsertMmToken({
+        mint: bundle.mint,
+        symbol: metadata.symbol.toUpperCase(),
+        walletId: mmCtx.walletId,
+        config: mmCtx.config,
+        enabled: true,
+      });
+      mmBootstrap = {
+        ok: true,
+        walletId: mmCtx.walletId,
+        wallet: mmCtx.keypair.publicKey.toBase58(),
+        entrySol: mmCtx.entrySol,
+        config: t.config,
+      };
+      updateSnipe(snipeRow.id, { mmBootstrap });
+      log('mm bootstrap registered', { snipeId: snipeRow.id, mint: bundle.mint, walletId: mmCtx.walletId });
+    } catch (e) {
+      // Non-fatal — admin can configure the MM token by hand from /admin/mm.
+      log('mm bootstrap failed (non-fatal)', { snipeId: snipeRow.id, error: e.message });
+      mmBootstrap = { ok: false, error: e.message };
+      updateSnipe(snipeRow.id, { mmBootstrap });
+    }
   }
 
   // Optional KOL airdrop — auto-stake a slice of the dev-buy bag across a
@@ -535,6 +692,27 @@ export async function stealthLaunch(params) {
     });
   }
 
+  // Choreography runs in the background — we DON'T await it for the
+  // response. The launch is functionally complete once finalize succeeds
+  // (mint exists, bag is in dev wallet, pool is live, public registry has
+  // the row). The drip window can take 30s+ which would push the total
+  // request past nginx's proxy_read_timeout and give the user a 504 even
+  // though everything succeeded on-chain. UI polls /api/admin/snipe/:id
+  // to render live choreography status (updated via updateSnipe inside
+  // runDumpAndAbsorb every phase transition).
+  //
+  // If choreography finished fast (no absorbers, no drip), we include the
+  // result for free — Promise.race wins immediately.
+  let choreographyResult = null;
+  if (wantsChoreography) {
+    try {
+      choreographyResult = await Promise.race([
+        choreographyPromise,
+        new Promise((resolve) => setTimeout(() => resolve({ ok: null, status: 'running-in-background', message: 'choreography continues in background; poll /api/admin/snipe/:id for live status' }), 1500)),
+      ]);
+    } catch { /* swallow — choreographyPromise has its own .catch */ }
+  }
+
   return {
     ok: true,
     snipeId: snipeRow.id,
@@ -551,6 +729,8 @@ export async function stealthLaunch(params) {
     metadataImageUrl: resolvedImageUrl,
     finalize: finalizeOut,
     kolAirdrop: kolResult,
+    mmBootstrap,
+    choreography: choreographyResult,
   };
 }
 
@@ -559,13 +739,14 @@ export async function stealthLaunch(params) {
  * Used by the admin UI's "generate new ephemeral wallets" button before the
  * launch happens, so the admin has time to fund them.
  */
-export function ensureEphemeralWallets(count, { labelPrefix = 'ephemeral' } = {}) {
+export function ensureEphemeralWallets(count, { labelPrefix = 'ephemeral', tier = null } = {}) {
   const created = [];
   for (let i = 0; i < count; i += 1) {
     const w = generateWallet({
       label: `${labelPrefix}-${Date.now().toString(36)}-${i + 1}`,
       source: 'ephemeral',
       launchMint: null, // pinned later by stealthLaunch after bundle confirms
+      tier,
     });
     created.push(w);
   }

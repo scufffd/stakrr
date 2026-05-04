@@ -303,6 +303,203 @@ export async function primeCheckpointIx({
   return { ix, checkpoint, rewardMintPda };
 }
 
+// --- v2 admin instruction builders -----------------------------------------
+// Mirror the on-chain instructions added in the upgrade for SQWARK
+// remediation + ongoing operational headroom. All authority-gated; the
+// caller is responsible for passing the correct signer.
+
+/**
+ * Build a `claim_push` instruction. Same accounting as user-signed `claim`,
+ * but `pool.authority` signs and pays for any first-time `RewardCheckpoint`
+ * rent. Recipient is enforced on-chain as `position.owner`'s ATA — authority
+ * cannot redirect.
+ *
+ * Used by the auto-push job to settle rewards on a cadence so users don't
+ * need to manually claim. For wSOL rewards the user receives wrapped SOL
+ * in their wSOL ATA (we can't auto-unwrap since closeAccount needs the ATA
+ * owner's signature — they unwrap in their wallet/Jupiter when convenient).
+ */
+export async function claimPushIx({
+  connection,
+  authority,
+  stakeMint,
+  rewardTokenMint,
+  position,
+  userTokenAccount,
+}) {
+  const program = loadProgramReadOnly(connection);
+  const tokenProgram = await detectTokenProgram(connection, rewardTokenMint);
+  const pool = findPoolPda(stakeMint);
+  const rewardMintPda = findRewardMintPda(pool, rewardTokenMint);
+  const vault = getAssociatedTokenAddressSync(rewardTokenMint, pool, true, tokenProgram);
+  const checkpoint = findCheckpointPda(position, rewardMintPda);
+  const ix = await program.methods
+    .claimPush()
+    .accounts({
+      pool,
+      authority: pubkeyOf(authority),
+      rewardMint: rewardMintPda,
+      mint: rewardTokenMint,
+      vault,
+      position,
+      checkpoint,
+      userTokenAccount,
+      tokenProgram,
+      systemProgram: SystemProgram.programId,
+      rent: SYSVAR_RENT_PUBKEY,
+    })
+    .instruction();
+  return { ix, pool, rewardMintPda, vault, checkpoint, tokenProgram };
+}
+
+export async function setPoolAuthorityIx({ connection, authority, stakeMint, newAuthority }) {
+  const program = loadProgramReadOnly(connection);
+  const pool = findPoolPda(stakeMint);
+  const ix = await program.methods
+    .setPoolAuthority(newAuthority)
+    .accounts({ pool, authority: pubkeyOf(authority) })
+    .instruction();
+  return { ix, pool };
+}
+
+export async function setPausedIx({ connection, authority, stakeMint, paused }) {
+  const program = loadProgramReadOnly(connection);
+  const pool = findPoolPda(stakeMint);
+  const ix = await program.methods
+    .setPaused(Boolean(paused))
+    .accounts({ pool, authority: pubkeyOf(authority) })
+    .instruction();
+  return { ix, pool };
+}
+
+/**
+ * Drain a reward vault to a recipient ATA. `amount = 0` sweeps everything.
+ * Caller must have already created `recipientAta` (use
+ * `createAssociatedTokenAccountIdempotentInstruction` if unsure).
+ */
+export async function sweepRewardVaultIx({
+  connection,
+  authority,
+  stakeMint,
+  rewardTokenMint,
+  recipientAta,
+  amount = 0,
+}) {
+  const program = loadProgramReadOnly(connection);
+  const tokenProgram = await detectTokenProgram(connection, rewardTokenMint);
+  const pool = findPoolPda(stakeMint);
+  const rewardMintPda = findRewardMintPda(pool, rewardTokenMint);
+  const vault = getAssociatedTokenAddressSync(rewardTokenMint, pool, true, tokenProgram);
+  const ix = await program.methods
+    .sweepRewardVault(new BN(amount.toString()))
+    .accounts({
+      pool,
+      authority: pubkeyOf(authority),
+      rewardMint: rewardMintPda,
+      mint: rewardTokenMint,
+      vault,
+      recipientAta,
+      tokenProgram,
+    })
+    .instruction();
+  return { ix, pool, rewardMintPda, vault };
+}
+
+export async function adminResetCheckpointIx({
+  connection,
+  authority,
+  stakeMint,
+  rewardTokenMint,
+  position,
+  newAccPerShare,
+}) {
+  const program = loadProgramReadOnly(connection);
+  const pool = findPoolPda(stakeMint);
+  const rewardMintPda = findRewardMintPda(pool, rewardTokenMint);
+  const checkpoint = findCheckpointPda(position, rewardMintPda);
+  const ix = await program.methods
+    .adminResetCheckpoint(new BN(newAccPerShare.toString()))
+    .accounts({
+      pool,
+      authority: pubkeyOf(authority),
+      rewardMint: rewardMintPda,
+      position,
+      checkpoint,
+    })
+    .instruction();
+  return { ix, pool, rewardMintPda, checkpoint };
+}
+
+export async function adminResetRewardMintIx({
+  connection,
+  authority,
+  stakeMint,
+  rewardTokenMint,
+  newAccPerShare = 0,
+  newTotalDeposited = 0,
+  newTotalClaimed = 0,
+}) {
+  const program = loadProgramReadOnly(connection);
+  const pool = findPoolPda(stakeMint);
+  const rewardMintPda = findRewardMintPda(pool, rewardTokenMint);
+  const ix = await program.methods
+    .adminResetRewardMint(
+      new BN(newAccPerShare.toString()),
+      new BN(newTotalDeposited.toString()),
+      new BN(newTotalClaimed.toString()),
+    )
+    .accounts({
+      pool,
+      authority: pubkeyOf(authority),
+      rewardMint: rewardMintPda,
+    })
+    .instruction();
+  return { ix, pool, rewardMintPda };
+}
+
+/**
+ * Build a v3 `redistribute_orphan` instruction. **No signer required** — this
+ * is permissionless. The on-chain handler validates that
+ * `vault_balance >= total_deposited - total_claimed` AFTER the bump, so an
+ * over-specified `amount` will revert with `InsufficientVaultForRedistribute`
+ * and no state changes.
+ *
+ * `amount` is the orphan to re-attribute to current active stakers. It bumps
+ * `reward_mint.acc_per_share` by `(amount × 1e18) / pool.total_effective`
+ * and `reward_mint.total_deposited` by `amount`. Vault is NOT touched.
+ *
+ * Compute it off-chain as:
+ *   ```
+ *   orphan = vault_balance - sum_over_active[
+ *     cp.claimable + (rm.acc_per_share - cp.acc_per_share) * pos.effective / 1e18
+ *   ]
+ *   ```
+ * with a small (~0.1%) safety margin in stakers' favour.
+ */
+export async function redistributeOrphanIx({
+  connection,
+  stakeMint,
+  rewardTokenMint,
+  amount,
+}) {
+  const program = loadProgramReadOnly(connection);
+  const tokenProgram = await detectTokenProgram(connection, rewardTokenMint);
+  const pool = findPoolPda(stakeMint);
+  const rewardMintPda = findRewardMintPda(pool, rewardTokenMint);
+  const vault = getAssociatedTokenAddressSync(rewardTokenMint, pool, true, tokenProgram);
+  const ix = await program.methods
+    .redistributeOrphan(new BN(amount.toString()))
+    .accounts({
+      pool,
+      rewardMint: rewardMintPda,
+      mint: rewardTokenMint,
+      vault,
+      tokenProgram,
+    })
+    .instruction();
+  return { ix, pool, rewardMintPda, vault };
+}
+
 export async function fetchPool({ connection, signer: _signerIgnored, stakeMint }) {
   const program = loadProgramReadOnly(connection);
   const pool = findPoolPda(stakeMint);
@@ -373,9 +570,10 @@ export async function fetchStakersLeaderboard({ connection, stakeMint, rewardMin
     fetchRewardMint({ connection, stakeMint, rewardMint }),
   ]);
   const accPerShareLatest = rm?.accPerShare ? new BN(rm.accPerShare.toString()) : new BN(0);
-  // Anchor 0.31 codec returns BN for u128; SCALE matches the on-chain Q64.64
-  // accumulator (1e12 used by the program).
-  const SCALE = new BN('1000000000000');
+  // MUST match `ACC_PRECISION = 1_000_000_000_000_000_000` (1e18) in
+  // programs/pob-index-stake/src/state.rs. The previous 1e12 baked into this
+  // file made every leaderboard "pending" reading 1,000,000× too big.
+  const SCALE = new BN('1000000000000000000');
 
   // Total effective for share-of-pool denomination — sum across positions
   // (more reliable than the StakePool's totalEffective if the pool's value

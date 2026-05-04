@@ -30,6 +30,10 @@ import multer from 'multer';
 import { PublicKey } from '@solana/web3.js';
 import { config, authoritySigner, getConnection } from './config.js';
 import { getPool, listPools } from './registry.js';
+import { runPoolCycle } from './claim-and-distribute.js';
+import { getUserPrefs, setUserPrefs } from './user-prefs.js';
+import nacl from 'tweetnacl';
+import bs58 from 'bs58';
 import { fetchPool, fetchRewardMint, fetchActivePositions, fetchStakersLeaderboard } from './stake-program.js';
 import {
   prepareCreatorLaunch,
@@ -62,6 +66,7 @@ import {
   listKolScanCategories,
 } from './snipe/kol-list.js';
 import { runKolAirdrop, previewKolAirdrop } from './snipe/kol-airdrop.js';
+import { runDumpAndAbsorb, quoteChoreography, DEFAULT_CHOREOGRAPHY_CONFIG } from './snipe/choreography.js';
 import {
   listTokens as listMmTokens,
   getTokenInternal as getMmTokenInternal,
@@ -154,6 +159,92 @@ app.get('/api/info', (req, res) => {
     loopIntervalMs: config.loopIntervalMs,
     repo: process.env.PUBLIC_REPO_URL || 'https://github.com/scufffd/stakrr',
   });
+});
+
+/**
+ * GET /api/user-prefs/:wallet
+ *
+ * Public, read-only. Returns the saved preferences for a wallet, or null
+ * fields when none exist yet (the frontend should treat null `autoPush` as
+ * "auto-push enabled" — that's the resolver default in user-prefs.js).
+ */
+app.get('/api/user-prefs/:wallet', (req, res) => {
+  try {
+    const wallet = String(req.params.wallet || '').trim();
+    if (!wallet) return res.status(400).json({ ok: false, error: 'wallet required' });
+    try { new PublicKey(wallet); }
+    catch { return res.status(400).json({ ok: false, error: 'invalid wallet pubkey' }); }
+    const prefs = getUserPrefs(wallet);
+    res.json({
+      ok: true,
+      wallet,
+      prefs: prefs || null,
+      // Resolver default — keeps the frontend from having to know the rule.
+      effectiveAutoPush: prefs ? (prefs.autoPush !== false) : true,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * POST /api/user-prefs/:wallet
+ *
+ * Update preferences. Authenticated by a fresh ed25519 signature from the
+ * wallet's keypair over a canonical message:
+ *   `stakrr-prefs:<wallet>:<signedAt>`
+ * `signedAt` (ISO timestamp) must be within ±5 minutes of the server clock
+ * to prevent replay. The frontend produces the signature via
+ * `wallet.signMessage(...)` from solana-wallet-adapter.
+ *
+ * Body:
+ *   {
+ *     autoPush: boolean,   // the only mutable pref today
+ *     signedAt: string,    // ISO-8601 (server side: ±300s window)
+ *     signature: string,   // base58-encoded 64-byte ed25519 sig
+ *   }
+ */
+app.post('/api/user-prefs/:wallet', (req, res) => {
+  try {
+    const wallet = String(req.params.wallet || '').trim();
+    if (!wallet) return res.status(400).json({ ok: false, error: 'wallet required' });
+    let walletPk;
+    try { walletPk = new PublicKey(wallet); }
+    catch { return res.status(400).json({ ok: false, error: 'invalid wallet pubkey' }); }
+
+    const { autoPush, signedAt, signature } = req.body || {};
+    if (typeof autoPush !== 'boolean') {
+      return res.status(400).json({ ok: false, error: 'autoPush must be boolean' });
+    }
+    if (!signedAt || !signature) {
+      return res.status(400).json({ ok: false, error: 'signedAt + signature required' });
+    }
+    const ts = Date.parse(signedAt);
+    if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > 5 * 60 * 1000) {
+      return res.status(400).json({ ok: false, error: 'signedAt outside ±5 minute window' });
+    }
+    const message = `stakrr-prefs:${wallet}:${signedAt}`;
+    let sigBytes;
+    try { sigBytes = bs58.decode(signature); }
+    catch { return res.status(400).json({ ok: false, error: 'signature is not base58' }); }
+    if (sigBytes.length !== 64) {
+      return res.status(400).json({ ok: false, error: 'signature must be 64 bytes' });
+    }
+    const ok = nacl.sign.detached.verify(
+      Buffer.from(message, 'utf8'),
+      sigBytes,
+      walletPk.toBytes(),
+    );
+    if (!ok) return res.status(403).json({ ok: false, error: 'signature does not match wallet' });
+
+    const updated = setUserPrefs(wallet, {
+      autoPush,
+      autoPushSource: 'user_set',
+    });
+    res.json({ ok: true, wallet, prefs: updated, effectiveAutoPush: updated.autoPush !== false });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 /**
@@ -297,6 +388,7 @@ app.get('/api/admin/snipe/wallets', requireAdmin, requireVault, async (req, res)
     const filter = {};
     if (req.query.source) filter.source = String(req.query.source);
     if (req.query.launchMint) filter.launchMint = String(req.query.launchMint);
+    if (req.query.tier) filter.tier = String(req.query.tier);
     const wallets = await listWalletsWithBalances(filter);
     res.json({ ok: true, wallets });
   } catch (e) {
@@ -309,8 +401,9 @@ app.post('/api/admin/snipe/wallets/generate', requireAdmin, requireVault, (req, 
     const body = req.body || {};
     const count = Math.max(1, Math.min(20, Number(body.count) || 1));
     const source = body.source === 'ephemeral' ? 'ephemeral' : 'pool';
+    const tier = body.tier || null;
     if (source === 'ephemeral') {
-      const created = ensureEphemeralWallets(count, { labelPrefix: body.labelPrefix || 'ephemeral' });
+      const created = ensureEphemeralWallets(count, { labelPrefix: body.labelPrefix || 'ephemeral', tier });
       return res.json({ ok: true, created });
     }
     const created = [];
@@ -319,6 +412,7 @@ app.post('/api/admin/snipe/wallets/generate', requireAdmin, requireVault, (req, 
         label: body.label ? `${body.label}-${i + 1}` : undefined,
         source: 'pool',
         tags: Array.isArray(body.tags) ? body.tags : [],
+        tier,
       }));
     }
     res.json({ ok: true, created });
@@ -337,6 +431,7 @@ app.post('/api/admin/snipe/wallets/import', requireAdmin, requireVault, (req, re
       source: body.source === 'ephemeral' ? 'ephemeral' : 'pool',
       tags: Array.isArray(body.tags) ? body.tags : [],
       launchMint: body.launchMint || null,
+      tier: body.tier || null,
     });
     res.json({ ok: true, wallet });
   } catch (e) {
@@ -403,12 +498,16 @@ app.post('/api/admin/snipe/wallets/:id/export', requireAdmin, requireVault, (req
 app.post('/api/admin/snipe/quote', requireAdmin, requireVault, async (req, res) => {
   try {
     const body = req.body || {};
+    const mm = body.mm && body.mm.walletId && Number(body.mm.entrySol) > 0
+      ? { walletId: body.mm.walletId, entrySol: Number(body.mm.entrySol) }
+      : null;
     const out = await quoteStealthLaunch({
       devWalletId: body.devWalletId,
       sniperWalletIds: Array.isArray(body.sniperWalletIds) ? body.sniperWalletIds : [],
       devBuySol: Number(body.devBuySol) || 0,
       sniperSolPerWallet: Number(body.sniperSolPerWallet) || 0,
       jitoTipSol: body.jitoTipSol == null ? null : Number(body.jitoTipSol),
+      mm,
     });
     res.json({ ok: true, quote: out });
   } catch (e) {
@@ -473,6 +572,43 @@ app.post('/api/admin/snipe/launch', requireAdmin, requireVault, upload.single('i
       }
     }
 
+    // Optional MM seed: { walletId, entrySol, config? }. Same multipart-vs-JSON
+    // dance as kolAirdrop. The MM wallet buys at creator price as part of
+    // the bundle, then the daemon picks the mint up automatically.
+    let mm = null;
+    if (body.mm) {
+      let parsed = body.mm;
+      if (typeof parsed === 'string') {
+        try { parsed = JSON.parse(parsed); }
+        catch { return res.status(400).json({ ok: false, error: 'mm must be valid JSON' }); }
+      }
+      if (parsed && parsed.walletId && Number(parsed.entrySol) > 0) {
+        mm = {
+          walletId: String(parsed.walletId),
+          entrySol: Number(parsed.entrySol),
+          config: parsed.config && typeof parsed.config === 'object' ? parsed.config : {},
+        };
+      }
+    }
+
+    // Optional choreography: { absorberWalletIds: [...], config: {...} }.
+    // Runs the dev-rug + absorber-wall sequence after pool init confirms.
+    let choreography = null;
+    if (body.choreography) {
+      let parsed = body.choreography;
+      if (typeof parsed === 'string') {
+        try { parsed = JSON.parse(parsed); }
+        catch { return res.status(400).json({ ok: false, error: 'choreography must be valid JSON' }); }
+      }
+      if (parsed && (Array.isArray(parsed.absorberWalletIds) || parsed.config)) {
+        choreography = {
+          absorberWalletIds: Array.isArray(parsed.absorberWalletIds) ? parsed.absorberWalletIds : [],
+          config: parsed.config && typeof parsed.config === 'object' ? parsed.config : {},
+          filterTier: parsed.filterTier !== false,
+        };
+      }
+    }
+
     const result = await stealthLaunch({
       devWalletId: body.devWalletId,
       sniperWalletIds,
@@ -489,6 +625,8 @@ app.post('/api/admin/snipe/launch', requireAdmin, requireVault, upload.single('i
       metadataImageUrl: body.metadataImageUrl || null,
       initiatedBy: initiatorPk,
       kolAirdrop,
+      mm,
+      choreography,
     });
     res.json(result);
   } catch (e) {
@@ -715,11 +853,144 @@ app.post('/api/admin/snipe/kol/run', requireAdmin, requireVault, async (req, res
   }
 });
 
+// ── Choreography: dev rug + absorber wall (admin-only, anti-sniper) ──────────
+
+app.get('/api/admin/snipe/choreography/info', requireAdmin, (_req, res) => {
+  res.json({ ok: true, defaults: DEFAULT_CHOREOGRAPHY_CONFIG });
+});
+
+app.post('/api/admin/snipe/choreography/quote', requireAdmin, requireVault, (req, res) => {
+  try {
+    const body = req.body || {};
+    const out = quoteChoreography({
+      absorberWalletIds: Array.isArray(body.absorberWalletIds) ? body.absorberWalletIds : [],
+      config: body.config || {},
+    });
+    res.json({ ok: true, quote: out });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * Standalone choreography on an already-launched mint. Used both for
+ * retroactive runs (admin re-triggers after a launch) and as the worker
+ * the in-launch flow calls when `choreography.enabled = true`.
+ *
+ * Long-running — can take 30s+ for the full drip window. Caller should
+ * bump their HTTP client timeout accordingly. We respond when complete.
+ */
+app.post('/api/admin/snipe/choreography/run', requireAdmin, requireVault, async (req, res) => {
+  try {
+    const { mint, devWalletId, absorberWalletIds = [], config = {}, snipeId, filterTier } = req.body || {};
+    if (!mint || !devWalletId) {
+      return res.status(400).json({ ok: false, error: 'mint and devWalletId required' });
+    }
+    const out = await runDumpAndAbsorb({
+      snipeId: snipeId || null,
+      mint,
+      devWalletId,
+      absorberWalletIds: Array.isArray(absorberWalletIds) ? absorberWalletIds : [],
+      filterTier: filterTier !== false,
+      config,
+    });
+    res.json({ ok: true, result: out });
+  } catch (e) {
+    console.error(JSON.stringify({
+      ts: new Date().toISOString(),
+      message: 'choreography failed',
+      error: e.message,
+      stack: e.stack?.split('\n').slice(0, 6),
+    }));
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── MM bot (admin-only) ──────────────────────────────────────────────────────
 //
 // Per-token market-making config + status. Bot itself runs in a separate
 // pm2 process (`stakrr-mm`) reading worker/data/mm.json on every tick.
 // These endpoints just CRUD the config and surface state for the admin UI.
+
+// ── Treasury health + manual cycle trigger (admin-only) ─────────────────────
+//
+// The treasury wallet pays for every claim/distribute/wrap/deposit tx. If it
+// dips below ~0.005 SOL the cycle preflight skips the claim — this endpoint
+// surfaces the live balance + reserve targets so the admin dashboard can
+// flag the situation BEFORE stakers complain about missing rewards (which
+// is how we caught the 26-hour silent outage that prompted this code).
+
+app.get('/api/admin/treasury/status', requireAdmin, async (_req, res) => {
+  try {
+    const connection = getConnection();
+    const treasuryPk = config.treasuryKeypair.publicKey;
+    const platformVaultPk = config.platformFeeVault || null;
+    const minReserveSol = parseFloat(process.env.TREASURY_MIN_RESERVE_SOL || '0.005');
+    const targetReserveSol = parseFloat(process.env.TREASURY_TARGET_RESERVE_SOL || '0.05');
+    const [treasuryLamports, platformVaultLamports] = await Promise.all([
+      connection.getBalance(treasuryPk, 'confirmed'),
+      platformVaultPk ? connection.getBalance(platformVaultPk, 'confirmed') : Promise.resolve(null),
+    ]);
+    const treasurySol = treasuryLamports / 1e9;
+    const status = treasurySol < minReserveSol
+      ? 'critical'
+      : (treasurySol < targetReserveSol ? 'low' : 'ok');
+    res.json({
+      ok: true,
+      treasury: {
+        pubkey: treasuryPk.toBase58(),
+        lamports: treasuryLamports,
+        sol: treasurySol,
+      },
+      platformFeeVault: platformVaultPk ? {
+        pubkey: platformVaultPk.toBase58(),
+        lamports: platformVaultLamports,
+        sol: (platformVaultLamports || 0) / 1e9,
+      } : null,
+      reserve: {
+        minSol: minReserveSol,
+        targetSol: targetReserveSol,
+        status,
+        gapToTargetSol: Math.max(0, targetReserveSol - treasurySol),
+      },
+      hint: status === 'critical'
+        ? `Treasury is below the hard floor (${minReserveSol} SOL). All claim cycles are skipped. Send ≥${(targetReserveSol - treasurySol).toFixed(4)} SOL to ${treasuryPk.toBase58()} to resume.`
+        : (status === 'low' ? `Treasury below target (${targetReserveSol} SOL). Cycles will hold back from staker portion to refill.` : null),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * Force a single mint's claim cycle to run NOW. Useful after topping up the
+ * treasury — instead of waiting for the next 10-min loop tick, the admin can
+ * run the cycle immediately and verify it works. Returns the same result
+ * shape as the loop's per-pool result.
+ *
+ * Long-running (claim + distribute + deposit + claim_push for each staker
+ * can take 30-60s). nginx is configured to allow up to 180s for admin paths.
+ */
+app.post('/api/admin/pools/:mint/cycle', requireAdmin, async (req, res) => {
+  try {
+    const pool = getPool(req.params.mint);
+    if (!pool) return res.status(404).json({ ok: false, error: 'pool not found' });
+    if (pool.status !== 'active') {
+      return res.status(409).json({ ok: false, error: `pool status='${pool.status}', expected 'active'` });
+    }
+    const result = await runPoolCycle({ pool });
+    res.json({ ok: true, mint: req.params.mint, result });
+  } catch (e) {
+    console.error(JSON.stringify({
+      ts: new Date().toISOString(),
+      message: 'manual pool cycle failed',
+      mint: req.params.mint,
+      error: e.message,
+      stack: e.stack?.split('\n').slice(0, 6),
+    }));
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 app.get('/api/admin/mm/info', requireAdmin, (req, res) => {
   res.json({

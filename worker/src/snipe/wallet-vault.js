@@ -20,6 +20,7 @@
 //       "id": "wlt_abc",
 //       "label": "snipe-1",
 //       "source": "pool" | "ephemeral",
+//       "tier":   "sniper" | "absorber" | "mm" | "dev" | null,
 //       "publicKey": "...",
 //       "tags": ["..."],
 //       "launchMint": "..." | null,    // ephemeral wallets pin to a launch
@@ -30,6 +31,12 @@
 //         "ct":  "<hex>"
 //       }
 //     }]
+//
+// `tier` is purely an organisational/role hint used by the launch
+// orchestrator (e.g. choreography only picks tier=='absorber' wallets for
+// the post-rug accumulation wave so they aren't mixed with the in-bundle
+// snipers — separating them is what makes the absorber wave look like
+// "fresh non-sniper money" to trading terminals).
 //   }
 
 import fs from 'node:fs';
@@ -138,11 +145,14 @@ function sanitize(w) {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-export function listWallets({ source = null, launchMint = null } = {}) {
+export const VALID_TIERS = ['sniper', 'absorber', 'mm', 'dev'];
+
+export function listWallets({ source = null, launchMint = null, tier = null } = {}) {
   const reg = readVaultRaw();
   return reg.wallets
     .filter((w) => (source == null || w.source === source))
     .filter((w) => (launchMint == null || w.launchMint === launchMint))
+    .filter((w) => (tier == null || (w.tier || null) === tier))
     .map(sanitize);
 }
 
@@ -162,9 +172,12 @@ export function getKeypairById(id) {
 }
 
 /** Generate a brand-new keypair and persist it. */
-export function generateWallet({ label, source = 'pool', tags = [], launchMint = null } = {}) {
+export function generateWallet({ label, source = 'pool', tags = [], launchMint = null, tier = null } = {}) {
   if (source !== 'pool' && source !== 'ephemeral') {
     throw new Error(`vault: invalid source "${source}" (expected pool|ephemeral)`);
+  }
+  if (tier != null && !VALID_TIERS.includes(tier)) {
+    throw new Error(`vault: invalid tier "${tier}" (expected ${VALID_TIERS.join('|')} or null)`);
   }
   // Ephemeral wallets typically pin to a launchMint, but that's set AFTER the
   // bundle confirms (we don't know the mint until then). Allow null on create.
@@ -176,6 +189,7 @@ export function generateWallet({ label, source = 'pool', tags = [], launchMint =
     id: newId(),
     label: label || `${source}-${reg.wallets.length + 1}`,
     source,
+    tier: tier || null,
     publicKey: kp.publicKey.toBase58(),
     tags: Array.isArray(tags) ? tags.slice(0, 8) : [],
     launchMint: launchMint || null,
@@ -191,10 +205,13 @@ export function generateWallet({ label, source = 'pool', tags = [], launchMint =
  * Import an existing keypair (base58 secret OR JSON array of bytes).
  * Refuses to add a duplicate publicKey.
  */
-export function importWallet({ label, secretKey, source = 'pool', tags = [], launchMint = null } = {}) {
+export function importWallet({ label, secretKey, source = 'pool', tags = [], launchMint = null, tier = null } = {}) {
   if (!secretKey) throw new Error('vault: secretKey required');
   if (source !== 'pool' && source !== 'ephemeral') {
     throw new Error(`vault: invalid source "${source}"`);
+  }
+  if (tier != null && !VALID_TIERS.includes(tier)) {
+    throw new Error(`vault: invalid tier "${tier}"`);
   }
   ensureKey();
 
@@ -233,6 +250,7 @@ export function importWallet({ label, secretKey, source = 'pool', tags = [], lau
     id: newId(),
     label: label || `imported-${reg.wallets.length + 1}`,
     source,
+    tier: tier || null,
     publicKey: pk,
     tags: Array.isArray(tags) ? tags.slice(0, 8) : [],
     launchMint: launchMint || null,
@@ -258,14 +276,25 @@ export function updateWallet(id, patch = {}) {
   const reg = readVaultRaw();
   const idx = reg.wallets.findIndex((w) => w.id === id);
   if (idx === -1) return null;
-  const allowed = ['label', 'tags', 'launchMint'];
+  const allowed = ['label', 'tags', 'launchMint', 'tier'];
+  if (patch.tier != null && patch.tier !== '' && !VALID_TIERS.includes(patch.tier)) {
+    throw new Error(`vault: invalid tier "${patch.tier}"`);
+  }
   const next = { ...reg.wallets[idx] };
   for (const k of allowed) {
-    if (patch[k] !== undefined) next[k] = patch[k];
+    if (patch[k] !== undefined) next[k] = patch[k] === '' ? null : patch[k];
   }
   reg.wallets[idx] = next;
   writeVault(reg);
   return sanitize(next);
+}
+
+/** Convenience: just set/clear a wallet's tier. Pass `null` to clear. */
+export function setTier(id, tier) {
+  if (tier != null && !VALID_TIERS.includes(tier)) {
+    throw new Error(`vault: invalid tier "${tier}"`);
+  }
+  return updateWallet(id, { tier });
 }
 
 /**
@@ -320,12 +349,16 @@ export async function listWalletsWithBalances(filter = {}) {
 export function vaultStats() {
   const reg = readVaultRaw();
   const counts = { pool: 0, ephemeral: 0, total: reg.wallets.length };
+  const tierCounts = { sniper: 0, absorber: 0, mm: 0, dev: 0, untiered: 0 };
   for (const w of reg.wallets) {
     counts[w.source] = (counts[w.source] || 0) + 1;
+    if (w.tier && tierCounts[w.tier] != null) tierCounts[w.tier] += 1;
+    else tierCounts.untiered += 1;
   }
   return {
     enabled: vaultEnabled(),
     file: vaultFilePath(),
     counts,
+    tierCounts,
   };
 }

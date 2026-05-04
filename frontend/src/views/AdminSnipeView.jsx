@@ -25,6 +25,15 @@ const SUB = '#444';
 const MUTED = '#888';
 const ERR = '#dc2626';
 const OK = '#16a34a';
+
+// Tier palette — keep in lockstep with the kind-pill in the snipes drawer
+// so a wallet's role looks the same wherever it's shown.
+const TIER_COLORS = {
+  sniper:   { bg: '#dbeafe', fg: '#1e40af' },
+  absorber: { bg: '#dcfce7', fg: '#166534' },
+  mm:       { bg: '#ede9fe', fg: '#6d28d9' },
+  dev:      { bg: '#fce7f3', fg: '#9d174d' },
+};
 const WARN = '#d97706';
 const BORDER = '#e5e7eb';
 
@@ -243,6 +252,26 @@ function WalletsTab({ adminPk }) {
     }
   }, [adminPk, reload]);
 
+  // Tier selection — purely organisational. The launch choreography uses
+  // `tier === 'absorber'` to pick wallets for the post-rug accumulation
+  // wave (separated from the in-bundle snipers so terminals don't cluster
+  // them). Empty string clears the tier on the backend.
+  const handleSetTier = useCallback(async (id, tier) => {
+    setBusy(id);
+    try {
+      await adminFetch(`/api/admin/snipe/wallets/${id}`, {
+        method: 'PATCH',
+        adminPk,
+        body: { tier: tier || null },
+      });
+      await reload();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(null);
+    }
+  }, [adminPk, reload]);
+
   const totalPoolSol = useMemo(
     () => wallets.filter((w) => w.source === 'pool').reduce((s, w) => s + (w.sol || 0), 0),
     [wallets],
@@ -340,6 +369,7 @@ function WalletsTab({ adminPk }) {
             <tr>
               <th style={th}>label</th>
               <th style={th}>source</th>
+              <th style={th} title="Tier — used by the launch choreography to pick which wallets play which role. Set to 'absorber' for the post-rug accumulation wave.">tier</th>
               <th style={th}>public key</th>
               <th style={{ ...th, textAlign: 'right' }}>SOL</th>
               <th style={th}>launch</th>
@@ -348,45 +378,67 @@ function WalletsTab({ adminPk }) {
             </tr>
           </thead>
           <tbody>
-            {filtered.map((w) => (
-              <tr key={w.id}>
-                <td style={td}><span style={{ fontWeight: 600 }}>{w.label}</span></td>
-                <td style={td}>
-                  <span style={{
-                    padding: '2px 6px', borderRadius: 4, fontSize: 11,
-                    background: w.source === 'pool' ? '#dbeafe' : '#f1f5f9',
-                    color: w.source === 'pool' ? '#1e40af' : '#475569',
-                  }}>{w.source}</span>
-                </td>
-                <td style={{ ...td, fontFamily: 'monospace', fontSize: 12 }}>
-                  <button
-                    onClick={() => navigator.clipboard?.writeText(w.publicKey)}
-                    title={`${w.publicKey} — click to copy`}
-                    style={{ background: 'none', border: 'none', cursor: 'pointer', color: INK, padding: 0 }}
-                  >
-                    {shortPk(w.publicKey, 5)}
-                  </button>
-                </td>
-                <td style={{ ...td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
-                  {w.solError ? <span style={{ color: ERR }} title={w.solError}>err</span> : fmtSol(w.sol)}
-                </td>
-                <td style={{ ...td, fontFamily: 'monospace', fontSize: 12 }}>
-                  {w.launchMint ? shortPk(w.launchMint, 4) : <span style={{ color: MUTED }}>—</span>}
-                </td>
-                <td style={{ ...td, color: MUTED }}>{timeAgo(w.createdAt)}</td>
-                <td style={td}>
-                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                    <button onClick={() => handleRename(w.id, w.label)} disabled={busy === w.id} style={tinyBtn}>rename</button>
-                    <button onClick={() => handleSweep(w.id)} disabled={busy === w.id || !w.sol} style={tinyBtn}>sweep</button>
-                    <button onClick={() => handleExport(w.id)} disabled={busy === w.id} style={{ ...tinyBtn, color: WARN }}>export</button>
-                    <button onClick={() => handleDelete(w.id)} disabled={busy === w.id} style={{ ...tinyBtn, color: ERR }}>delete</button>
-                  </div>
-                </td>
-              </tr>
-            ))}
+            {filtered.map((w) => {
+              const tierColor = TIER_COLORS[w.tier] || { bg: '#f3f4f6', fg: '#6b7280' };
+              return (
+                <tr key={w.id}>
+                  <td style={td}><span style={{ fontWeight: 600 }}>{w.label}</span></td>
+                  <td style={td}>
+                    <span style={{
+                      padding: '2px 6px', borderRadius: 4, fontSize: 11,
+                      background: w.source === 'pool' ? '#dbeafe' : '#f1f5f9',
+                      color: w.source === 'pool' ? '#1e40af' : '#475569',
+                    }}>{w.source}</span>
+                  </td>
+                  <td style={td}>
+                    <select
+                      value={w.tier || ''}
+                      onChange={(e) => handleSetTier(w.id, e.target.value)}
+                      disabled={busy === w.id}
+                      style={{
+                        padding: '2px 6px', fontSize: 11, borderRadius: 4,
+                        background: tierColor.bg, color: tierColor.fg,
+                        border: `1px solid ${BORDER}`, fontWeight: w.tier ? 600 : 400,
+                        cursor: busy === w.id ? 'wait' : 'pointer',
+                      }}
+                    >
+                      <option value="">— none —</option>
+                      <option value="sniper">sniper</option>
+                      <option value="absorber">absorber</option>
+                      <option value="mm">mm</option>
+                      <option value="dev">dev</option>
+                    </select>
+                  </td>
+                  <td style={{ ...td, fontFamily: 'monospace', fontSize: 12 }}>
+                    <button
+                      onClick={() => navigator.clipboard?.writeText(w.publicKey)}
+                      title={`${w.publicKey} — click to copy`}
+                      style={{ background: 'none', border: 'none', cursor: 'pointer', color: INK, padding: 0 }}
+                    >
+                      {shortPk(w.publicKey, 5)}
+                    </button>
+                  </td>
+                  <td style={{ ...td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                    {w.solError ? <span style={{ color: ERR }} title={w.solError}>err</span> : fmtSol(w.sol)}
+                  </td>
+                  <td style={{ ...td, fontFamily: 'monospace', fontSize: 12 }}>
+                    {w.launchMint ? shortPk(w.launchMint, 4) : <span style={{ color: MUTED }}>—</span>}
+                  </td>
+                  <td style={{ ...td, color: MUTED }}>{timeAgo(w.createdAt)}</td>
+                  <td style={td}>
+                    <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                      <button onClick={() => handleRename(w.id, w.label)} disabled={busy === w.id} style={tinyBtn}>rename</button>
+                      <button onClick={() => handleSweep(w.id)} disabled={busy === w.id || !w.sol} style={tinyBtn}>sweep</button>
+                      <button onClick={() => handleExport(w.id)} disabled={busy === w.id} style={{ ...tinyBtn, color: WARN }}>export</button>
+                      <button onClick={() => handleDelete(w.id)} disabled={busy === w.id} style={{ ...tinyBtn, color: ERR }}>delete</button>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
             {filtered.length === 0 && (
               <tr>
-                <td style={{ ...td, textAlign: 'center', color: MUTED, padding: 24 }} colSpan={7}>
+                <td style={{ ...td, textAlign: 'center', color: MUTED, padding: 24 }} colSpan={8}>
                   {loading ? 'loading…' : 'No wallets in this filter. Generate or import above.'}
                 </td>
               </tr>
@@ -418,7 +470,7 @@ function LaunchTab({ adminPk, onLaunched }) {
   const [sniperIds, setSniperIds] = useState([]);
   const [devBuySol, setDevBuySol] = useState('0.1');
   const [sniperSolPerWallet, setSniperSolPerWallet] = useState('0.05');
-  const [jitoTipSol, setJitoTipSol] = useState('0.001');
+  const [jitoTipSol, setJitoTipSol] = useState('0.005');
   const [slippageBps, setSlippageBps] = useState('5000');
   const [rewardMode, setRewardMode] = useState('sol');
 
@@ -455,6 +507,41 @@ function LaunchTab({ adminPk, onLaunched }) {
   const [kolScanLoading, setKolScanLoading] = useState(false);
   const [kolScanErr, setKolScanErr] = useState(null);
 
+  // MM seed bootstrap (optional). MM wallet buys at creator price as part
+  // of the launch bundle, then the daemon picks the mint up automatically
+  // and starts cycling buys/sells with bankroll/drawdown kill switches.
+  // The early-entry bag is what makes the strategy structurally profitable.
+  const [mmEnabled, setMmEnabled] = useState(false);
+  const [mmWalletId, setMmWalletId] = useState('');
+  const [mmEntrySol, setMmEntrySol] = useState('0.05');
+  const [mmBankrollSol, setMmBankrollSol] = useState('0.5');
+  const [mmDrawdownPct, setMmDrawdownPct] = useState('25');
+  const [mmMinBuySol, setMmMinBuySol] = useState('0.005');
+  const [mmMaxBuySol, setMmMaxBuySol] = useState('0.02');
+  const [mmMinIntervalSec, setMmMinIntervalSec] = useState('45');
+  const [mmMaxIntervalSec, setMmMaxIntervalSec] = useState('180');
+  const [mmSlippage, setMmSlippage] = useState('15');
+
+  // Choreography (dev rug + absorber wall, anti-sniper play). After pool
+  // init confirms, the dev wallet sells (max scare → snipers exit), then
+  // a wave of clean absorber wallets buys to absorb the supply. Each
+  // absorber can optionally auto-stake to lock its bag.
+  const [choreoEnabled, setChoreoEnabled] = useState(false);
+  const [choreoAbsorberIds, setChoreoAbsorberIds] = useState([]);
+  const [choreoDevStakePct, setChoreoDevStakePct] = useState('0');
+  const [choreoDevStakeLockDays, setChoreoDevStakeLockDays] = useState('7');
+  const [choreoDevSellPct, setChoreoDevSellPct] = useState('100');
+  const [choreoDevSellDelayBlocks, setChoreoDevSellDelayBlocks] = useState('3');
+  const [choreoAbsorberWaveDelayBlocks, setChoreoAbsorberWaveDelayBlocks] = useState('4');
+  const [choreoAbsorberWaveSize, setChoreoAbsorberWaveSize] = useState('4');
+  const [choreoAbsorberBuyMinSol, setChoreoAbsorberBuyMinSol] = useState('0.02');
+  const [choreoAbsorberBuyMaxSol, setChoreoAbsorberBuyMaxSol] = useState('0.08');
+  const [choreoAbsorberAutoStakePct, setChoreoAbsorberAutoStakePct] = useState('50');
+  const [choreoAbsorberStakeLockDays, setChoreoAbsorberStakeLockDays] = useState('7');
+  const [choreoDripWindowSec, setChoreoDripWindowSec] = useState('30');
+  const [choreoDripIntervalMinMs, setChoreoDripIntervalMinMs] = useState('1500');
+  const [choreoDripIntervalMaxMs, setChoreoDripIntervalMaxMs] = useState('4000');
+
   const reload = useCallback(async () => {
     if (!adminPk) return;
     setLoading(true);
@@ -474,6 +561,17 @@ function LaunchTab({ adminPk, onLaunched }) {
     () => wallets.filter((w) => (w.sol || 0) > 0).sort((a, b) => (b.sol || 0) - (a.sol || 0)),
     [wallets],
   );
+  // Wallets explicitly tagged as absorbers — only these can be picked for the
+  // choreography wave. Pre-flight requires SOL but we list unfunded too so
+  // the user sees who they need to top-up.
+  const absorberWallets = useMemo(
+    () => wallets.filter((w) => w.tier === 'absorber').sort((a, b) => (b.sol || 0) - (a.sol || 0)),
+    [wallets],
+  );
+  const choreoEstSpendSol = useMemo(() => {
+    const avg = (Number(choreoAbsorberBuyMinSol) + Number(choreoAbsorberBuyMaxSol)) / 2;
+    return choreoAbsorberIds.length * avg;
+  }, [choreoAbsorberIds, choreoAbsorberBuyMinSol, choreoAbsorberBuyMaxSol]);
   // Dev picker: include unfunded wallets if the toggle is on (so a freshly
   // imported wallet shows up before you've topped it up). Sniper picker stays
   // funded-only — pre-flight will reject the launch otherwise.
@@ -577,13 +675,16 @@ function LaunchTab({ adminPk, onLaunched }) {
           devBuySol: Number(devBuySol),
           sniperSolPerWallet: Number(sniperSolPerWallet),
           jitoTipSol: Number(jitoTipSol),
+          mm: mmEnabled && mmWalletId && Number(mmEntrySol) > 0
+            ? { walletId: mmWalletId, entrySol: Number(mmEntrySol) }
+            : null,
         },
       });
       setQuote(out.quote);
     } catch (e) {
       setQuoteErr(e.message);
     }
-  }, [adminPk, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol]);
+  }, [adminPk, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol, mmEnabled, mmWalletId, mmEntrySol]);
 
   useEffect(() => {
     const t = setTimeout(refreshQuote, 250);
@@ -617,7 +718,7 @@ function LaunchTab({ adminPk, onLaunched }) {
       fd.append('sniperWalletIds', JSON.stringify(sniperIds));
       fd.append('devBuySol', String(Number(devBuySol) || 0));
       fd.append('sniperSolPerWallet', String(Number(sniperSolPerWallet) || 0));
-      fd.append('jitoTipSol', String(Number(jitoTipSol) || 0.001));
+      fd.append('jitoTipSol', String(Number(jitoTipSol) || 0.005));
       fd.append('slippageBps', String(Number(slippageBps) || 5000));
       fd.append('rewardMode', rewardMode);
 
@@ -626,6 +727,44 @@ function LaunchTab({ adminPk, onLaunched }) {
           wallets: kolWallets,
           lockDays: Number(kolLockDays) || 7,
           tokenAllocationPct: Number(kolAllocPct) || 25,
+        }));
+      }
+
+      if (mmEnabled && mmWalletId && Number(mmEntrySol) > 0) {
+        fd.append('mm', JSON.stringify({
+          walletId: mmWalletId,
+          entrySol: Number(mmEntrySol),
+          config: {
+            bankrollSol: Number(mmBankrollSol) || 0.5,
+            drawdownPct: Number(mmDrawdownPct) || 25,
+            minBuySol: Number(mmMinBuySol) || 0.005,
+            maxBuySol: Number(mmMaxBuySol) || 0.02,
+            minIntervalSec: Number(mmMinIntervalSec) || 45,
+            maxIntervalSec: Number(mmMaxIntervalSec) || 180,
+            slippage: Number(mmSlippage) || 15,
+          },
+        }));
+      }
+
+      if (choreoEnabled) {
+        fd.append('choreography', JSON.stringify({
+          absorberWalletIds: choreoAbsorberIds,
+          filterTier: true,
+          config: {
+            devStakePct: Number(choreoDevStakePct) || 0,
+            devStakeLockDays: Number(choreoDevStakeLockDays) || 7,
+            devSellPct: Number(choreoDevSellPct) || 100,
+            devSellDelayBlocks: Number(choreoDevSellDelayBlocks) || 3,
+            absorberWaveDelayBlocks: Number(choreoAbsorberWaveDelayBlocks) || 4,
+            absorberWaveSize: Number(choreoAbsorberWaveSize) || 4,
+            absorberBuyMinSol: Number(choreoAbsorberBuyMinSol) || 0.02,
+            absorberBuyMaxSol: Number(choreoAbsorberBuyMaxSol) || 0.08,
+            absorberAutoStakePct: Number(choreoAbsorberAutoStakePct) || 0,
+            absorberStakeLockDays: Number(choreoAbsorberStakeLockDays) || 7,
+            dripWindowSec: Number(choreoDripWindowSec) || 30,
+            dripIntervalMinMs: Number(choreoDripIntervalMinMs) || 1500,
+            dripIntervalMaxMs: Number(choreoDripIntervalMaxMs) || 4000,
+          },
         }));
       }
 
@@ -642,7 +781,7 @@ function LaunchTab({ adminPk, onLaunched }) {
     } finally {
       setSubmitting(false);
     }
-  }, [adminPk, name, symbol, description, twitter, telegram, website, imageFile, imageUrl, metadataUri, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol, slippageBps, rewardMode, kolEnabled, kolWallets, kolLockDays, kolAllocPct, onLaunched]);
+  }, [adminPk, name, symbol, description, twitter, telegram, website, imageFile, imageUrl, metadataUri, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol, slippageBps, rewardMode, kolEnabled, kolWallets, kolLockDays, kolAllocPct, mmEnabled, mmWalletId, mmEntrySol, mmBankrollSol, mmDrawdownPct, mmMinBuySol, mmMaxBuySol, mmMinIntervalSec, mmMaxIntervalSec, mmSlippage, choreoEnabled, choreoAbsorberIds, choreoDevStakePct, choreoDevStakeLockDays, choreoDevSellPct, choreoDevSellDelayBlocks, choreoAbsorberWaveDelayBlocks, choreoAbsorberWaveSize, choreoAbsorberBuyMinSol, choreoAbsorberBuyMaxSol, choreoAbsorberAutoStakePct, choreoAbsorberStakeLockDays, choreoDripWindowSec, choreoDripIntervalMinMs, choreoDripIntervalMaxMs, onLaunched]);
 
   return (
     <form onSubmit={handleSubmit}>
@@ -834,8 +973,8 @@ function LaunchTab({ adminPk, onLaunched }) {
           <Field label="Per-sniper (SOL)">
             <input type="number" step="0.01" min="0" value={sniperSolPerWallet} onChange={(e) => setSniperSolPerWallet(e.target.value)} style={inputStyle} />
           </Field>
-          <Field label="Jito tip (SOL)">
-            <input type="number" step="0.001" min="0.0005" value={jitoTipSol} onChange={(e) => setJitoTipSol(e.target.value)} style={inputStyle} />
+          <Field label="Jito tip (SOL)" hint="Jito's effective floor moves with congestion (typically 0.001-0.005 SOL). Below floor = bundle silently dropped → 'bundle confirmation timed out'. 0.005 is a safe default for most launches.">
+            <input type="number" step="0.001" min="0.001" value={jitoTipSol} onChange={(e) => setJitoTipSol(e.target.value)} style={inputStyle} />
           </Field>
           <Field label="Slippage (bps, 100=1%)">
             <input type="number" step="100" min="100" max="9000" value={slippageBps} onChange={(e) => setSlippageBps(e.target.value)} style={inputStyle} />
@@ -965,7 +1104,258 @@ function LaunchTab({ adminPk, onLaunched }) {
         )}
       </Card>
 
-      <Card title="6. Pre-flight quote" style={{ marginTop: 16 }}>
+      <Card title="6. MM seed (optional — buys at creator price + auto-cycle)" style={{ marginTop: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+          <input
+            id="mm-enabled"
+            type="checkbox"
+            checked={mmEnabled}
+            onChange={(e) => setMmEnabled(e.target.checked)}
+          />
+          <label htmlFor="mm-enabled" style={{ fontSize: 13, color: SUB, cursor: 'pointer' }}>
+            Buy in the launch bundle with an MM wallet, then enable cycling buys/sells automatically
+          </label>
+        </div>
+        <div style={{ fontSize: 11, color: MUTED, marginBottom: mmEnabled ? 12 : 0, lineHeight: 1.5 }}>
+          The MM wallet acquires its bag at <em>creator price</em> in the same bundle as the dev buy and snipers, so subsequent sells lock in real profit instead of bleeding spread. The <code>stakrr-mm</code> daemon picks up this mint on its next 10s tick and starts running the subtle-ladder strategy with the bankroll/drawdown caps below.
+        </div>
+
+        {mmEnabled && (
+          <>
+            <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 12, marginBottom: 12 }}>
+              <Field label="MM wallet (must be in vault, funded with entry SOL + bankroll + gas)">
+                <select value={mmWalletId} onChange={(e) => setMmWalletId(e.target.value)} style={inputStyle}>
+                  <option value="">— select wallet —</option>
+                  {devCandidates.map((w) => (
+                    <option key={w.id} value={w.id}>
+                      {w.label || shortPk(w.publicKey)} · {fmtSol(w.sol)} SOL
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Entry SOL (in-bundle buy)">
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0.001"
+                  value={mmEntrySol}
+                  onChange={(e) => setMmEntrySol(e.target.value)}
+                  style={inputStyle}
+                />
+              </Field>
+            </div>
+
+            <div style={{ fontSize: 12, fontWeight: 600, color: SUB, marginTop: 8, marginBottom: 6 }}>
+              Daemon strategy config (post-launch cycling)
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
+              <Field label="Bankroll cap (SOL · max net spend before pause)">
+                <input
+                  type="number"
+                  step="0.05"
+                  min="0.05"
+                  value={mmBankrollSol}
+                  onChange={(e) => setMmBankrollSol(e.target.value)}
+                  style={inputStyle}
+                />
+              </Field>
+              <Field label="Drawdown % (pause if P&L drops X% below peak)">
+                <input
+                  type="number"
+                  step="5"
+                  min="5"
+                  max="90"
+                  value={mmDrawdownPct}
+                  onChange={(e) => setMmDrawdownPct(e.target.value)}
+                  style={inputStyle}
+                />
+              </Field>
+              <Field label="Slippage %">
+                <input
+                  type="number"
+                  step="1"
+                  min="1"
+                  max="50"
+                  value={mmSlippage}
+                  onChange={(e) => setMmSlippage(e.target.value)}
+                  style={inputStyle}
+                />
+              </Field>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
+              <Field label="Min buy SOL">
+                <input type="number" step="0.001" min="0.001" value={mmMinBuySol} onChange={(e) => setMmMinBuySol(e.target.value)} style={inputStyle} />
+              </Field>
+              <Field label="Max buy SOL">
+                <input type="number" step="0.001" min="0.001" value={mmMaxBuySol} onChange={(e) => setMmMaxBuySol(e.target.value)} style={inputStyle} />
+              </Field>
+              <Field label="Min interval (s)">
+                <input type="number" step="5" min="10" value={mmMinIntervalSec} onChange={(e) => setMmMinIntervalSec(e.target.value)} style={inputStyle} />
+              </Field>
+              <Field label="Max interval (s)">
+                <input type="number" step="5" min="20" value={mmMaxIntervalSec} onChange={(e) => setMmMaxIntervalSec(e.target.value)} style={inputStyle} />
+              </Field>
+            </div>
+
+            {quote?.mm && (
+              <div style={{ fontSize: 11, color: MUTED, padding: 8, background: '#f0fdf4', borderRadius: 6 }}>
+                MM wallet <strong style={{ color: INK }}>{shortPk(quote.mm.wallet?.publicKey)}</strong> needs <strong style={{ color: INK }}>{fmtSol(quote.mm.estSpend)} SOL</strong> for the seed buy (has <strong style={{ color: quote.mm.wallet?.sol >= quote.mm.estSpend ? OK : ERR }}>{fmtSol(quote.mm.wallet?.sol)}</strong>). Post-launch the daemon will cycle within the <strong style={{ color: INK }}>{mmBankrollSol} SOL</strong> bankroll cap. {quote.mm.inBundle ? 'In-bundle slot reserved.' : 'Bundle full — MM seed will run staggered post-bundle.'}
+              </div>
+            )}
+
+            <details style={{ marginTop: 10, fontSize: 11, color: MUTED }}>
+              <summary style={{ cursor: 'pointer' }}>Why this is net-positive (vs. cold-start MM which is net-negative)</summary>
+              <div style={{ paddingTop: 6, lineHeight: 1.5 }}>
+                Cold MM on a bonding curve loses ~spread + slippage on every round-trip — there's no edge so it's structurally negative-EV. By buying in the create bundle, the MM wallet enters at the lowest curve price the token will ever see. Every sell after that point realises real bag profit; small subsequent buys to maintain chart activity are dwarfed by accumulated sell receipts. P&L is tracked in <code>worker/data/mm.json</code> and visible at <code>/admin/mm</code>; the bankroll cap pauses cycling if cumulative net spend exceeds it (safety against an unexpected dump).
+              </div>
+            </details>
+          </>
+        )}
+      </Card>
+
+      <Card title="7. Dump & absorb (anti-sniper choreography)" style={{ marginTop: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+          <input
+            id="choreo-enabled"
+            type="checkbox"
+            checked={choreoEnabled}
+            onChange={(e) => setChoreoEnabled(e.target.checked)}
+          />
+          <label htmlFor="choreo-enabled" style={{ fontSize: 13, color: SUB, cursor: 'pointer' }}>
+            After pool init: dev wallet sells (max scare → snipers exit), then absorber wallets buy + auto-stake to lock supply
+          </label>
+        </div>
+        <div style={{ fontSize: 11, color: MUTED, marginBottom: choreoEnabled ? 12 : 0, lineHeight: 1.5 }}>
+          Sequence: <strong>dev rug</strong> at <strong>launchSlot+{choreoDevSellDelayBlocks}</strong> (~{Math.round((Number(choreoDevSellDelayBlocks) || 0) * 400)}ms) → <strong>{choreoAbsorberWaveSize}-wallet absorber wave</strong> at <strong>launchSlot+{choreoAbsorberWaveDelayBlocks}</strong> (~{Math.round((Number(choreoAbsorberWaveDelayBlocks) || 0) * 400)}ms) → <strong>drip accumulation</strong> over {choreoDripWindowSec}s. Snipers race in slots launchSlot+1..3, so firing the rug at slot+3 and absorbers at slot+4 catches their panic-sells right as they land. All absorber buys use jittered amounts/slippage/priority fees so terminals can't fingerprint them as a coordinated bundle.
+        </div>
+
+        {choreoEnabled && (
+          <>
+            {absorberWallets.length === 0 && (
+              <div style={{ padding: 10, background: '#fffbeb', border: `1px solid #fde68a`, borderRadius: 6, fontSize: 12, color: '#92400e', marginBottom: 12 }}>
+                No wallets tagged as <code>tier=absorber</code>. Go to the <strong>Wallets</strong> tab and use the tier dropdown to mark wallets as absorbers — they MUST be different from snipers and ideally funded from a separate source (CEX withdrawal, multi-hop, or aged wallet) so terminals don't cluster them.
+              </div>
+            )}
+
+            <Field label={`Absorber wallets (pick from tier='absorber' \u2014 ${absorberWallets.length} available)`} style={{ marginBottom: 12 }}>
+              <div style={{
+                maxHeight: 180, overflowY: 'auto', border: `1px solid ${BORDER}`, borderRadius: 8, padding: 8, background: '#fff',
+              }}>
+                {absorberWallets.map((w) => {
+                  const checked = choreoAbsorberIds.includes(w.id);
+                  return (
+                    <label key={w.id} style={{
+                      display: 'flex', alignItems: 'center', gap: 8, padding: '4px 6px', cursor: 'pointer',
+                      background: checked ? '#f0fdf4' : 'transparent', borderRadius: 4, fontSize: 12,
+                    }}>
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => setChoreoAbsorberIds((prev) => (
+                          prev.includes(w.id) ? prev.filter((x) => x !== w.id) : [...prev, w.id]
+                        ))}
+                      />
+                      <span style={{ fontWeight: 600 }}>{w.label}</span>
+                      <span style={{ color: MUTED, fontFamily: 'monospace' }}>{shortPk(w.publicKey, 4)}</span>
+                      <span style={{ marginLeft: 'auto', color: (w.sol || 0) >= Number(choreoAbsorberBuyMaxSol) + 0.01 ? OK : ERR }}>
+                        {fmtSol(w.sol)} SOL
+                      </span>
+                    </label>
+                  );
+                })}
+                {absorberWallets.length > 0 && (
+                  <div style={{ display: 'flex', gap: 6, marginTop: 6, paddingTop: 6, borderTop: `1px solid ${BORDER}` }}>
+                    <button type="button" onClick={() => setChoreoAbsorberIds(absorberWallets.map((w) => w.id))} style={smallBtn}>select all</button>
+                    <button type="button" onClick={() => setChoreoAbsorberIds([])} style={smallBtn}>clear</button>
+                    <span style={{ marginLeft: 'auto', color: MUTED, fontSize: 11, alignSelf: 'center' }}>
+                      {choreoAbsorberIds.length} selected · est spend {fmtSol(choreoEstSpendSol)} SOL
+                    </span>
+                  </div>
+                )}
+              </div>
+            </Field>
+
+            <div style={{ fontSize: 12, fontWeight: 600, color: SUB, marginBottom: 6 }}>
+              Dev wallet (Phase 0 + 1)
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
+              <Field label="Dev stake % (preserves supply)" hint="Stakes X% of dev bag to itself BEFORE the rug. 0 = max scare on the sell.">
+                <input type="number" step="5" min="0" max="100" value={choreoDevStakePct} onChange={(e) => setChoreoDevStakePct(e.target.value)} style={inputStyle} />
+              </Field>
+              <Field label="Dev stake lock (days)">
+                <input type="number" step="1" min="1" max="365" value={choreoDevStakeLockDays} onChange={(e) => setChoreoDevStakeLockDays(e.target.value)} style={inputStyle} />
+              </Field>
+              <Field label="Dev sell % of remaining">
+                <input type="number" step="5" min="1" max="100" value={choreoDevSellPct} onChange={(e) => setChoreoDevSellPct(e.target.value)} style={inputStyle} />
+              </Field>
+              <Field label="Dev rug delay (blocks after launch)" hint="Solana slots are ~400ms. Snipers race in slots launchSlot+1..3 — fire the rug at slot+3 to catch them mid-buy. 0 = same block as launch (rare but possible).">
+                <input type="number" step="1" min="0" max="50" value={choreoDevSellDelayBlocks} onChange={(e) => setChoreoDevSellDelayBlocks(e.target.value)} style={inputStyle} />
+              </Field>
+            </div>
+
+            <div style={{ fontSize: 12, fontWeight: 600, color: SUB, marginBottom: 6 }}>
+              Absorber wave + drip (Phase 2-4)
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
+              <Field label="Wave delay (blocks after launch)" hint="Default 4 = absorbers fire at slot launchSlot+4, just after the on-chain sniper window (slots 1-3) ends. Each block is ~400ms.">
+                <input type="number" step="1" min="0" max="50" value={choreoAbsorberWaveDelayBlocks} onChange={(e) => setChoreoAbsorberWaveDelayBlocks(e.target.value)} style={inputStyle} />
+              </Field>
+              <Field label="Wave size (parallel)">
+                <input type="number" step="1" min="1" max="20" value={choreoAbsorberWaveSize} onChange={(e) => setChoreoAbsorberWaveSize(e.target.value)} style={inputStyle} />
+              </Field>
+              <Field label="Buy min SOL (jittered)">
+                <input type="number" step="0.005" min="0.001" value={choreoAbsorberBuyMinSol} onChange={(e) => setChoreoAbsorberBuyMinSol(e.target.value)} style={inputStyle} />
+              </Field>
+              <Field label="Buy max SOL (jittered)">
+                <input type="number" step="0.005" min="0.002" value={choreoAbsorberBuyMaxSol} onChange={(e) => setChoreoAbsorberBuyMaxSol(e.target.value)} style={inputStyle} />
+              </Field>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
+              <Field label="Drip window (s)">
+                <input type="number" step="5" min="5" max="600" value={choreoDripWindowSec} onChange={(e) => setChoreoDripWindowSec(e.target.value)} style={inputStyle} />
+              </Field>
+              <Field label="Drip interval min (ms)">
+                <input type="number" step="500" min="500" max="60000" value={choreoDripIntervalMinMs} onChange={(e) => setChoreoDripIntervalMinMs(e.target.value)} style={inputStyle} />
+              </Field>
+              <Field label="Drip interval max (ms)">
+                <input type="number" step="500" min="1000" max="60000" value={choreoDripIntervalMaxMs} onChange={(e) => setChoreoDripIntervalMaxMs(e.target.value)} style={inputStyle} />
+              </Field>
+              <Field label="Absorber auto-stake %" hint="After each absorber buys, stake X% of its bag to itself (locks supply, earns fees, terminals tag as 'staker' not 'sniper')">
+                <input type="number" step="10" min="0" max="100" value={choreoAbsorberAutoStakePct} onChange={(e) => setChoreoAbsorberAutoStakePct(e.target.value)} style={inputStyle} />
+              </Field>
+            </div>
+
+            {Number(choreoAbsorberAutoStakePct) > 0 && (
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 12, marginBottom: 12 }}>
+                <Field label="Absorber stake lock (days)">
+                  <input type="number" step="1" min="1" max="365" value={choreoAbsorberStakeLockDays} onChange={(e) => setChoreoAbsorberStakeLockDays(e.target.value)} style={inputStyle} />
+                </Field>
+              </div>
+            )}
+
+            <details style={{ fontSize: 11, color: MUTED }}>
+              <summary style={{ cursor: 'pointer', fontSize: 12, color: SUB, fontWeight: 600 }}>
+                Why this works (and the disclaimers)
+              </summary>
+              <div style={{ paddingTop: 6, lineHeight: 1.6 }}>
+                <strong>Anti-sniper mechanism:</strong> trading terminals (Photon, BullX, Trojan, Axiom) auto-tag wallets that bought in blocks 0-3 as "snipers" and fire "dev sold" alerts when the dev wallet sells &gt;50% of its bag. The dev rug at T+0.6s triggers those alerts → real snipers panic-sell + copy-trader bots auto-exit at their stop-losses. Their tokens flow to the bonding curve → our absorber wallets (which bought at block 6+ outside the sniper window) catch them at the dump price.
+                <br /><br />
+                <strong>Anti-cluster:</strong> every absorber buy uses a different SOL amount (jittered ±50% within your range), different slippage (base ±5%), different priority fee (base ±50%), and lands in a different block. No round numbers (avoids 0.05/0.1/0.5 fingerprints). Wave is parallel; drip is sequential with random intervals.
+                <br /><br />
+                <strong>Funding lineage caveat:</strong> if all your absorber wallets were funded from the same source within 10 minutes of each other, terminals will cluster them as one entity regardless of jitter. Best practice is to fund absorbers from CEX withdrawals (untraceable past the exchange) or via multi-hop SOL routing with idle time between hops. We don't (yet) automate this — it's on you to maintain a clean wallet stable.
+                <br /><br />
+                <strong>Risk:</strong> if the launch has organic demand, the dev rug kills sentiment regardless of absorbers. Use this on launches you don't intend to grow organically, or pair with strong KOL/community comms to override the bearish signal.
+                <br /><br />
+                <strong>Legal:</strong> this is wash trading + sniper exploitation. Norm on Pump.fun memecoin space, not enforced; would be illegal in regulated markets. You're operating at your own risk.
+              </div>
+            </details>
+          </>
+        )}
+      </Card>
+
+      <Card title="8. Pre-flight quote" style={{ marginTop: 16 }}>
         {quoteErr && <div style={{ color: ERR, marginBottom: 8 }}>{quoteErr}</div>}
         {quote ? (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
@@ -1011,6 +1401,38 @@ function LaunchTab({ adminPk, onLaunched }) {
               )}
             </div>
           )}
+          {result.choreography && (
+            <div style={{ marginTop: 12, padding: 10, background: result.choreography.ok ? '#dcfce7' : '#fee2e2', borderRadius: 6, fontSize: 12 }}>
+              <strong>Choreography:</strong>{' '}
+              {result.choreography.ok ? (
+                <>
+                  dev rug {result.choreography.devRug?.skipped ? 'skipped' : <a href={`https://solscan.io/tx/${result.choreography.devRug?.sig}`} target="_blank" rel="noreferrer" style={linkStyle}>tx</a>}
+                  {result.choreography.devStake && !result.choreography.devStake.skipped && (
+                    <> · dev pre-staked <a href={`https://solscan.io/tx/${result.choreography.devStake.sig}`} target="_blank" rel="noreferrer" style={linkStyle}>tx</a></>
+                  )}
+                  {' · '}absorber wave {result.choreography.absorberWave?.filter((r) => !r.error).length}/{result.choreography.absorberWave?.length} ok
+                  {' · '}drip {result.choreography.absorberDrip?.filter((r) => !r.error).length}/{result.choreography.absorberDrip?.length} ok
+                  {result.choreography.absorberStakes?.length > 0 && (
+                    <> · {result.choreography.absorberStakes.filter((r) => !r.error && !r.skipped).length} absorbers auto-staked</>
+                  )}
+                </>
+              ) : (
+                <span style={{ color: ERR }}>failed: {result.choreography.error || 'see worker logs'}</span>
+              )}
+            </div>
+          )}
+          {result.mmBootstrap && (
+            <div style={{ marginTop: 12, padding: 10, background: result.mmBootstrap.ok ? '#dcfce7' : '#fee2e2', borderRadius: 6, fontSize: 12 }}>
+              <strong>MM seed:</strong>{' '}
+              {result.mmBootstrap.ok ? (
+                <>
+                  wallet <code>{shortPk(result.mmBootstrap.wallet)}</code> bought {fmtSol(result.mmBootstrap.entrySol)} SOL at creator price · daemon enabled (bankroll {fmtSol(result.mmBootstrap.config?.bankrollSol)} SOL) · <a href="/admin/mm" style={{ color: SKY }}>monitor at /admin/mm</a>
+                </>
+              ) : (
+                <span style={{ color: ERR }}>register failed: {result.mmBootstrap.error || 'see worker logs'} (configure manually at /admin/mm)</span>
+              )}
+            </div>
+          )}
           <div style={{ marginTop: 12 }}>
             <a href={`/token/${result.mint}`} target="_blank" rel="noreferrer" style={{ color: SKY, fontWeight: 600 }}>
               → open public stake page
@@ -1033,6 +1455,8 @@ function SnipesTab({ adminPk }) {
   const [busy, setBusy] = useState(null);
   const [drawerKey, setDrawerKey] = useState(null); // `${snipeId}-${walletId}` of the open trade drawer
   const [lastSig, setLastSig] = useState(null);
+  const [mmInfo, setMmInfo] = useState({}); // mint -> mm token record (status, state, recentTrades)
+  const [mmBusy, setMmBusy] = useState(null);
 
   const reload = useCallback(async () => {
     if (!adminPk) return;
@@ -1050,10 +1474,47 @@ function SnipesTab({ adminPk }) {
 
   useEffect(() => { reload(); }, [reload]);
 
+  // For wallet listing we treat the dev + MM wallets as additional rows of
+  // the snipers table so the existing trade/transfer/sweep handlers work
+  // unchanged. Dev goes first (it's the deployer + did the dev buy), then
+  // snipers (in-bundle then overflow), then the MM seed.
+  const allWalletsForSnipe = useCallback((snipe) => {
+    const list = [];
+    if (snipe.devWalletId && snipe.devWallet) {
+      list.push({
+        walletId: snipe.devWalletId,
+        publicKey: snipe.devWallet,
+        kind: 'dev',
+        // The dev's "buy" was its devBuySol portion of the bundle (signed
+        // alongside the create tx). No separate buy sig — it's the same
+        // bundle as create.
+        solSpent: Number(snipe.devBuySol) || 0,
+        buySig: snipe.txSignatures?.[0] || null,
+        error: null,
+      });
+    }
+    for (const s of (snipe.snipers || [])) list.push(s);
+    if (snipe.mmBootstrap?.ok && snipe.mmBootstrap.walletId) {
+      const dup = list.some((s) => s.walletId === snipe.mmBootstrap.walletId);
+      if (!dup) {
+        list.push({
+          walletId: snipe.mmBootstrap.walletId,
+          publicKey: snipe.mmBootstrap.wallet,
+          kind: 'mm',
+          solSpent: snipe.mmBootstrap.entrySol || 0,
+          buySig: null,
+          error: null,
+        });
+      }
+    }
+    return list;
+  }, []);
+
   const loadHoldings = useCallback(async (snipe) => {
-    if (!snipe?.snipers) return;
+    const wallets = allWalletsForSnipe(snipe);
+    if (wallets.length === 0) return;
     const next = { ...holdings };
-    for (const s of snipe.snipers) {
+    for (const s of wallets) {
       try {
         const out = await adminFetch('/api/admin/snipe/holdings', {
           method: 'POST',
@@ -1066,7 +1527,17 @@ function SnipesTab({ adminPk }) {
       }
     }
     setHoldings(next);
-  }, [adminPk, holdings]);
+  }, [adminPk, holdings, allWalletsForSnipe]);
+
+  const loadMmInfo = useCallback(async (snipe) => {
+    if (!snipe.mmBootstrap?.ok) return;
+    try {
+      const out = await adminFetch(`/api/admin/mm/${snipe.mint}`, { adminPk });
+      setMmInfo((prev) => ({ ...prev, [snipe.mint]: out.token }));
+    } catch (e) {
+      setMmInfo((prev) => ({ ...prev, [snipe.mint]: { error: e.message } }));
+    }
+  }, [adminPk]);
 
   const toggleExpand = useCallback(async (snipe) => {
     if (expandedId === snipe.id) {
@@ -1074,11 +1545,39 @@ function SnipesTab({ adminPk }) {
       return;
     }
     setExpandedId(snipe.id);
-    await loadHoldings(snipe);
-  }, [expandedId, loadHoldings]);
+    await Promise.all([loadHoldings(snipe), loadMmInfo(snipe)]);
+  }, [expandedId, loadHoldings, loadMmInfo]);
+
+  const handleMmAction = useCallback(async (snipe, action) => {
+    setMmBusy(`${snipe.mint}-${action}`);
+    try {
+      let path;
+      let method = 'POST';
+      if (action === 'pause') path = `/api/admin/mm/pause`;
+      else if (action === 'resume') path = `/api/admin/mm/resume`;
+      else if (action === 'tick') path = `/api/admin/mm/tick`;
+      else if (action === 'delete') {
+        if (!confirm(`Disable MM for ${snipe.symbol}? The wallet keeps its bag — you can re-enable from /admin/mm later.`)) {
+          setMmBusy(null);
+          return;
+        }
+        path = `/api/admin/mm/${snipe.mint}`;
+        method = 'DELETE';
+      } else return;
+      await adminFetch(path, {
+        method,
+        adminPk,
+        body: action === 'delete' ? undefined : { mint: snipe.mint },
+      });
+      await loadMmInfo(snipe);
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setMmBusy(null);
+    }
+  }, [adminPk, loadMmInfo]);
 
   const handleSell = useCallback(async (snipe, walletId, pct, slippage = 10) => {
-    if (!confirm(`Sell ${pct}% of this wallet's bag (slippage ${slippage}%)?`)) return;
     setBusy(`${snipe.id}-${walletId}`);
     setLastSig(null);
     try {
@@ -1099,7 +1598,6 @@ function SnipesTab({ adminPk }) {
 
   const handleBuy = useCallback(async (snipe, walletId, solAmount, slippage = 10) => {
     if (!(solAmount > 0)) { setErr('amount must be > 0'); return; }
-    if (!confirm(`Buy ${solAmount} SOL worth from this wallet (slippage ${slippage}%)?`)) return;
     setBusy(`${snipe.id}-${walletId}`);
     setLastSig(null);
     try {
@@ -1208,6 +1706,20 @@ function SnipesTab({ adminPk }) {
                         <div style={{ marginBottom: 12, color: MUTED, fontSize: 12 }}>
                           Bundle: {s.bundleId || '—'} · {s.bundleEndpoint || ''}
                         </div>
+
+                        {s.mmBootstrap?.ok && (
+                          <MmPanel
+                            snipe={s}
+                            mm={mmInfo[s.mint]}
+                            busy={mmBusy}
+                            onPause={() => handleMmAction(s, 'pause')}
+                            onResume={() => handleMmAction(s, 'resume')}
+                            onTick={() => handleMmAction(s, 'tick')}
+                            onDelete={() => handleMmAction(s, 'delete')}
+                            onRefresh={() => loadMmInfo(s)}
+                          />
+                        )}
+
                         <table style={tableStyle}>
                           <thead>
                             <tr>
@@ -1220,7 +1732,7 @@ function SnipesTab({ adminPk }) {
                             </tr>
                           </thead>
                           <tbody>
-                            {(s.snipers || []).map((sn) => {
+                            {allWalletsForSnipe(s).map((sn) => {
                               const h = holdings[sn.walletId];
                               const id = `${s.id}-${sn.walletId}`;
                               const drawerOpen = drawerKey === id;
@@ -1229,7 +1741,19 @@ function SnipesTab({ adminPk }) {
                                   <tr>
                                     <td style={td}><span style={{ fontFamily: 'monospace', fontSize: 12 }}>{shortPk(sn.publicKey, 5)}</span></td>
                                     <td style={td}>
-                                      <span style={{ padding: '2px 6px', borderRadius: 4, fontSize: 11, background: sn.kind === 'in-bundle' ? '#dbeafe' : '#fef3c7', color: sn.kind === 'in-bundle' ? '#1e40af' : '#92400e' }}>{sn.kind}</span>
+                                      {(() => {
+                                        const palette = sn.kind === 'dev'
+                                          ? { bg: '#fce7f3', fg: '#9d174d' }
+                                          : sn.kind === 'in-bundle'
+                                            ? { bg: '#dbeafe', fg: '#1e40af' }
+                                            : sn.kind === 'mm'
+                                              ? { bg: '#ede9fe', fg: '#6d28d9' }
+                                              : { bg: '#fef3c7', fg: '#92400e' };
+                                        const bold = sn.kind === 'mm' || sn.kind === 'dev';
+                                        return (
+                                          <span style={{ padding: '2px 6px', borderRadius: 4, fontSize: 11, background: palette.bg, color: palette.fg, fontWeight: bold ? 600 : 400 }}>{sn.kind}</span>
+                                        );
+                                      })()}
                                     </td>
                                     <td style={{ ...td, textAlign: 'right' }}>{fmtSol(h?.sol)}</td>
                                     <td style={{ ...td, textAlign: 'right' }}>
@@ -1286,6 +1810,143 @@ function SnipesTab({ adminPk }) {
           </tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+// ── MmPanel: inline market-maker daemon controls per snipe ──────────────────
+//
+// Surfaces /admin/mm functionality directly inside the past-launches drawer
+// so the operator doesn't have to context-switch between two pages. Shows
+// running/paused status, P&L (sells - buys, in lamports), trade count,
+// next-action ETA, and provides pause/resume/tick-now/disable actions.
+
+function MmPanel({ snipe, mm, busy, onPause, onResume, onTick, onDelete, onRefresh }) {
+  const lamportsToSol = (s) => {
+    if (s == null) return 0;
+    try { return Number(BigInt(s)) / 1_000_000_000; } catch { return 0; }
+  };
+  const isLoading = !mm;
+  const errored = mm?.error;
+  const enabled = !!mm?.enabled;
+  const config = mm?.config || {};
+  const state = mm?.state || {};
+  const pnl = lamportsToSol(state.currentPnlLamports);
+  const peak = lamportsToSol(state.peakPnlLamports);
+  const spent = lamportsToSol(state.totalSpentLamports);
+  const received = lamportsToSol(state.totalReceivedLamports);
+  const drawdown = peak > 0 ? Math.max(0, ((peak - pnl) / peak) * 100) : 0;
+  const bankrollUsedPct = config.bankrollSol ? Math.min(100, ((spent - received) / config.bankrollSol) * 100) : 0;
+  const nextEta = state.nextActionAt ? new Date(state.nextActionAt) : null;
+  const nextSecs = nextEta ? Math.max(0, Math.floor((nextEta - Date.now()) / 1000)) : null;
+
+  const headerColor = errored ? ERR : (enabled ? OK : '#92400e');
+  const headerBg = errored ? '#fef2f2' : (enabled ? '#f0fdf4' : '#fffbeb');
+  const headerLabel = errored
+    ? 'MM: error reading state'
+    : (enabled ? 'MM running' : `MM paused${state.pauseReason ? ` (${state.pauseReason})` : ''}`);
+
+  return (
+    <div style={{ marginBottom: 16, border: `1px solid ${BORDER}`, borderRadius: 10, background: '#fff', overflow: 'hidden' }}>
+      <div style={{
+        padding: '10px 14px', background: headerBg, borderBottom: `1px solid ${BORDER}`,
+        display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+      }}>
+        <span style={{ width: 8, height: 8, borderRadius: '50%', background: headerColor, display: 'inline-block' }} />
+        <strong style={{ color: headerColor, fontSize: 13 }}>{headerLabel}</strong>
+        {snipe.mmBootstrap?.entrySol > 0 && (
+          <span style={{ color: MUTED, fontSize: 11 }}>
+            seeded with {fmtSol(snipe.mmBootstrap.entrySol)} SOL at creator price
+          </span>
+        )}
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+          <button onClick={onRefresh} style={tinyBtn} disabled={!!busy}>refresh</button>
+          {enabled ? (
+            <button onClick={onPause} style={{ ...tinyBtn, color: '#92400e' }} disabled={busy === `${snipe.mint}-pause`}>
+              {busy === `${snipe.mint}-pause` ? '…' : 'pause'}
+            </button>
+          ) : (
+            <button onClick={onResume} style={{ ...tinyBtn, color: OK, fontWeight: 600 }} disabled={busy === `${snipe.mint}-resume` || errored}>
+              {busy === `${snipe.mint}-resume` ? '…' : 'resume'}
+            </button>
+          )}
+          <button onClick={onTick} style={tinyBtn} disabled={busy === `${snipe.mint}-tick` || !enabled} title="Force the daemon to consider this token now (skip wait)">
+            {busy === `${snipe.mint}-tick` ? '…' : 'tick now'}
+          </button>
+          <a href="/admin/mm" target="_blank" rel="noreferrer" style={{ ...tinyBtn, textDecoration: 'none', color: SKY }}>full dashboard ↗</a>
+          <button onClick={onDelete} style={{ ...tinyBtn, color: ERR }} disabled={busy === `${snipe.mint}-delete`}>
+            {busy === `${snipe.mint}-delete` ? '…' : 'disable'}
+          </button>
+        </div>
+      </div>
+
+      {isLoading && <div style={{ padding: 14, color: MUTED, fontSize: 12 }}>loading MM state…</div>}
+      {errored && <div style={{ padding: 14, color: ERR, fontSize: 12 }}>{mm.error}</div>}
+      {!isLoading && !errored && (
+        <>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 0 }}>
+            <MmStat label="P&L (realised)" value={`${pnl >= 0 ? '+' : ''}${pnl.toFixed(5)} SOL`} sub={`peak ${peak.toFixed(5)}`} good={pnl >= 0} bad={pnl < 0} />
+            <MmStat label="Trades" value={String(state.tradesCount || 0)} sub={`${state.errorsCount || 0} errors`} />
+            <MmStat label="Spent / received" value={`${spent.toFixed(4)} / ${received.toFixed(4)}`} sub="SOL out / in" />
+            <MmStat label="Bankroll used" value={`${bankrollUsedPct.toFixed(1)}%`} sub={`cap ${config.bankrollSol} SOL`} bad={bankrollUsedPct >= 100} />
+            <MmStat label="Drawdown" value={`${drawdown.toFixed(1)}%`} sub={`limit ${config.drawdownPct}%`} bad={drawdown >= (config.drawdownPct || 25)} />
+          </div>
+          <div style={{ padding: '8px 14px', borderTop: `1px solid ${BORDER}`, fontSize: 11, color: MUTED, display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
+            <span>
+              MM wallet: <code style={{ color: INK }}>{shortPk(snipe.mmBootstrap?.wallet, 5)}</code> · last action: {state.lastActionAt ? timeAgo(state.lastActionAt) : 'never'}
+              {state.lastSig && (
+                <> · last sig: <a href={`https://solscan.io/tx/${state.lastSig}`} target="_blank" rel="noreferrer" style={linkStyle}>{shortPk(state.lastSig, 5)}</a></>
+              )}
+            </span>
+            <span>
+              {enabled
+                ? (nextSecs != null ? `next action in ~${nextSecs}s` : 'next action: due now')
+                : 'paused — daemon will skip this token'}
+              {' · '}
+              buy size {config.minBuySol}–{config.maxBuySol} SOL · interval {config.minIntervalSec}–{config.maxIntervalSec}s
+            </span>
+          </div>
+          {(mm.recentTrades || []).length > 0 && (
+            <div style={{ padding: '8px 14px', borderTop: `1px solid ${BORDER}`, fontSize: 11 }}>
+              <div style={{ color: MUTED, marginBottom: 4 }}>Recent trades:</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {mm.recentTrades.slice().reverse().map((t, i) => {
+                  const sol = t.type === 'buy' ? lamportsToSol(t.solSpentLamports) : lamportsToSol(t.solReceivedLamports);
+                  const c = t.error ? ERR : (t.type === 'buy' ? '#1e40af' : OK);
+                  return (
+                    <a
+                      key={`${t.sig || i}-${t.ts}`}
+                      href={t.sig ? `https://solscan.io/tx/${t.sig}` : '#'}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={(e) => { if (!t.sig) e.preventDefault(); }}
+                      style={{
+                        padding: '2px 6px', borderRadius: 4, background: '#f8fafc',
+                        border: `1px solid ${BORDER}`, color: c, fontFamily: 'monospace',
+                        textDecoration: 'none',
+                      }}
+                      title={t.error || `${t.type} ${sol.toFixed(5)} SOL @ ${new Date(t.ts).toLocaleTimeString()}`}
+                    >
+                      {t.type} {sol.toFixed(4)}
+                    </a>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function MmStat({ label, value, sub, good, bad }) {
+  const fg = bad ? ERR : (good ? OK : INK);
+  return (
+    <div style={{ padding: '10px 14px', borderRight: `1px solid ${BORDER}` }}>
+      <div style={{ fontSize: 10, color: MUTED, textTransform: 'uppercase', letterSpacing: 0.4 }}>{label}</div>
+      <div style={{ fontSize: 14, fontWeight: 600, color: fg, marginTop: 2 }}>{value}</div>
+      {sub && <div style={{ fontSize: 10, color: MUTED, marginTop: 1 }}>{sub}</div>}
     </div>
   );
 }
@@ -1553,10 +2214,13 @@ const selectableCard = {
   background: '#fff',
 };
 
-function Field({ label, children, style }) {
+function Field({ label, children, style, hint }) {
   return (
-    <label style={{ display: 'block', ...style }}>
-      <span style={{ display: 'block', fontSize: 12, color: MUTED, marginBottom: 4 }}>{label}</span>
+    <label style={{ display: 'block', ...style }} title={hint || undefined}>
+      <span style={{ display: 'block', fontSize: 12, color: MUTED, marginBottom: 4 }}>
+        {label}
+        {hint && <span style={{ marginLeft: 4, fontSize: 10, color: MUTED, cursor: 'help' }}>ⓘ</span>}
+      </span>
       {children}
     </label>
   );

@@ -144,11 +144,17 @@ export async function buildTradeTx({
   if (!action || !['buy', 'sell'].includes(action)) {
     throw new Error("buildTradeTx: action must be 'buy' or 'sell'");
   }
+  // PumpDev accepts amount as either:
+  //   • a number (SOL when denominatedInSol=true, RAW token units otherwise)
+  //   • a percentage string like "100%" (sell-all when balance is unknown
+  //     client-side; pump's server resolves the bag and sells that share)
+  // Preserve string amounts as-is, coerce numerics to Number for safety.
+  const isPercentString = typeof amount === 'string' && /%\s*$/.test(amount);
   const body = {
     publicKey,
     action,
     mint,
-    amount: Number(amount),
+    amount: isPercentString ? amount.trim() : Number(amount),
     denominatedInSol: String(denominatedInSol) === 'true' ? 'true' : 'false',
     slippage: Number(slippage),
     priorityFee: Number(priorityFee),

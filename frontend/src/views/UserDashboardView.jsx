@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { useAnchorWallet, useConnection } from '@solana/wallet-adapter-react';
+import { useAnchorWallet, useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { PublicKey } from '@solana/web3.js';
+import bs58 from 'bs58';
 import { apiUrl } from '../apiBase.js';
 import { claimPositionRewards } from '../stake/claimPosition.js';
 
@@ -31,15 +32,36 @@ function fmtRaw(raw, decimals = 6) {
   }
 }
 
+// SOL is always 9 decimals — keep dust visible (6 decimals) so even small
+// staker rewards (~0.0001 SOL) don't render as "0".
+function fmtLamports(lamports, dp = 6) {
+  if (!lamports || lamports === '0') return '0';
+  try {
+    const n = Number(BigInt(lamports)) / 1e9;
+    if (n === 0) return '0';
+    if (n < 0.000001) return '<0.000001';
+    return n.toFixed(dp).replace(/\.?0+$/, '');
+  } catch {
+    return String(lamports);
+  }
+}
+
 export default function UserDashboardView({ wallet, onSelectToken }) {
   const { connection } = useConnection();
   const anchorWallet = useAnchorWallet();
+  // signMessage isn't exposed via useAnchorWallet — pull it from the
+  // adapter directly so the auto-push toggle can authenticate updates.
+  const fullWallet = useWallet();
   const [tab, setTab] = useState('positions');
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [claimBusyKey, setClaimBusyKey] = useState(null);
   const [claimMsg, setClaimMsg] = useState(null);
+  const [prefs, setPrefs] = useState(null);
+  const [prefsLoading, setPrefsLoading] = useState(false);
+  const [prefsBusy, setPrefsBusy] = useState(false);
+  const [prefsMsg, setPrefsMsg] = useState(null);
 
   const pk = wallet?.publicKey?.toBase58?.() || null;
 
@@ -107,6 +129,79 @@ export default function UserDashboardView({ wallet, onSelectToken }) {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Load the wallet's auto-push preference from the worker. Returns the
+  // resolved effective value (true when no record exists — that's the
+  // server-side resolver default for legacy stakers).
+  const loadPrefs = useCallback(async () => {
+    if (!pk) {
+      setPrefs(null);
+      return;
+    }
+    setPrefsLoading(true);
+    try {
+      const r = await fetch(apiUrl(`/api/user-prefs/${pk}`));
+      const d = await r.json();
+      if (!r.ok || !d.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setPrefs({
+        autoPush: d.effectiveAutoPush !== false,
+        hasRecord: !!d.prefs,
+        source: d.prefs?.autoPushSource || null,
+        updatedAt: d.prefs?.updatedAt || null,
+      });
+    } catch (e) {
+      setPrefs(null);
+      console.warn('user-prefs load failed', e);
+    } finally {
+      setPrefsLoading(false);
+    }
+  }, [pk]);
+
+  useEffect(() => {
+    loadPrefs();
+  }, [loadPrefs]);
+
+  // Toggle auto-push. Wallet must support signMessage (Phantom, Backpack,
+  // Solflare all do; some hardware wallets don't — surface a helpful error).
+  const onTogglePrefs = useCallback(
+    async (next) => {
+      setPrefsMsg(null);
+      if (!pk) return;
+      if (!fullWallet?.signMessage) {
+        setPrefsMsg({ ok: false, text: 'This wallet does not support message signing — try Phantom, Backpack, or Solflare.' });
+        return;
+      }
+      setPrefsBusy(true);
+      try {
+        const signedAt = new Date().toISOString();
+        const message = `stakrr-prefs:${pk}:${signedAt}`;
+        const sig = await fullWallet.signMessage(new TextEncoder().encode(message));
+        const r = await fetch(apiUrl(`/api/user-prefs/${pk}`), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            autoPush: next,
+            signedAt,
+            signature: bs58.encode(sig),
+          }),
+        });
+        const d = await r.json();
+        if (!r.ok || !d.ok) throw new Error(d.error || `HTTP ${r.status}`);
+        setPrefs({
+          autoPush: d.effectiveAutoPush !== false,
+          hasRecord: true,
+          source: d.prefs?.autoPushSource || 'user_set',
+          updatedAt: d.prefs?.updatedAt || null,
+        });
+        setPrefsMsg({ ok: true, text: next ? 'Auto-push enabled — rewards will land in your wallet automatically.' : 'Auto-push disabled — claim manually from the Rewards tab.' });
+      } catch (e) {
+        setPrefsMsg({ ok: false, text: e.message || String(e) });
+      } finally {
+        setPrefsBusy(false);
+      }
+    },
+    [pk, fullWallet],
+  );
 
   if (!pk) {
     return (
@@ -180,9 +275,13 @@ export default function UserDashboardView({ wallet, onSelectToken }) {
           <div style={statValue}>{loading ? '—' : stats?.positionCount ?? 0}</div>
         </div>
         <div className="db-stat-card" style={{ ...statCardStyle, borderColor: 'rgba(53,197,224,0.35)' }}>
-          <div style={statLabel}>Trading PnL</div>
-          <div style={{ ...statValue, fontSize: 16, color: MUTED }}>Not tracked</div>
-          <div style={{ fontSize: 11, color: '#aaa', marginTop: 6 }}>Use Pump.fun / explorers for buys & sells.</div>
+          <div style={statLabel}>Fees earned (SOL pools)</div>
+          <div style={statValue}>
+            {loading ? '—' : `${fmtLamports(data?.totals?.lifetimeEarnedSolLamports || '0')} SOL`}
+          </div>
+          <div style={{ fontSize: 11, color: '#aaa', marginTop: 6 }}>
+            {loading ? '' : `${fmtLamports(data?.totals?.pendingSolLamports || '0')} SOL pending · ${fmtLamports(data?.totals?.lifetimeClaimedSolLamports || '0')} SOL already claimed`}
+          </div>
         </div>
       </div>
 
@@ -191,6 +290,7 @@ export default function UserDashboardView({ wallet, onSelectToken }) {
         {tabBtn('launched', 'Launched tokens')}
         {tabBtn('rewards', 'Rewards')}
         {tabBtn('activity', 'Activity')}
+        {tabBtn('settings', 'Settings')}
       </div>
 
       {error && (
@@ -325,6 +425,8 @@ export default function UserDashboardView({ wallet, onSelectToken }) {
                     <th>Reward</th>
                     <th>Staked</th>
                     <th>Lock</th>
+                    <th style={{ textAlign: 'right' }}>Earned</th>
+                    <th style={{ textAlign: 'right' }}>Pending</th>
                     <th />
                   </tr>
                 </thead>
@@ -334,6 +436,18 @@ export default function UserDashboardView({ wallet, onSelectToken }) {
                     const isSol = (r.rewardMode || 'sol') !== 'token';
                     const claimLabel = isSol ? 'Claim SOL' : `Claim $${r.symbol || 'TKN'}`;
                     const busy = claimBusyKey === r.key;
+                    const earnedRaw = pos.earnedRaw || '0';
+                    const pendingRaw = pos.claimableRaw || '0';
+                    const earnedTxt = isSol
+                      ? `${fmtLamports(earnedRaw)} SOL`
+                      : `${fmtRaw(earnedRaw, 6)} $${r.symbol || 'TKN'}`;
+                    const pendingTxt = isSol
+                      ? `${fmtLamports(pendingRaw)} SOL`
+                      : `${fmtRaw(pendingRaw, 6)} $${r.symbol || 'TKN'}`;
+                    const claimedRaw = pos.totalClaimedRaw || '0';
+                    const claimedNote = isSol
+                      ? `${fmtLamports(claimedRaw)} SOL claimed`
+                      : `${fmtRaw(claimedRaw, 6)} claimed`;
                     return (
                       <tr key={r.key}>
                         <td>
@@ -361,6 +475,13 @@ export default function UserDashboardView({ wallet, onSelectToken }) {
                         <td style={{ fontSize: 13 }}>{isSol ? 'SOL' : `Token ($${r.symbol || 'TKN'})`}</td>
                         <td style={{ fontFamily: "'DM Mono', monospace", fontSize: 13 }}>{fmtRaw(pos.amount, 6)}</td>
                         <td>{pos.lockDays}d</td>
+                        <td style={{ textAlign: 'right', fontFamily: "'DM Mono', monospace", fontSize: 13 }}>
+                          <div style={{ fontWeight: 700 }}>{earnedTxt}</div>
+                          <div style={{ fontSize: 11, color: MUTED, fontWeight: 500 }}>{claimedNote}</div>
+                        </td>
+                        <td style={{ textAlign: 'right', fontFamily: "'DM Mono', monospace", fontSize: 13, color: pendingRaw === '0' ? MUTED : INK, fontWeight: pendingRaw === '0' ? 500 : 700 }}>
+                          {pendingTxt}
+                        </td>
                         <td>
                           <button
                             type="button"
@@ -408,6 +529,90 @@ export default function UserDashboardView({ wallet, onSelectToken }) {
               </div>
             ))
           )}
+        </div>
+      )}
+
+      {!loading && data && tab === 'settings' && (
+        <div style={{ display: 'grid', gap: 16, maxWidth: 720 }}>
+          <div
+            style={{
+              background: '#fff',
+              border: '1px solid #E8E8E8',
+              borderRadius: 16,
+              padding: '20px 22px',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 16 }}>
+              <div style={{ flex: 1 }}>
+                <p
+                  style={{
+                    margin: 0,
+                    fontSize: 11,
+                    fontWeight: 700,
+                    letterSpacing: '0.15em',
+                    color: MUTED,
+                    textTransform: 'uppercase',
+                  }}
+                >
+                  Auto-claim rewards
+                </p>
+                <p style={{ margin: '8px 0 4px', fontSize: 17, fontWeight: 800, fontFamily: "'Syne', sans-serif" }}>
+                  {prefsLoading ? 'Loading…' : prefs?.autoPush ? 'Enabled' : 'Disabled'}
+                </p>
+                <p style={{ margin: 0, fontSize: 13, color: '#555', lineHeight: 1.55 }}>
+                  When enabled, the worker pushes any rewards you've earned directly to your wallet shortly after each
+                  cycle settles. SOL rewards arrive as <strong>wrapped SOL</strong> (wSOL); your wallet (Phantom,
+                  Backpack, Jupiter, etc.) lets you unwrap to native SOL with one click. Token rewards land in the
+                  matching token ATA. Disable to claim manually from the Rewards tab whenever you want.
+                </p>
+                {prefs?.source && (
+                  <p style={{ margin: '8px 0 0', fontSize: 12, color: MUTED }}>
+                    Source: {prefs.source === 'stake_for_default' ? 'auto-staked on your behalf (presale / airdrop)' : 'set by you'}
+                    {prefs.updatedAt ? ` · updated ${new Date(prefs.updatedAt).toLocaleString()}` : ''}
+                  </p>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => onTogglePrefs(!prefs?.autoPush)}
+                disabled={prefsBusy || prefsLoading}
+                style={{
+                  background: prefs?.autoPush ? INK : SKY,
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: 100,
+                  padding: '12px 20px',
+                  fontWeight: 800,
+                  fontFamily: "'Syne', sans-serif",
+                  fontSize: 13,
+                  cursor: prefsBusy ? 'wait' : 'pointer',
+                  opacity: prefsBusy || prefsLoading ? 0.6 : 1,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {prefsBusy ? 'Signing…' : prefs?.autoPush ? 'Switch to manual' : 'Switch to auto'}
+              </button>
+            </div>
+            {prefsMsg && (
+              <div
+                style={{
+                  marginTop: 14,
+                  padding: '10px 12px',
+                  borderRadius: 10,
+                  fontSize: 13,
+                  background: prefsMsg.ok ? '#E8FFF4' : '#FFF0F0',
+                  border: `1px solid ${prefsMsg.ok ? '#A7E9C4' : '#FFCDD2'}`,
+                  color: prefsMsg.ok ? '#065f46' : '#991b1b',
+                }}
+              >
+                {prefsMsg.text}
+              </div>
+            )}
+            <p style={{ margin: '14px 0 0', fontSize: 12, color: '#888', lineHeight: 1.5 }}>
+              You'll be prompted to sign a short message to authorise the change. No tokens move and no transaction is
+              broadcast — the signature just proves you control this wallet.
+            </p>
+          </div>
         </div>
       )}
 

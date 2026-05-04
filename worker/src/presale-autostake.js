@@ -22,6 +22,7 @@ import {
   stakeForIx,
 } from './stake-program.js';
 import { allocateAllocations, scanPresaleContributions } from './presale-scan.js';
+import { ensureAutoPushDefault } from './user-prefs.js';
 
 // Conservative — stake_for + prime_checkpoint per beneficiary is ~12-14
 // unique accounts; 2 beneficiaries fits comfortably under the 1232 byte
@@ -184,6 +185,12 @@ export async function buildPresaleAutoStakeBatches({
         nonce: nonce.toString(),
         position: sf.position.toBase58(),
       });
+
+      // Presale beneficiaries didn't visit our UI to opt into staking — they
+      // just contributed to the dev wallet. Default them to auto-push so
+      // rewards land in their wallet without any manual action. They can
+      // toggle off later via Settings if they prefer manual claiming.
+      ensureAutoPushDefault(a.wallet);
     }
 
     tx.feePayer = devPk;

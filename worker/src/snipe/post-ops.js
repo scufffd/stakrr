@@ -107,22 +107,48 @@ export async function sellSniperBag({
 
   const programId = await detectTokenProgram(connection, mintPk);
   const ata = getAssociatedTokenAddressSync(mintPk, kp.publicKey, false, programId);
-  const tok = await getAccount(connection, ata, 'confirmed', programId);
-  if (tok.amount <= 0n) {
-    throw new Error('sniper wallet has no tokens to sell');
+  let tok;
+  try {
+    tok = await getAccount(connection, ata, 'confirmed', programId);
+  } catch {
+    tok = { amount: 0n };
   }
-  const m = await getMint(connection, mintPk, 'confirmed', programId);
-  // PumpDev's trade-local accepts amount as raw token units when denominatedInSol='false'.
-  // Convert pct of raw amount to UI tokens (decimals applied) — pumpdev expects float.
-  const sellRaw = (tok.amount * BigInt(Math.round(pct))) / 100n;
-  const sellUi = Number(sellRaw) / 10 ** m.decimals;
-  if (!(sellUi > 0)) throw new Error(`computed sell amount is 0 (raw=${sellRaw}, decimals=${m.decimals})`);
+  // CRITICAL: PumpDev's /api/trade-local with denominatedInSol='false' expects
+  // the amount as RAW on-chain units (e.g. 1785347024930 for 1785347.024930
+  // tokens at 6 decimals). Passing the human-readable UI float caused the API
+  // to sell only ~1/1,000,000th of the intended amount. Verified in refi-live.
+  //
+  // Two amount shapes pump accepts here:
+  //   • integer raw token units  → e.g. 1785347024930
+  //   • '100%' style string      → server resolves balance & sells the percent
+  // We prefer raw integer for accuracy on partial sells, fall back to '100%'
+  // only if the ATA read returned 0 (RPC indexing lag — bag may exist but
+  // pump's server can resolve it).
+  let sellAmount;
+  let sellRaw = 0n;
+  let sellUiForLog = 0;
+  let decimalsForLog = null;
+  if (tok.amount > 0n) {
+    const m = await getMint(connection, mintPk, 'confirmed', programId);
+    decimalsForLog = m.decimals;
+    sellRaw = pct === 100 ? tok.amount : (tok.amount * BigInt(pct)) / 100n;
+    if (sellRaw <= 0n) throw new Error(`computed sell amount is 0 (balance=${tok.amount}, pct=${pct})`);
+    sellAmount = Number(sellRaw); // raw integer — pump expects this
+    sellUiForLog = Number(sellRaw) / 10 ** m.decimals;
+  } else if (pct === 100) {
+    // Bag read returned 0 but caller asked for sell-all — let pump server
+    // resolve balance via the percentage string.
+    sellAmount = '100%';
+    sellUiForLog = '100%';
+  } else {
+    throw new Error('sniper wallet has no tokens to sell (or RPC indexing lag — try sell 100%)');
+  }
 
   const tx = await buildTradeTx({
     publicKey: kp.publicKey.toBase58(),
     action: 'sell',
     mint: mintPk.toBase58(),
-    amount: sellUi,
+    amount: sellAmount,
     denominatedInSol: 'false',
     slippage: slip,
     pool,
@@ -132,7 +158,7 @@ export async function sellSniperBag({
     label: 'snipe:sell',
     timeoutMs: 60_000,
   });
-  return { ok: true, sig, walletId, mint, sellPct: pct, sellRaw: sellRaw.toString(), sellUi };
+  return { ok: true, sig, walletId, mint, sellPct: pct, sellRaw: sellRaw.toString(), sellUi: sellUiForLog, decimals: decimalsForLog };
 }
 
 // ── Buy more (top-up, manual market making) ───────────────────────────────────

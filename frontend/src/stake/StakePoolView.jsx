@@ -4,12 +4,13 @@ import { PublicKey, Transaction } from '@solana/web3.js';
 import {
   TOKEN_PROGRAM_ID,
   createAssociatedTokenAccountIdempotentInstruction,
+  createCloseAccountInstruction,
   getAccount,
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token';
 import BN from 'bn.js';
 import { LOCK_TIERS } from '../staking-sdk/index.js';
-import { claimPositionRewards } from './claimPosition.js';
+import { claimPositionRewards, buildClaimAllIxs } from './claimPosition.js';
 import { useStakePoolClient } from './useStakePoolClient.js';
 import { confirmWithFallback } from '../lib/confirm.js';
 
@@ -221,15 +222,41 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
         nonce,
         userTokenAccount,
       });
-      // also prime checkpoint for wSOL reward so first claim baselines correctly
+      // Prime a checkpoint for EVERY reward line registered on the pool, not
+      // just wSOL. Otherwise the on-chain `claim` baseline-safe init would
+      // pin a fresh staker at the current accPerShare on whichever lines
+      // never got primed — and any rewards already accumulated on those
+      // lines (e.g. early-unstake penalties on the stake-mint reward line)
+      // are silently forfeit on first claim. Older code only primed wSOL
+      // because the stake-mint reward line was added retroactively via
+      // the `add_reward_mint` backfill flow; see SQWARK incident logs.
+      //
+      // Each prime ix is best-effort (no-op if checkpoint already exists),
+      // ~80 bytes of tx space, and bounded in count by the number of
+      // reward lines on the pool (typically 2: wSOL + stake-mint). For
+      // large pools we'd batch into a follow-up tx; for now they fit.
       const position = client.positionPda(wallet.publicKey, nonce);
-      const primeIx = await client.primeCheckpointIx({
-        payer: wallet.publicKey,
-        position,
-        rewardTokenMint: WSOL,
-      }).catch(() => null);
       const ixs = [stakeIx];
-      if (primeIx) ixs.push(primeIx);
+      try {
+        const allRm = await client.fetchAllRewardMints();
+        for (const rm of allRm) {
+          const primeIx = await client.primeCheckpointIx({
+            payer: wallet.publicKey,
+            position,
+            rewardTokenMint: rm.account.mint,
+          }).catch(() => null);
+          if (primeIx) ixs.push(primeIx);
+        }
+      } catch {
+        // Reward mint enumeration failed (RPC error) — fall back to the
+        // old wSOL-only prime so the stake itself still goes through.
+        const primeIx = await client.primeCheckpointIx({
+          payer: wallet.publicKey,
+          position,
+          rewardTokenMint: WSOL,
+        }).catch(() => null);
+        if (primeIx) ixs.push(primeIx);
+      }
       const sig = await sendTx(ixs);
       setLastSig(sig);
       setAmount('');
@@ -296,20 +323,66 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
     }
   }, [client, wallet, stakeMint, stakeTokenProgram, reload, sendTx]);
 
+  /**
+   * Unstake a position — auto-claims every reward line first so accrued
+   * wSOL/token balances aren't silently forfeited.
+   *
+   * Background: `unstake` and `unstake_early` close the position account,
+   * which deletes its `RewardCheckpoint` PDAs. Any pending payout
+   * (`(rm.accPerShare - ck.accPerShare) * effective / SCALE`) becomes
+   * unclaimable forever and stays orphaned in the pool's reward vault — no
+   * sweep instruction exists in the program. Earlier versions of this view
+   * shipped only `[ataIx, unstakeIx]`, so every UI unstake silently burned
+   * pending fees.
+   *
+   * The claim-ix construction is delegated to `buildClaimAllIxs` (shared
+   * with the per-position Claim button) so both paths drain identical reward
+   * lines — if the Claim button is fixed to include a new line, unstake
+   * picks it up too.
+   */
   const onUnstake = useCallback(async (position, early) => {
     setBusy(true); setError(null); setLastSig(null);
     try {
       const userTokenAccount = getAssociatedTokenAddressSync(stakeMint, wallet.publicKey, false, stakeTokenProgram);
-      const ataIx = createAssociatedTokenAccountIdempotentInstruction(
+      const stakeAtaIx = createAssociatedTokenAccountIdempotentInstruction(
         wallet.publicKey, userTokenAccount, wallet.publicKey, stakeMint, stakeTokenProgram,
       );
+
+      // 1) Drain every reward line. Non-fatal on RPC failure: we'd rather
+      //    let the user out of the position than block them indefinitely.
+      let claimIxs = [];
+      let wsolAtasToClose = new Set();
+      try {
+        const built = await buildClaimAllIxs({
+          connection,
+          client,
+          ownerPk: wallet.publicKey,
+          positionPk: position.publicKey,
+        });
+        claimIxs = built.ixs;
+        wsolAtasToClose = built.wsolAtasToClose;
+      } catch (e) {
+        console.warn('auto-claim build failed; proceeding with unstake-only', e);
+      }
+
+      // 2) The unstake / unstake_early ix.
       const ixBuilder = early ? client.unstakeEarlyIx : client.unstakeIx;
-      const ix = await ixBuilder.call(client, {
+      const unstakeIx = await ixBuilder.call(client, {
         owner: wallet.publicKey,
         position: position.publicKey,
         userTokenAccount,
       });
-      const sig = await sendTx([ataIx, ix]);
+
+      // 3) Close any wSOL ATAs created above so the user gets native SOL out
+      //    instead of a lingering wrapped balance. Done AFTER unstake so the
+      //    account is fully drained first.
+      const closeIxs = Array.from(wsolAtasToClose).map((b58) =>
+        createCloseAccountInstruction(
+          new PublicKey(b58), wallet.publicKey, wallet.publicKey, [], TOKEN_PROGRAM_ID,
+        ),
+      );
+
+      const sig = await sendTx([...claimIxs, stakeAtaIx, unstakeIx, ...closeIxs]);
       setLastSig(sig);
       reload();
     } catch (e) {
@@ -317,7 +390,7 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
     } finally {
       setBusy(false);
     }
-  }, [client, stakeMint, stakeTokenProgram, wallet, reload, sendTx]);
+  }, [client, connection, stakeMint, stakeTokenProgram, wallet, reload, sendTx]);
 
   if (!walletState?.connected) {
     return (

@@ -14,3 +14,15 @@ worker/keys/
 secret*.json
 admin*.json
 treasury*.json
+
+# Throwaway debug + one-off ops scripts (named utilities live alongside as
+# audit_, recover_, fund_, sweep_, remediate_, check_pool_authority).
+worker/scripts/check_test*.mjs
+worker/scripts/check_live.mjs
+worker/scripts/check_fees.mjs
+worker/scripts/check_amm_fees.mjs
+worker/scripts/check_volume.mjs
+worker/scripts/find_amm_claim_ix.mjs
+worker/scripts/sim_amm_bridge.mjs
+worker/scripts/exec_amm_bridge.mjs
+worker/scripts/probe_pumpdev_amm.mjs

@@ -30,6 +30,7 @@ import {
 } from '../stake-program.js';
 import { signAndPollConfirm } from '../confirm.js';
 import { getKeypairById } from './wallet-vault.js';
+import { ensureAutoPushDefault } from '../user-prefs.js';
 
 // Fits 2 (stake_for + prime_checkpoint × N rewardMints) per tx safely under
 // the 1232 byte versioned-tx ceiling, with compute-budget ix overhead.
@@ -234,6 +235,11 @@ export async function runKolAirdrop({
         nonce: nonce.toString(),
         position: sf.position.toBase58(),
       });
+
+      // KOL airdrop recipients didn't visit our UI — default to auto-push so
+      // their rewards land automatically. They can flip to manual via
+      // Settings if they prefer.
+      ensureAutoPushDefault(a.wallet);
     }
 
     let sig = null;

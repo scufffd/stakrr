@@ -20,7 +20,6 @@ import {
   WSOL_MINT,
 } from './pump-fees.js';
 import {
-  createAssociatedTokenAccountIdempotentInstruction,
   getAccount,
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token';
@@ -31,15 +30,11 @@ import { shouldAttemptClaim } from './dexscreener.js';
 import {
   depositRewardsIx,
   detectTokenProgram,
-  fetchActivePositions,
   fetchPool,
   fetchRewardMint,
-  findCheckpointPda,
-  findPoolPda,
-  findRewardMintPda,
-  loadProgram,
 } from './stake-program.js';
 import { addToPoolMetrics, recordEvent, updatePoolFields } from './registry.js';
+import { pushClaimsForPool, listPoolRewardMints } from './auto-push-claims.js';
 
 function log(message, extra = {}) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), message, ...extra }));
@@ -54,6 +49,26 @@ function priorityFeeIx() {
 async function getSolBalance(connection, pubkey) {
   return BigInt(await connection.getBalance(pubkey, 'confirmed'));
 }
+
+// Treasury operational reserve (lamports). The treasury wallet pays for every
+// claim/distribute/wrap/deposit tx, so it needs a non-trivial buffer beyond
+// the rent-exempt minimum. Each successful cycle is roughly net-zero on
+// treasury's SOL (claimed → split → fully forwarded), but tx fees + occasional
+// rent for new ATAs slowly bleed it. Without a reserve mechanism, treasury
+// drains to zero, the next cycle fails with "insufficient funds for rent",
+// and EVERY subsequent cycle fails the same way (silent breakage — caught
+// during the GE9J/SQWARK staker-rewards investigation when claims hadn't
+// run for 26+ hours despite real volume).
+//
+// MIN: hard floor — below this the cycle skips entirely with a clear alert.
+// TARGET: cycles top treasury up to this if claimed funds allow, holding back
+//         from the staker portion (NEVER from platform fee — that's revenue).
+const TREASURY_MIN_RESERVE_LAMPORTS = BigInt(
+  Math.round((parseFloat(process.env.TREASURY_MIN_RESERVE_SOL || '0.005')) * 1e9),
+);
+const TREASURY_TARGET_RESERVE_LAMPORTS = BigInt(
+  Math.round((parseFloat(process.env.TREASURY_TARGET_RESERVE_SOL || '0.05')) * 1e9),
+);
 
 /**
  * Read the AMM coin_creator_vault WSOL ATA balance for `mint`. Returns 0n
@@ -356,136 +371,10 @@ async function depositTokensToPool({ connection, treasury, stakeMint, lamports }
   return { buySig, depositSig, depositedRaw: acquiredRaw.toString() };
 }
 
-// Build a single claim_push instruction for a given (position, rewardMintPda).
-// Caller passes `tokenProgram` since reward mints can be classic SPL (wSOL) or
-// Token-2022 (pump.fun launches).
-async function buildClaimPushIx({
-  connection,
-  authority,
-  stakeMint,
-  rewardMint,
-  position,
-  positionOwner,
-  tokenProgram,
-}) {
-  const program = loadProgram(connection, authority);
-  const pool = findPoolPda(stakeMint);
-  const rewardMintPda = findRewardMintPda(pool, rewardMint);
-  const checkpoint = findCheckpointPda(position, rewardMintPda);
-  const vault = getAssociatedTokenAddressSync(rewardMint, pool, true, tokenProgram);
-  const userTokenAccount = getAssociatedTokenAddressSync(rewardMint, positionOwner, false, tokenProgram);
-
-  const ataIx = createAssociatedTokenAccountIdempotentInstruction(
-    authority.publicKey,
-    userTokenAccount,
-    positionOwner,
-    rewardMint,
-    tokenProgram,
-  );
-
-  const ix = await program.methods
-    .claimPush()
-    .accounts({
-      pool,
-      authority: authority.publicKey,
-      rewardMint: rewardMintPda,
-      mint: rewardMint,
-      vault,
-      position,
-      checkpoint,
-      userTokenAccount,
-      tokenProgram,
-      systemProgram: SystemProgram.programId,
-      rent: new PublicKey('SysvarRent111111111111111111111111111111111'),
-    })
-    .instruction();
-
-  return { ataIx, ix };
-}
-
-const TX_PACKET_BUDGET_BYTES = 1180;
-
-function packIxs({ groups, feePayer, recentBlockhash }) {
-  const txs = [];
-  let current = new Transaction();
-  current.feePayer = feePayer;
-  current.recentBlockhash = recentBlockhash;
-  const fee = priorityFeeIx();
-  if (fee) current.add(fee);
-
-  const trySerialize = (tx) => {
-    try {
-      return tx.serialize({ requireAllSignatures: false, verifySignatures: false }).length;
-    } catch {
-      return Number.MAX_SAFE_INTEGER;
-    }
-  };
-
-  for (const group of groups) {
-    const trial = Transaction.from(current.serialize({ requireAllSignatures: false, verifySignatures: false }));
-    trial.feePayer = feePayer;
-    trial.recentBlockhash = recentBlockhash;
-    for (const ix of group) trial.add(ix);
-    if (trySerialize(trial) <= TX_PACKET_BUDGET_BYTES) {
-      for (const ix of group) current.add(ix);
-    } else {
-      // current is full, push it and start a new one with this group.
-      if (current.instructions.length > (priorityFeeIx() ? 1 : 0)) txs.push(current);
-      current = new Transaction();
-      current.feePayer = feePayer;
-      current.recentBlockhash = recentBlockhash;
-      const f = priorityFeeIx();
-      if (f) current.add(f);
-      for (const ix of group) current.add(ix);
-    }
-  }
-  if (current.instructions.length > (priorityFeeIx() ? 1 : 0)) txs.push(current);
-  return txs;
-}
-
-async function pushClaimsToActiveStakers({ connection, stakeMint, rewardMint }) {
-  const authority = authoritySigner();
-  const positions = await fetchActivePositions({ connection, signer: authority, stakeMint });
-  if (positions.length === 0) {
-    return { pushed: 0, skipped: 0, txSigs: [] };
-  }
-  const tokenProgram = await detectTokenProgram(connection, rewardMint);
-
-  const groups = [];
-  for (const p of positions) {
-    try {
-      const { ataIx, ix } = await buildClaimPushIx({
-        connection,
-        authority,
-        stakeMint,
-        rewardMint,
-        position: p.publicKey,
-        positionOwner: p.account.owner,
-        tokenProgram,
-      });
-      groups.push([ataIx, ix]);
-    } catch (e) {
-      log('claim_push: build failed', { position: p.publicKey.toBase58(), error: e.message });
-    }
-  }
-  if (groups.length === 0) return { pushed: 0, skipped: positions.length, txSigs: [] };
-
-  const { blockhash } = await connection.getLatestBlockhash('confirmed');
-  const txs = packIxs({ groups, feePayer: authority.publicKey, recentBlockhash: blockhash });
-  const sigs = [];
-  for (const tx of txs) {
-    try {
-      const s = await signAndPollConfirm(connection, tx, [authority], {
-        commitment: 'confirmed',
-        label: 'claim_push',
-      });
-      sigs.push(s);
-    } catch (e) {
-      log('claim_push: tx failed', { error: e.message });
-    }
-  }
-  return { pushed: groups.length, skipped: positions.length - groups.length, txSigs: sigs };
-}
+// Auto-push of `claim_push` to active stakers is now handled by
+// `auto-push-claims.js` (per-pool authority resolution, opt-out, threshold
+// gating, multi-reward-line). The legacy in-file implementation that
+// previously lived here was removed when the dedicated module landed.
 
 export async function runPoolCycle({ pool }) {
   const stakeMint = new PublicKey(pool.stakeMint);
@@ -520,6 +409,38 @@ export async function runPoolCycle({ pool }) {
   }
   if (onchain.totalEffective?.isZero?.()) {
     log('cycle: pool has zero effective stake, skipping deposit', { stakeMint: pool.stakeMint });
+  }
+
+  // Preflight: treasury balance must be above the hard floor to even attempt
+  // the claim — every claim/distribute tx is signed and rent-paid by treasury.
+  // If we're underfunded, abort the cycle with a clear surfaceable status so
+  // the admin dashboard can flag it (instead of silently looping on simulation
+  // failures forever like before this check existed).
+  const treasuryBalanceBefore = await getSolBalance(connection, treasury.publicKey);
+  if (treasuryBalanceBefore < TREASURY_MIN_RESERVE_LAMPORTS) {
+    log('cycle: TREASURY_UNDERFUNDED — skipping claim', {
+      stakeMint: pool.stakeMint,
+      treasury: treasury.publicKey.toBase58(),
+      balanceLamports: treasuryBalanceBefore.toString(),
+      minReserveLamports: TREASURY_MIN_RESERVE_LAMPORTS.toString(),
+      targetReserveLamports: TREASURY_TARGET_RESERVE_LAMPORTS.toString(),
+      hint: `top up treasury wallet (${treasury.publicKey.toBase58()}) to ≥ ${Number(TREASURY_TARGET_RESERVE_LAMPORTS) / 1e9} SOL — no claim cycles will run until then`,
+    });
+    updatePoolFields(pool.stakeMint, {
+      lastClaimAttemptAt: new Date().toISOString(),
+      lastClaimAttemptReason: 'treasury_underfunded',
+      lastClaimAttemptEstimate: {
+        balanceLamports: treasuryBalanceBefore.toString(),
+        minReserveLamports: TREASURY_MIN_RESERVE_LAMPORTS.toString(),
+        targetReserveLamports: TREASURY_TARGET_RESERVE_LAMPORTS.toString(),
+      },
+    });
+    return {
+      status: 'treasury_underfunded',
+      treasury: treasury.publicKey.toBase58(),
+      balanceLamports: treasuryBalanceBefore.toString(),
+      minReserveLamports: TREASURY_MIN_RESERVE_LAMPORTS.toString(),
+    };
   }
 
   const reward = await fetchRewardMint({
@@ -600,12 +521,38 @@ export async function runPoolCycle({ pool }) {
   }
 
   // 2) Split fees.
-  const { platform, stakers } = splitFees(claimedLamports);
+  const { platform, stakers: stakersBeforeReserve } = splitFees(claimedLamports);
+
+  // Operational reserve top-up: if the treasury is below the target reserve,
+  // hold back lamports from the STAKER portion (never from platform — that's
+  // the user's revenue) to refill it. This makes cycles self-sustaining over
+  // the long run: after the first cycle following a near-empty treasury, we
+  // back-fill the reserve from one cycle's stakers, and every subsequent
+  // cycle is net-zero on reserve (so 100% of stakers portion goes to stakers).
+  //
+  // We re-measure treasury balance AFTER the claim — claimedLamports just
+  // landed there, so it might already be above target without holdback.
+  const treasuryAfterClaim = await getSolBalance(connection, treasury.publicKey);
+  let reserveTopupLamports = 0n;
+  if (treasuryAfterClaim < TREASURY_TARGET_RESERVE_LAMPORTS) {
+    const needed = TREASURY_TARGET_RESERVE_LAMPORTS - treasuryAfterClaim;
+    // Cap the holdback at 80% of the staker portion so a single tiny cycle
+    // can't consume the entire claimed amount. Stakers always receive
+    // something. After 2-3 cycles the reserve is fully topped up regardless.
+    const maxHoldback = (stakersBeforeReserve * 8n) / 10n;
+    reserveTopupLamports = needed > maxHoldback ? maxHoldback : needed;
+  }
+  const stakers = stakersBeforeReserve - reserveTopupLamports;
+
   log('cycle: split', {
     stakeMint: pool.stakeMint,
     rewardMode,
     platform: platform.toString(),
     stakers: stakers.toString(),
+    stakersBeforeReserve: stakersBeforeReserve.toString(),
+    reserveTopupLamports: reserveTopupLamports.toString(),
+    treasuryAfterClaim: treasuryAfterClaim.toString(),
+    treasuryTargetReserve: TREASURY_TARGET_RESERVE_LAMPORTS.toString(),
   });
 
   let depositSig = null;
@@ -657,19 +604,27 @@ export async function runPoolCycle({ pool }) {
     }
   }
 
-  // 3) Push to stakers (only if we deposited and platform owns the pool — claim_push signs as authority).
-  let pushResult = { pushed: 0, skipped: 0, txSigs: [] };
+  // 3) Auto-push to stakers — runs the upgraded module which:
+  //    - tries platform_authority first, then per-pool env keys (POOL_AUTH /
+  //      FAITH_KEYPAID for legacy SQWARK + FLfR pools)
+  //    - skips wallets that have toggled `autoPush: false` in user-prefs
+  //    - threshold-gates per (position, reward) pair to avoid dust pushes
+  //    - iterates ALL registered reward mints (e.g. SQWARK has both wSOL +
+  //      stake-mint reward lines for early-unstake penalty redistribution)
+  //
+  // We enumerate reward mints fresh from on-chain rather than trusting the
+  // registry's `rewardMint` field — registry only tracks the primary reward
+  // mode, but pools can have additional reward lines added over time.
+  let pushResult = { totalPushed: 0, totalSkipped: 0, totalOptedOut: 0, txSigs: [] };
   if (depositSig) {
-    const poolAuthorityMatches = onchain.authority.equals(authority.publicKey);
-    if (poolAuthorityMatches) {
-      pushResult = await pushClaimsToActiveStakers({ connection, stakeMint, rewardMint });
-      log('cycle: pushed claims', { stakeMint: pool.stakeMint, ...pushResult });
-    } else {
-      log('cycle: skipping claim_push (pool authority is not platform authority; stakers claim from UI)', {
-        stakeMint: pool.stakeMint,
-        poolAuthority: onchain.authority.toBase58(),
-        workerAuthority: authority.publicKey.toBase58(),
-      });
+    try {
+      const rewardMints = await listPoolRewardMints({ connection, stakeMint });
+      if (rewardMints.length > 0) {
+        pushResult = await pushClaimsForPool({ connection, stakeMint, rewardMints });
+        log('cycle: pushed claims', { stakeMint: pool.stakeMint, ...pushResult });
+      }
+    } catch (e) {
+      log('cycle: auto-push failed', { stakeMint: pool.stakeMint, error: e.message });
     }
   }
 
@@ -701,7 +656,9 @@ export async function runPoolCycle({ pool }) {
     buySig,
     depositSig,
     sweepSig,
-    pushedClaims: pushResult.pushed,
+    pushedClaims: pushResult.totalPushed,
+    pushSkippedBelowThreshold: pushResult.totalSkipped,
+    pushSkippedOptedOut: pushResult.totalOptedOut,
     pushTxSigs: pushResult.txSigs,
   });
 
@@ -716,6 +673,6 @@ export async function runPoolCycle({ pool }) {
     buySig,
     depositSig,
     sweepSig,
-    pushedClaims: pushResult.pushed,
+    pushedClaims: pushResult.totalPushed,
   };
 }

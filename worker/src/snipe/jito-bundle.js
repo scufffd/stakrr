@@ -38,7 +38,10 @@ export const MAX_BUNDLE_TXS = 5;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function defaultJitoTipSol() {
-  const v = parseFloat(process.env.JITO_TIP_SOL || '0.001');
+  // 0.005 SOL is a safe default — Jito's effective tip floor moved up from
+  // ~0.001 in early 2026 as bundle competition grew. Tips below ~0.001 are
+  // silently dropped (bundle never lands → "bundle confirmation timed out").
+  const v = parseFloat(process.env.JITO_TIP_SOL || '0.005');
   return Number.isFinite(v) && v > 0 ? v : 0.001;
 }
 
@@ -85,11 +88,20 @@ async function buildAndSignBundle({
   jitoTipSol,
   sniperKeypairs = [],
   sniperSolPerWallet = 0,
+  extraBuyers = [],          // [{ keypair, solAmount }] — custom-SOL buyers
+                              // (e.g. MM seed wallet); appended after snipers
+                              // and counted toward the bundle slot limit
 }) {
-  const additionalBuyers = sniperKeypairs.map((kp) => ({
-    publicKey: kp.publicKey.toBase58(),
-    amountSol: sniperSolPerWallet,
-  }));
+  const additionalBuyers = [
+    ...sniperKeypairs.map((kp) => ({
+      publicKey: kp.publicKey.toBase58(),
+      amountSol: sniperSolPerWallet,
+    })),
+    ...extraBuyers.map((b) => ({
+      publicKey: b.keypair.publicKey.toBase58(),
+      amountSol: Number(b.solAmount) || 0,
+    })),
+  ];
 
   const body = {
     publicKey: devKeypair.publicKey.toBase58(),
@@ -140,14 +152,22 @@ async function buildAndSignBundle({
   const mintAddress = parsed.mint || usedMintKeypair.publicKey.toBase58();
 
   // Build the signer label → keypair map pumpdev expects. The labels are
-  // hard-coded by pumpdev: 'creator', 'mint', 'buyer1' … 'buyerN'.
+  // hard-coded by pumpdev: 'creator', 'mint', 'buyer1' … 'buyerN'. The order
+  // here MUST match how we assembled `additionalBuyers` above (snipers first,
+  // then extraBuyers) so the buyerN indices line up.
   const walletMap = {
     creator: devKeypair,
     mint: usedMintKeypair,
   };
-  sniperKeypairs.forEach((kp, i) => {
-    walletMap[`buyer${i + 1}`] = kp;
-  });
+  let buyerIdx = 0;
+  for (const kp of sniperKeypairs) {
+    buyerIdx += 1;
+    walletMap[`buyer${buyerIdx}`] = kp;
+  }
+  for (const b of extraBuyers) {
+    buyerIdx += 1;
+    walletMap[`buyer${buyerIdx}`] = b.keypair;
+  }
 
   const encodedSignedTxs = [];
   const txSignatures = [];
@@ -231,7 +251,10 @@ async function waitForBundle({
   bundleId,
   createTxSignature,
   mint,
-  timeoutMs = 30_000,
+  // 45s gives Jito + RPC ~3 finality cycles (12-15s each) before we give up
+  // and retry the bundle. 30s was occasionally too tight when Helius was
+  // rate-limited and we had to fall back to public RPC.
+  timeoutMs = 45_000,
   pollIntervalMs = 1500,
 }) {
   const deadline = Date.now() + timeoutMs;
@@ -349,8 +372,14 @@ export async function launchBundle({
   slippageBps = 50,
   sniperKeypairs = [],
   sniperSolPerWallet = 0,
+  extraBuyers = [],          // [{ keypair, solAmount }] — e.g. MM seed wallet
+                              // with its own SOL amount. These take priority
+                              // over snipers for in-bundle slots so the MM
+                              // seed always lands in the create block.
   jitoTipSol,
-  maxBundleAttempts = 4,
+  // 3 × 45s = ~135s worst case before we give up. Keeps the launch
+  // request comfortably under nginx's proxy_read_timeout (180s).
+  maxBundleAttempts = 3,
 }) {
   if (!devKeypair) throw new Error('launchBundle: devKeypair required');
   if (!mintKeypair) throw new Error('launchBundle: mintKeypair required');
@@ -361,9 +390,12 @@ export async function launchBundle({
   // we know the exact reserves.
   const slippagePct = Math.max(1, Math.min(99, Math.round(slippageBps / 100)));
 
-  const slotsAvailableForSnipers = MAX_BUNDLE_TXS - 1 - (devBuySol > 0 ? 1 : 0);
-  const inBundleSnipers = sniperKeypairs.slice(0, slotsAvailableForSnipers);
-  const overflowSnipers = sniperKeypairs.slice(slotsAvailableForSnipers);
+  const totalBuyerSlots = MAX_BUNDLE_TXS - 1 - (devBuySol > 0 ? 1 : 0);
+  // extraBuyers are mission-critical (MM seed) — give them slots first.
+  const inBundleExtras = extraBuyers.slice(0, totalBuyerSlots);
+  const remainingSlots = totalBuyerSlots - inBundleExtras.length;
+  const inBundleSnipers = sniperKeypairs.slice(0, remainingSlots);
+  const overflowSnipers = sniperKeypairs.slice(remainingSlots);
 
   let lastErr;
   for (let attempt = 1; attempt <= maxBundleAttempts; attempt += 1) {
@@ -379,6 +411,7 @@ export async function launchBundle({
         jitoTipSol: tipSol,
         sniperKeypairs: inBundleSnipers,
         sniperSolPerWallet,
+        extraBuyers: inBundleExtras,
       });
 
       const submission = await submitBundle(built.encodedSignedTxs);
@@ -400,6 +433,10 @@ export async function launchBundle({
         txSignatures: built.txSignatures,
         inBundleSnipers: inBundleSnipers.map((kp) => kp.publicKey.toBase58()),
         overflowSnipers: overflowSnipers.map((kp) => kp.publicKey.toBase58()),
+        inBundleExtras: inBundleExtras.map((b) => ({
+          publicKey: b.keypair.publicKey.toBase58(),
+          solAmount: Number(b.solAmount) || 0,
+        })),
         jitoTipSol: tipSol,
         slippagePct,
         devBuySol,
