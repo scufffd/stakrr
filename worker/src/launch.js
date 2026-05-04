@@ -643,12 +643,25 @@ export async function finalizeCreatorLaunch({
   if (!onchainPool) {
     throw new Error('stake pool not found on-chain after launch txs');
   }
-  if (!onchainPool.authority.equals(creatorPk)) {
+  // Anti-rug rotation (see buildPoolRewardTxFor / buildUnsignedPoolRewardTxBase64)
+  // moves pool.authority from the deployer to the platform authority in the
+  // same tx initialize_pool runs in. So the on-chain authority can legally be
+  // EITHER the deployer (legacy / pre-rotation pools) OR the platform key
+  // (modern pools). Anything else is a real mismatch and we should bail.
+  const platformAuthorityPk = (config.authorityKeypair || config.treasuryKeypair).publicKey;
+  const authorityIsCreator = onchainPool.authority.equals(creatorPk);
+  const authorityIsPlatform = onchainPool.authority.equals(platformAuthorityPk);
+  if (!authorityIsCreator && !authorityIsPlatform) {
     throw new Error(
-      `on-chain pool authority ${onchainPool.authority.toBase58()} does not match creatorWallet ${creatorPk.toBase58()}`,
+      `on-chain pool authority ${onchainPool.authority.toBase58()} matches neither the creator ${creatorPk.toBase58()} nor the platform authority ${platformAuthorityPk.toBase58()}`,
     );
   }
-  const canonicalCreator = onchainPool.authority;
+  // Registry distinguishes the wallet that *deployed* the token (used for
+  // attribution, leaderboards, royalty payout records) from the on-chain
+  // authority that controls the pool (used for ops). Pre-rotation they were
+  // the same; post-rotation they're different and we need both.
+  const canonicalCreator = creatorPk;
+  const canonicalPoolAuthority = onchainPool.authority;
 
   const rewardAcct = await fetchRewardMint({
     connection,
@@ -678,7 +691,7 @@ export async function finalizeCreatorLaunch({
     rewardMode,
     platformFeeBps: config.platformFeeBps,
     launchFunding: 'creator',
-    poolAuthority: canonicalCreator.toBase58(),
+    poolAuthority: canonicalPoolAuthority.toBase58(),
     /**
      * Once feeLock is present, the BondingCurve.creator field is the
      * FeeSharingConfig PDA (not a wallet) and the worker calls
