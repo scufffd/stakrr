@@ -25,6 +25,7 @@ import {
   formatPct,
   formatTokensCompact,
 } from '../lib/pump-curve.js';
+import { RewardLinesPicker, useRewardLinesState } from './RewardLinesPicker.jsx';
 
 const SKY = '#35C5E0';
 const INK = '#0C0C0C';
@@ -480,6 +481,7 @@ function LaunchTab({ adminPk, onLaunched }) {
   const [jitoTipSol, setJitoTipSol] = useState('0.005');
   const [slippageBps, setSlippageBps] = useState('5000');
   const [rewardMode, setRewardMode] = useState('sol');
+  const rewardLines = useRewardLinesState();
 
   // Inline "import another wallet to use as dev" UX — paste a secret key,
   // it's stored encrypted in the vault (so it can be reused/swept later)
@@ -812,6 +814,15 @@ function LaunchTab({ adminPk, onLaunched }) {
       fd.append('jitoTipSol', String(Number(jitoTipSol) || 0.005));
       fd.append('slippageBps', String(Number(slippageBps) || 5000));
       fd.append('rewardMode', rewardMode);
+      // Multi-reward (advanced) — see RewardLinesPicker / worker reward-lines.js.
+      // When enabled the worker treats `rewardLines` as canonical and the
+      // legacy `rewardMode` only mirrors the primary line.
+      if (rewardLines.enabled) {
+        if (!rewardLines.isValid) {
+          throw new Error(`Reward split is invalid — weights must sum to 100% (currently ${(rewardLines.totalWeightBps / 100).toFixed(2)}%)`);
+        }
+        fd.append('rewardLines', JSON.stringify(rewardLines.payload));
+      }
 
       if (kolEnabled && kolWallets.length > 0) {
         const excludeWallets = kolExcludeWalletsText
@@ -904,7 +915,7 @@ function LaunchTab({ adminPk, onLaunched }) {
     } finally {
       setSubmitting(false);
     }
-  }, [adminPk, name, symbol, description, twitter, telegram, website, imageFile, imageUrl, metadataUri, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol, slippageBps, rewardMode, kolEnabled, kolWallets, kolLockDays, kolAllocPct, kolMode, kolClaimWindowDays, kolExcludeWalletsText, kolEarlyUnstakePct, presaleEnabled, presaleWalletAddr, presaleCutoffSig, presaleLockDays, presaleMinTransferSol, presaleEarlyUnstakePct, presaleExcludeText, mmEnabled, mmWalletId, mmEntrySol, mmBankrollSol, mmDrawdownPct, mmMinBuySol, mmMaxBuySol, mmMinIntervalSec, mmMaxIntervalSec, mmSlippage, choreoEnabled, choreoAbsorberIds, choreoDevStakePct, choreoDevStakeLockDays, choreoDevSellPct, choreoDevSellDelayBlocks, choreoAbsorberWaveDelayBlocks, choreoAbsorberWaveSize, choreoAbsorberBuyMinSol, choreoAbsorberBuyMaxSol, choreoAbsorberAutoStakePct, choreoAbsorberStakeLockDays, choreoDripWindowSec, choreoDripIntervalMinMs, choreoDripIntervalMaxMs, onLaunched]);
+  }, [adminPk, name, symbol, description, twitter, telegram, website, imageFile, imageUrl, metadataUri, devWalletId, sniperIds, devBuySol, sniperSolPerWallet, jitoTipSol, slippageBps, rewardMode, rewardLines.enabled, rewardLines.payload, rewardLines.isValid, rewardLines.totalWeightBps, kolEnabled, kolWallets, kolLockDays, kolAllocPct, kolMode, kolClaimWindowDays, kolExcludeWalletsText, kolEarlyUnstakePct, presaleEnabled, presaleWalletAddr, presaleCutoffSig, presaleLockDays, presaleMinTransferSol, presaleEarlyUnstakePct, presaleExcludeText, mmEnabled, mmWalletId, mmEntrySol, mmBankrollSol, mmDrawdownPct, mmMinBuySol, mmMaxBuySol, mmMinIntervalSec, mmMaxIntervalSec, mmSlippage, choreoEnabled, choreoAbsorberIds, choreoDevStakePct, choreoDevStakeLockDays, choreoDevSellPct, choreoDevSellDelayBlocks, choreoAbsorberWaveDelayBlocks, choreoAbsorberWaveSize, choreoAbsorberBuyMinSol, choreoAbsorberBuyMaxSol, choreoAbsorberAutoStakePct, choreoAbsorberStakeLockDays, choreoDripWindowSec, choreoDripIntervalMinMs, choreoDripIntervalMaxMs, onLaunched]);
 
   return (
     <form onSubmit={handleSubmit}>
@@ -1158,11 +1169,24 @@ function LaunchTab({ adminPk, onLaunched }) {
         )}
 
         <Field label="Reward mode" style={{ marginTop: 12 }}>
-          <select value={rewardMode} onChange={(e) => setRewardMode(e.target.value)} style={inputStyle}>
+          <select
+            value={rewardMode}
+            onChange={(e) => setRewardMode(e.target.value)}
+            disabled={rewardLines.enabled}
+            style={{ ...inputStyle, opacity: rewardLines.enabled ? 0.5 : 1 }}
+          >
             <option value="sol">SOL (wsol-rewards) — most launches</option>
             <option value="token">Token (self-rewards) — pool earns the launched token</option>
           </select>
+          {rewardLines.enabled && (
+            <div style={{ marginTop: 6, fontSize: 11, color: MUTED }}>
+              Custom reward split below overrides this — fees auto-swap into the picked tokens.
+            </div>
+          )}
         </Field>
+        <div style={{ marginTop: 12 }}>
+          <RewardLinesPicker {...rewardLines} />
+        </div>
       </Card>
 
       <Card title="5. KOL airdrop (optional)" style={{ marginTop: 16 }}>

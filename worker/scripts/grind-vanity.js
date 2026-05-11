@@ -3,28 +3,43 @@
  * grind-vanity.js — Stakrr vanity address pool filler.
  *
  * Wraps `solana-keygen grind` (Rust, multithreaded, ~50M keys/s) and merges
- * the resulting keypairs into Stakrr's `data/vanity-pump.json`. Same shape
- * the launch flow already consumes (see `popUnusedMintKeypairFromPool`).
+ * the resulting keypairs into the JSON pool file the launch flow consumes
+ * (see `popUnusedMintKeypairFromPool`).
+ *
+ * Multi-suffix: this script accepts CLI args so multiple instances can run
+ * in parallel — one per (suffix, pool) pair. Pump.fun launches use the
+ * `pump`-suffix pool; Meteora launches use the `stkr`-suffix pool. Run a
+ * dedicated pm2 process for each.
  *
  * Usage:
- *   node scripts/grind-vanity.js              # one-shot: grind GRIND_BATCH then exit
- *   node scripts/grind-vanity.js --daemon     # long-running pm2 mode
+ *   node scripts/grind-vanity.js                           # one-shot, env defaults
+ *   node scripts/grind-vanity.js --daemon                  # daemon, env defaults
+ *   node scripts/grind-vanity.js --daemon \\
+ *     --label stkr --suffix stkr --pool ./data/vanity-stkr.json --target 200
  *
- * Env (worker .env):
- *   VANITY_MINT_POOL_FILE   → output pool path (./data/vanity-pump.json)
- *   VANITY_MINT_SUFFIX      → base58 suffix (pump)
- *   GRIND_TARGET            → stop topping up once pool reaches this size (300)
- *   GRIND_BATCH             → keys per `solana-keygen grind` invocation (1)
- *   GRIND_THREADS           → solana-keygen --num-threads (1 — keep low on shared boxes)
- *   GRIND_SLEEP_MS          → daemon sleep after a successful grind (90000)
- *   GRIND_SLEEP_FULL_MS     → daemon sleep when pool ≥ TARGET (600000)
- *   GRIND_NICE              → unix nice level 0..19 (19 — lowest priority on Linux)
+ * CLI args (override env):
+ *   --pool <path>            output JSON pool file (env VANITY_MINT_POOL_FILE)
+ *   --suffix <str>           base58 suffix to grind, CASE-SENSITIVE
+ *                            (env VANITY_MINT_SUFFIX). Common: pump | stkr | STK.
+ *   --target <n>             stop topping up once pool ≥ n (env GRIND_TARGET=300)
+ *   --batch <n>              keys per solana-keygen invocation (env GRIND_BATCH=1)
+ *   --threads <n>            solana-keygen --num-threads (env GRIND_THREADS=1)
+ *   --sleep-ms <n>           daemon sleep after a successful grind (env GRIND_SLEEP_MS=90000)
+ *   --sleep-full-ms <n>      daemon sleep when pool full (env GRIND_SLEEP_FULL_MS=600000)
+ *   --nice <0..19>           unix nice level (env GRIND_NICE=19; 19 = lowest prio)
+ *   --label <name>           log identifier (default: derived from suffix). Useful
+ *                            when running parallel instances so pm2 logs are easy
+ *                            to filter.
+ *   --daemon                 long-running pm2 mode (no flag = exit after one round)
+ *
+ * Difficulty by suffix length (case-sensitive base58):
+ *   3 chars (STK):  58^3   ≈ 195k keys/match  → instant on 1 vCPU
+ *   4 chars (stkr): 58^4   ≈ 11M keys/match   → seconds-to-tens-of-seconds
+ *   5 chars (stakr): 58^5  ≈ 656M keys/match  → minutes per match
  *
  * Production preset on Faith droplet (1 vCPU, 458 MiB RAM):
- *   1 thread, batch 1, sleep 90s, nice 19. Average CPU ~5–10% over time;
- *   never starves stakrr-api / stakrr-loop. ~3 mints/min when grinding,
- *   ~0% when pool is full. Target 300 = ~9 days of "1 launch every 40 min"
- *   before refill is even needed.
+ *   1 thread, batch 1, sleep 90s, nice 19 — never starves stakrr-api /
+ *   stakrr-loop. Target 300 ≈ many days of "1 launch / 40 min" before refill.
  */
 
 import { spawn, execSync } from 'node:child_process';
@@ -39,17 +54,62 @@ const __dirname  = path.dirname(__filename);
 
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
-const POOL_FILE = process.env.VANITY_MINT_POOL_FILE
-  ? path.resolve(__dirname, '..', process.env.VANITY_MINT_POOL_FILE)
-  : path.resolve(__dirname, '..', 'data', 'vanity-pump.json');
-const SUFFIX           = (process.env.VANITY_MINT_SUFFIX || 'pump').toLowerCase();
-const TARGET           = intEnv('GRIND_TARGET', 300);
-const BATCH            = Math.max(1, intEnv('GRIND_BATCH', 1));
-const THREADS          = Math.max(1, intEnv('GRIND_THREADS', 1));
-const SLEEP_MS         = intEnv('GRIND_SLEEP_MS', 90_000);
-const SLEEP_FULL_MS    = intEnv('GRIND_SLEEP_FULL_MS', 600_000);
-const NICE             = clamp(intEnv('GRIND_NICE', 19), 0, 19);
-const DAEMON           = process.argv.includes('--daemon');
+// CLI args parsing — supports `--key value` and `--key=value`. Only the
+// flags listed in the file header are honoured; unknown flags are ignored.
+function parseCliArgs(argv) {
+  const out = {};
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith('--')) continue;
+    if (a === '--daemon') { out.daemon = true; continue; }
+    const eq = a.indexOf('=');
+    let key, val;
+    if (eq > 0) {
+      key = a.slice(2, eq);
+      val = a.slice(eq + 1);
+    } else {
+      key = a.slice(2);
+      val = (argv[i + 1] && !argv[i + 1].startsWith('--')) ? argv[++i] : true;
+    }
+    out[key] = val;
+  }
+  return out;
+}
+const CLI = parseCliArgs(process.argv);
+
+function pickStr(cliKey, envKey, fallback) {
+  const v = CLI[cliKey];
+  if (typeof v === 'string' && v.trim()) return v.trim();
+  const e = process.env[envKey];
+  if (typeof e === 'string' && e.trim()) return e.trim();
+  return fallback;
+}
+function pickInt(cliKey, envKey, fallback) {
+  const v = CLI[cliKey];
+  if (typeof v === 'string' && v.trim()) {
+    const n = Number(v);
+    if (Number.isFinite(n)) return Math.floor(n);
+  }
+  return intEnv(envKey, fallback);
+}
+
+const POOL_REL = pickStr('pool', 'VANITY_MINT_POOL_FILE', 'data/vanity-pump.json');
+const POOL_FILE = path.isAbsolute(POOL_REL)
+  ? POOL_REL
+  : path.resolve(__dirname, '..', POOL_REL);
+// CASE-SENSITIVE: solana-keygen `--ends-with` is case-sensitive, and the
+// worker's `popUnusedMintKeypairFromPool` does a case-sensitive
+// `String.endsWith` match. We must NOT lowercase here or "STK" would grind
+// keys ending in "stk" that the launcher then can't find. Mismatch silently.
+const SUFFIX           = pickStr('suffix', 'VANITY_MINT_SUFFIX', 'pump');
+const TARGET           = pickInt('target', 'GRIND_TARGET', 300);
+const BATCH            = Math.max(1, pickInt('batch', 'GRIND_BATCH', 1));
+const THREADS          = Math.max(1, pickInt('threads', 'GRIND_THREADS', 1));
+const SLEEP_MS         = pickInt('sleep-ms', 'GRIND_SLEEP_MS', 90_000);
+const SLEEP_FULL_MS    = pickInt('sleep-full-ms', 'GRIND_SLEEP_FULL_MS', 600_000);
+const NICE             = clamp(pickInt('nice', 'GRIND_NICE', 19), 0, 19);
+const DAEMON           = !!CLI.daemon || process.argv.includes('--daemon');
+const LABEL            = pickStr('label', 'GRIND_LABEL', SUFFIX);
 
 // ── solana-keygen discovery ──────────────────────────────────────────────────
 
@@ -78,6 +138,7 @@ if (!KEYGEN) {
 }
 
 log('grind: starting', {
+  label: LABEL,
   daemon: DAEMON,
   poolFile: POOL_FILE,
   suffix: SUFFIX,
@@ -144,7 +205,9 @@ function grindOnce(needed, knownKeys) {
         const fresh = [];
         for (const file of files) {
           const pubKey = path.basename(file, '.json');
-          if (!pubKey.toLowerCase().endsWith(SUFFIX)) continue;
+          // CASE-SENSITIVE match — must align with worker's
+          // popUnusedMintKeypairFromPool which uses String.endsWith.
+          if (!pubKey.endsWith(SUFFIX)) continue;
           if (knownKeys.has(pubKey)) continue;
           const secretBytes = JSON.parse(fs.readFileSync(path.join(workDir, file), 'utf8'));
           fresh.push({
@@ -244,5 +307,9 @@ function intEnv(key, fallback) {
 function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
 
 function log(message, extra = {}) {
-  console.log(JSON.stringify({ ts: new Date().toISOString(), message, ...extra }));
+  // `label` is set after CLI parsing — guard for the early-startup `log()`
+  // calls that happen before LABEL exists (e.g. "solana-keygen not found").
+  const label = typeof LABEL === 'string' ? LABEL : null;
+  const tagged = label ? { label, ...extra } : extra;
+  console.log(JSON.stringify({ ts: new Date().toISOString(), message, ...tagged }));
 }

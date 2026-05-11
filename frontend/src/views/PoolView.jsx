@@ -57,6 +57,43 @@ function fmtRaw(rawStr, decimals = 6) {
   }
 }
 
+const KNOWN_REWARD_MINTS = {
+  'So11111111111111111111111111111111111111112': 'SOL',
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 'USDC',
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 'USDT',
+  'Xsf9mBktVB9BSU5kf4nHxPq5hCBJ2j2ui3ecFGxPRGc': 'GMEx',
+};
+
+/**
+ * Compute a one-line reward summary for the token header badge. We prefer
+ * `rewardLines` (the multi-reward shape) when present and fall back to the
+ * legacy `rewardMode` / `rewardMint` for older single-reward pools.
+ *
+ * The stake mint always gets added as a reward line on-chain so penalty
+ * lamports from early unstakes have a place to land — but it's not a
+ * "reward" the staker actively earns from cycles, so we filter it out
+ * of the badge label. (The dedicated penalties section below the header
+ * still surfaces it.)
+ */
+function deriveRewardSummary(token, symbol) {
+  const stakeMint = token?.stakeMint;
+  const rewardLines = Array.isArray(token?.rewardLines) ? token.rewardLines : [];
+  const payoutLines = rewardLines.filter((l) => l && l.mint && l.mint !== stakeMint);
+  if (payoutLines.length > 0) {
+    const labels = payoutLines.map(
+      (l) => KNOWN_REWARD_MINTS[l.mint] || `${l.mint.slice(0, 4)}…${l.mint.slice(-4)}`,
+    );
+    return {
+      classMod: payoutLines.length > 1 ? 'badge--token' : 'badge--sol',
+      label: labels.join(' + '),
+    };
+  }
+  if (token?.rewardMode === 'token') {
+    return { classMod: 'badge--token', label: `$${symbol || 'TKN'}` };
+  }
+  return { classMod: 'badge--sol', label: 'SOL' };
+}
+
 export default function PoolView({ mint, onBack }) {
   const [token, setToken] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -82,7 +119,18 @@ export default function PoolView({ mint, onBack }) {
   }, [mint, refreshTick]);
 
   const meta = token?.metadata || {};
-  const pumpfunUrl = useMemo(() => `https://pump.fun/${token?.stakeMint || ''}`, [token]);
+  // Where to send users to buy/sell. Pump.fun launches link to pump.fun;
+  // Meteora launches link to launch.meteora.ag's pool page (works for both
+  // pre-graduation virtual pools and post-graduation DAMM v2 pools — the
+  // landing page redirects to the right venue).
+  const buyVenueUrl = useMemo(() => {
+    if (!token?.stakeMint) return '#';
+    if (token.launchSource === 'meteora') {
+      return `https://launch.meteora.ag/?baseMint=${token.stakeMint}`;
+    }
+    return `https://pump.fun/${token.stakeMint}`;
+  }, [token]);
+  const buyVenueLabel = token?.launchSource === 'meteora' ? 'Buy on Meteora' : 'Buy on Pump.fun';
 
   // Update document title and og: meta tags so the per-token URL has a useful
   // tab title and (for clients that read these — Telegram, Discord, Slack)
@@ -141,9 +189,21 @@ export default function PoolView({ mint, onBack }) {
                   <span className="badge">
                     {token.initialized ? 'Staking live' : 'Staking not ready'}
                   </span>
-                  {token.initialized && (
-                    <span className={`badge ${token.rewardMode === 'token' ? 'badge--token' : 'badge--sol'}`}>
-                      Rewards · {token.rewardMode === 'token' ? `$${meta.symbol || 'TKN'}` : 'SOL'}
+                  {token.initialized && (() => {
+                    const summary = deriveRewardSummary(token, meta.symbol);
+                    return (
+                      <span className={`badge ${summary.classMod}`}>
+                        Rewards · {summary.label}
+                      </span>
+                    );
+                  })()}
+                  {token.launchSource === 'meteora' && (
+                    <span
+                      className="badge"
+                      title="Launched via Meteora Dynamic Bonding Curve. 100% of trading fees flow to stakers."
+                      style={{ background: '#7C45F3', color: 'white' }}
+                    >
+                      Meteora DBC
                     </span>
                   )}
                 </div>
@@ -164,8 +224,8 @@ export default function PoolView({ mint, onBack }) {
                   {meta.twitter && <a href={meta.twitter} target="_blank" rel="noreferrer" className="link-chip">Twitter</a>}
                   {meta.telegram && <a href={meta.telegram} target="_blank" rel="noreferrer" className="link-chip">Telegram</a>}
                   {meta.website && <a href={meta.website} target="_blank" rel="noreferrer" className="link-chip">Site</a>}
-                  <a href={pumpfunUrl} target="_blank" rel="noreferrer" className="btn-pump" style={{ marginLeft: 'auto' }}>
-                    Buy on Pump.fun ↗
+                  <a href={buyVenueUrl} target="_blank" rel="noreferrer" className="btn-pump" style={{ marginLeft: 'auto' }}>
+                    {buyVenueLabel} ↗
                   </a>
                 </div>
               </div>

@@ -25,7 +25,12 @@ import {
 } from '@solana/spl-token';
 import { config, authoritySigner, getConnection } from './config.js';
 import { wrapSolIxs } from './wsol.js';
-import { buildClaimCreatorFeesTx, buildClaimDistributeTx, buildBuyTokenTx } from './pumpdev.js';
+import { buildClaimCreatorFeesTx, buildClaimDistributeTx, buildBuyTokenTx as buildPumpfunBuyTokenTx } from './pumpdev.js';
+import {
+  buildBuyTokenTx as buildMeteoraBuyTokenTx,
+  buildClaimCreatorFeesTx as buildMeteoraClaimPartnerFeesTx,
+  getPoolState as getMeteoraPoolState,
+} from './meteora.js';
 import { shouldAttemptClaim } from './dexscreener.js';
 import {
   depositRewardsIx,
@@ -35,6 +40,8 @@ import {
 } from './stake-program.js';
 import { addToPoolMetrics, recordEvent, updatePoolFields } from './registry.js';
 import { pushClaimsForPool, listPoolRewardMints } from './auto-push-claims.js';
+import { effectiveRewardLines, allocateByWeight } from './reward-lines.js';
+import { executeSwap } from './jupiter.js';
 
 function log(message, extra = {}) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), message, ...extra }));
@@ -107,7 +114,119 @@ async function readAmmVaultWsolBalance(connection, mintPk) {
   }
 }
 
-async function claimCreatorFees(connection, treasury, { mint, feeLocked = false } = {}) {
+/**
+ * Top-level claim dispatcher. Picks the right code path for the token's venue:
+ *   - `pumpfun` (default): legacy pump_fees flow (native distribute + claim).
+ *   - `meteora`: partner-fee claim via Meteora DBC SDK.
+ *
+ * Returns the same shape regardless of venue:
+ *   { claimedLamports: bigint, signature, distributeSig?, distributePath? }
+ *
+ * This wraps the existing pump.fun helper as `claimPumpfunCreatorFees` so the
+ * (large, well-tested) flow stays intact while letting Meteora pools take a
+ * separate, simpler path.
+ */
+async function claimCreatorFees(
+  connection,
+  treasury,
+  { mint, feeLocked = false, launchSource = 'pumpfun', meteoraConfigKey = null } = {},
+) {
+  if (launchSource === 'meteora') {
+    return claimMeteoraPartnerFees(connection, treasury, { mint, configKey: meteoraConfigKey });
+  }
+  return claimPumpfunCreatorFees(connection, treasury, { mint, feeLocked });
+}
+
+/**
+ * Meteora claim path. The Stakrr-owned config sets `feeClaimer = treasury`
+ * and `creatorTradingFeePercentage = 0`, so `claimPartnerTradingFee` collects
+ * 100% of accumulated quote-token (SOL) fees in a single tx. The SDK handles
+ * wSOL wrap/unwrap internally, so the treasury's native SOL balance reflects
+ * the claim immediately and the existing `delta = after - before` accounting
+ * works without modification.
+ *
+ * Pre-graduation: claim works against the virtual pool.
+ * Post-graduation: claim still works for any unclaimed fees that accrued
+ * pre-migration; new post-grad fees flow through the DAMM v2 pool's
+ * partner-locked LP and require a separate flow (TODO: add a DAMM v2 fee
+ * claim path; v1 just logs and returns 0).
+ */
+async function claimMeteoraPartnerFees(connection, treasury, { mint, configKey = null }) {
+  const beforeLamports = await getSolBalance(connection, treasury.publicKey);
+
+  // Probe pool state — skip the claim entirely if the pool is fully migrated
+  // and we've already drained pre-grad fees in a prior cycle. We can't tell
+  // that perfectly without reading the partner-fee accumulator, but checking
+  // `isMigrated` lets us short-circuit the common "graduated and idle" case
+  // and avoid the rent-create cost on the temp wSOL ATA.
+  const state = await getMeteoraPoolState({ mint, configKey });
+  if (!state) {
+    log('claim: meteora pool state missing — skipping', { mint });
+    return { claimedLamports: 0n, signature: null, distributeSig: null, distributePath: 'meteora-skip' };
+  }
+
+  let signature = null;
+  try {
+    const tx = await buildMeteoraClaimPartnerFeesTx({
+      mint,
+      feeClaimer: treasury.publicKey,
+      payer: treasury.publicKey,
+      receiver: treasury.publicKey,
+      configKey,
+    });
+
+    // Priority fee — same posture as the pump.fun claim path.
+    const priorityIx = priorityFeeIx();
+    if (priorityIx) {
+      tx.instructions.unshift(priorityIx);
+    }
+
+    const { blockhash } = await connection.getLatestBlockhash('confirmed');
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = treasury.publicKey;
+
+    signature = await signAndPollConfirm(connection, tx, [treasury], {
+      commitment: 'confirmed',
+      label: 'meteora-claim-partner-fees',
+    });
+    log('claim: meteora partner fees claimed', {
+      mint,
+      sig: signature,
+      isMigrated: state.isMigrated,
+    });
+  } catch (e) {
+    // Common no-op error: "no fees to claim" — treat as a clean zero rather
+    // than a failure so the cycle worker still updates lastClaimAttemptAt.
+    const msg = String(e?.message || '');
+    if (/no fees|nothing to claim|InsufficientLiquidity|nothing to distribute/i.test(msg)) {
+      log('claim: meteora reported no fees to claim', { mint, reason: msg.slice(0, 200) });
+      return { claimedLamports: 0n, signature: null, distributeSig: null, distributePath: 'meteora' };
+    }
+    log('claim: meteora claim failed', { mint, error: msg });
+    return { claimedLamports: 0n, signature: null, distributeSig: null, distributePath: 'meteora' };
+  }
+
+  const afterLamports = await getSolBalance(connection, treasury.publicKey);
+  const delta = afterLamports - beforeLamports;
+  // Same fee-floor as pump path: discard tiny deltas that are just network
+  // fee noise (priority fee + rent for ATAs not fully recovered, etc.).
+  if (delta < 5_000n) {
+    return {
+      claimedLamports: 0n,
+      signature,
+      distributeSig: null,
+      distributePath: 'meteora',
+    };
+  }
+  return {
+    claimedLamports: delta,
+    signature,
+    distributeSig: null,
+    distributePath: 'meteora',
+  };
+}
+
+async function claimPumpfunCreatorFees(connection, treasury, { mint, feeLocked = false } = {}) {
   const beforeLamports = await getSolBalance(connection, treasury.publicKey);
   let signature = null;
   let distributeSig = null;
@@ -257,6 +376,16 @@ function buildPlatformFeeSweepIx(treasury, lamports) {
   });
 }
 
+/**
+ * Wrap `lamports` SOL into wSOL and `deposit_rewards` into the wSOL reward
+ * line. Optionally bundles the platform fee sweep into the same tx for
+ * atomicity (both move or neither). Returns `{ depositSig, sweepSig }`.
+ *
+ * Used by:
+ *   - Single-line wSOL pools (legacy fast path, sweep bundled)
+ *   - Multi-line pools with `pump-fees-direct` lines (sweep deferred to
+ *     a standalone tx so it always runs regardless of which lines deposit)
+ */
 async function depositSolAsWsolToPool({ connection, treasury, stakeMint, lamports, platformLamports = 0n }) {
   if (lamports <= 0n) return { depositSig: null, sweepSig: null };
 
@@ -294,6 +423,93 @@ async function depositSolAsWsolToPool({ connection, treasury, stakeMint, lamport
 }
 
 /**
+ * Multi-reward fan-out: convert `lamports` of treasury wSOL into the line's
+ * target token via Jupiter, then `deposit_rewards(target_mint, acquiredRaw)`
+ * into the reward line. Returns `{ depositSig, swapSig, acquiredRaw }` or
+ * null if the swap returned 0 (no liquidity, route gone, etc).
+ *
+ * Failure-mode contract: this function CAN throw on submit/confirm errors.
+ * The caller MUST wrap each line's call in try/catch so one bad line doesn't
+ * break the others — that's the cycle's per-line resilience guarantee.
+ */
+async function depositJupSwapToPool({ connection, treasury, stakeMint, line, lamports }) {
+  if (lamports <= 0n) return null;
+  const targetMint = new PublicKey(line.mint);
+  const slippageBps = line.slippageBps || 100;
+
+  const swap = await executeSwap({
+    connection,
+    signer: treasury,
+    inputMint: WSOL_MINT,
+    outputMint: line.mint,
+    amountLamports: lamports,
+    slippageBps,
+    label: `cycle:swap-${(line.label || line.mint).slice(0, 12)}`,
+  });
+  // Real failure path: quote/build/submit error. Per-line isolation —
+  // the wSOL allocation stays in the treasury and gets re-attempted
+  // next cycle on top of fresh accruals.
+  if (!swap.ok) {
+    log('cycle: jupiter swap failed', {
+      stakeMint: stakeMint.toBase58(),
+      line: line.mint,
+      lamportsIn: lamports.toString(),
+      reason: swap.error || 'unknown',
+    });
+    return null;
+  }
+
+  // After a successful swap, deposit the FULL ATA balance — not just the
+  // swap delta. This is self-healing: if a previous cycle's swap
+  // confirmed on-chain but our helper read 0 acquired (e.g. the
+  // pre-fix detectTokenProgram bug, or RPC catch-up exceeding the
+  // retry window), the orphan tokens left behind in the treasury ATA
+  // get swept into the pool next cycle. The treasury's reward-mint
+  // ATAs are only ever populated by this code path, so depositing
+  // the full balance is safe.
+  const tokenProgram = await detectTokenProgram(connection, targetMint);
+  const treasuryAta = getAssociatedTokenAddressSync(
+    targetMint,
+    treasury.publicKey,
+    false,
+    tokenProgram,
+  );
+  let totalRaw = 0n;
+  try {
+    const acc = await getAccount(connection, treasuryAta, 'confirmed', tokenProgram);
+    totalRaw = acc.amount;
+  } catch {
+    totalRaw = 0n;
+  }
+  if (totalRaw <= 0n) {
+    log('cycle: jupiter swap returned no tokens', {
+      stakeMint: stakeMint.toBase58(),
+      line: line.mint,
+      lamportsIn: lamports.toString(),
+      swapSig: swap.sig,
+    });
+    return null;
+  }
+
+  const dep = await depositRewardsIx({
+    connection,
+    funder: treasury,
+    stakeMint,
+    rewardMint: targetMint,
+    amountLamports: totalRaw,
+  });
+  const tx = new Transaction();
+  const fee = priorityFeeIx();
+  if (fee) tx.add(fee);
+  tx.add(dep.ix);
+  const depositSig = await signAndPollConfirm(connection, tx, [treasury], {
+    commitment: 'confirmed',
+    label: `deposit_rewards(${(line.label || line.mint).slice(0, 12)})`,
+  });
+  return { depositSig, swapSig: swap.sig, acquiredRaw: totalRaw };
+}
+
+/**
  * Token-reward mode can't piggy-back the sweep onto the deposit tx (that
  * tx has its own large account list). Sweep as a tiny standalone tx after
  * the deposit. ~5000 lamports network fee, paid by treasury.
@@ -317,8 +533,21 @@ async function sweepPlatformFeeStandalone({ connection, treasury, lamports }) {
  *
  * Returns `{ buySig, depositSig, depositedRaw }` or null if no tokens were
  * acquired (e.g. PumpDev rejection / curve issues).
+ *
+ * `launchSource` selects which curve to buy from:
+ *   - `pumpfun` (default): PumpDev /api/trade-local against pump's BC.
+ *   - `meteora`: Meteora DBC SDK swap against the per-mint virtual pool.
+ *     Caller MUST gate on `pool.meteora.graduated === false` — this helper
+ *     does not check graduation status and the SDK swap will fail post-grad.
  */
-async function depositTokensToPool({ connection, treasury, stakeMint, lamports }) {
+async function depositTokensToPool({
+  connection,
+  treasury,
+  stakeMint,
+  lamports,
+  launchSource = 'pumpfun',
+  meteoraConfigKey = null,
+}) {
   if (lamports <= 0n) return null;
 
   const tokenProgram = await detectTokenProgram(connection, stakeMint);
@@ -337,18 +566,38 @@ async function depositTokensToPool({ connection, treasury, stakeMint, lamports }
     beforeRaw = 0n;
   }
 
-  // 1) Buy the launched token from the bonding curve.
+  // 1) Buy the launched token from the bonding curve. Both venues return a
+  //    legacy Transaction — same downstream send/confirm flow.
   const solAmount = Number(lamports) / 1e9;
-  const buyTx = await buildBuyTokenTx({
-    publicKey: treasury.publicKey.toBase58(),
-    mint: stakeMint.toBase58(),
-    solAmount,
-    slippage: 5,
-    pool: 'auto',
-  });
+  let buyTx;
+  let label;
+  if (launchSource === 'meteora') {
+    buyTx = await buildMeteoraBuyTokenTx({
+      publicKey: treasury.publicKey,
+      mint: stakeMint,
+      solAmount,
+      configKey: meteoraConfigKey,
+    });
+    // Meteora swap tx is unsigned — fill blockhash + feePayer + priority fee.
+    const priorityIx = priorityFeeIx();
+    if (priorityIx) buyTx.instructions.unshift(priorityIx);
+    const { blockhash } = await connection.getLatestBlockhash('confirmed');
+    buyTx.recentBlockhash = blockhash;
+    buyTx.feePayer = treasury.publicKey;
+    label = 'meteora-buy';
+  } else {
+    buyTx = await buildPumpfunBuyTokenTx({
+      publicKey: treasury.publicKey.toBase58(),
+      mint: stakeMint.toBase58(),
+      solAmount,
+      slippage: 5,
+      pool: 'auto',
+    });
+    label = 'pump-buy';
+  }
   buyTx.sign([treasury]);
   const buySig = await connection.sendRawTransaction(buyTx.serialize(), { skipPreflight: false, maxRetries: 3 });
-  await confirmSignature(connection, buySig, { commitment: 'confirmed', label: 'pump-buy' });
+  await confirmSignature(connection, buySig, { commitment: 'confirmed', label });
 
   // 2) Compute how many tokens we actually got, with a tiny retry to allow
   //    the ATA balance to settle on the RPC.
@@ -511,14 +760,24 @@ export async function runPoolCycle({ pool }) {
     };
   }
 
-  // 2) Claim creator fees. We pass the pool's stakeMint so PumpDev uses the
-  //    correct claim instruction when fee-sharing is configured. Locked tokens
-  //    rely entirely on claim-distribute (the BC creator is a PDA, not the
-  //    treasury) so we skip the legacy claim-account call for them.
+  // 2) Claim creator fees. The dispatcher branches by `pool.launchSource`:
+  //    - `pumpfun` (default): legacy pump_fees flow (native distribute +
+  //      claim-account / claim-distribute). Uses fee-sharing config when
+  //      `pool.feeLock` is present.
+  //    - `meteora`: partner-fee claim via Meteora DBC SDK. The Stakrr-owned
+  //      config has feeClaimer=treasury and creatorTradingFeePercentage=0,
+  //      so 100% of accrued SOL fees land in the treasury.
+  const launchSourceForClaim = pool.launchSource || 'pumpfun';
+  const meteoraConfigKey = pool.meteora?.configKey || null;
   const { claimedLamports, signature: claimSig, distributeSig, distributePath } = await claimCreatorFees(
     connection,
     treasury,
-    { mint: pool.stakeMint, feeLocked: !!pool.feeLock },
+    {
+      mint: pool.stakeMint,
+      feeLocked: !!pool.feeLock,
+      launchSource: launchSourceForClaim,
+      meteoraConfigKey,
+    },
   );
   log('cycle: claimed', {
     stakeMint: pool.stakeMint,
@@ -639,29 +898,18 @@ export async function runPoolCycle({ pool }) {
   let rewardsDepositedRaw = '0';
   let rewardsDepositedLabel = stakers.toString(); // for SOL mode, lamports == raw
 
+  // Resolve the effective reward-line plan for this pool. Single-line
+  // legacy pools synthesise a one-entry array from rewardMode (see
+  // `effectiveRewardLines`), so this code path covers BOTH old and new
+  // pools without a registry migration.
+  const rewardLines = effectiveRewardLines(pool);
+  const isLegacySingleLine = !Array.isArray(pool.rewardLines) || pool.rewardLines.length === 0;
+  const lineResults = []; // [{ line, ok, depositSig?, swapSig?, depositedRaw?, error? }]
+
   if (stakers > 0n && !onchain.totalEffective?.isZero?.()) {
-    if (rewardMode === 'token') {
-      const res = await depositTokensToPool({
-        connection,
-        treasury,
-        stakeMint,
-        lamports: stakers,
-      });
-      if (res) {
-        buySig = res.buySig;
-        depositSig = res.depositSig;
-        rewardsDepositedRaw = res.depositedRaw;
-        rewardsDepositedLabel = res.depositedRaw;
-        log('cycle: swapped SOL to token + deposited', {
-          stakeMint: pool.stakeMint,
-          buySig,
-          depositSig,
-          depositedRaw: res.depositedRaw,
-        });
-        sweepSig = await sweepPlatformFeeStandalone({ connection, treasury, lamports: platform });
-        if (sweepSig) log('cycle: swept platform fee', { stakeMint: pool.stakeMint, sweepSig, lamports: platform.toString() });
-      }
-    } else {
+    // FAST PATH: legacy single-line wSOL pool. Keep the bundled deposit+sweep
+    // tx (saves one tx fee per cycle) — most pools today fall into this case.
+    if (isLegacySingleLine && rewardLines[0].source === 'pump-fees-direct') {
       const solRes = await depositSolAsWsolToPool({
         connection,
         treasury,
@@ -673,12 +921,182 @@ export async function runPoolCycle({ pool }) {
       sweepSig = solRes.sweepSig;
       rewardsDepositedRaw = stakers.toString();
       rewardsDepositedLabel = stakers.toString();
+      lineResults.push({ line: rewardLines[0], ok: !!depositSig, depositSig, depositedRaw: stakers.toString() });
       log('cycle: deposited wSOL to pool + swept platform fee', {
         stakeMint: pool.stakeMint,
         sig: depositSig,
         sweepBundled: !!sweepSig,
         platformLamports: platform.toString(),
       });
+    } else if (isLegacySingleLine && rewardLines[0].source === 'pump-fees-swap-pumpdev') {
+      // FAST PATH: legacy token-mode pool — buy stake_mint via the launch
+      // venue's bonding curve (pump.fun OR meteora, dispatched by
+      // `pool.launchSource`), deposit, then sweep platform fee as a
+      // standalone tx. The source label `pump-fees-swap-pumpdev` is kept
+      // for back-compat — semantically it just means "buy stake_mint from
+      // the native curve" and the venue dispatch happens inside.
+      // Meteora pools that have already graduated cannot be bought via
+      // their virtual pool; gate here and skip rather than spending the
+      // SOL on a guaranteed-to-fail swap.
+      if (launchSourceForClaim === 'meteora') {
+        const meteoraState = await getMeteoraPoolState({
+          mint: pool.stakeMint,
+          configKey: meteoraConfigKey,
+        });
+        if (meteoraState?.isMigrated) {
+          log('cycle: meteora pool graduated — skipping token-mode buy', {
+            stakeMint: pool.stakeMint,
+            poolAddress: meteoraState.poolAddress.toBase58(),
+          });
+          // Hold the staker portion in the treasury — next cycle's check
+          // will keep skipping until ops manually convert via Jupiter or
+          // we add a DAMM-v2-aware buy path. The platform fee still gets
+          // swept so we don't leak revenue collection.
+          await sweepPlatformFeeStandalone({ connection, treasury, lamports: platform })
+            .catch((e) => log('cycle: platform-fee sweep on grad-skip failed', { error: e.message }));
+          return {
+            status: 'meteora_graduated_token_mode_skipped',
+            claimedLamports: claimedLamports.toString(),
+          };
+        }
+      }
+      const res = await depositTokensToPool({
+        connection,
+        treasury,
+        stakeMint,
+        lamports: stakers,
+        launchSource: launchSourceForClaim,
+        meteoraConfigKey,
+      });
+      if (res) {
+        buySig = res.buySig;
+        depositSig = res.depositSig;
+        rewardsDepositedRaw = res.depositedRaw;
+        rewardsDepositedLabel = res.depositedRaw;
+        lineResults.push({ line: rewardLines[0], ok: !!depositSig, depositSig, swapSig: buySig, depositedRaw: res.depositedRaw });
+        log('cycle: swapped SOL to token + deposited', {
+          stakeMint: pool.stakeMint,
+          buySig,
+          depositSig,
+          depositedRaw: res.depositedRaw,
+        });
+        sweepSig = await sweepPlatformFeeStandalone({ connection, treasury, lamports: platform });
+        if (sweepSig) log('cycle: swept platform fee', { stakeMint: pool.stakeMint, sweepSig, lamports: platform.toString() });
+      }
+    } else {
+      // MULTI-LINE PATH: split staker pot by weight, dispatch per source.
+      // Per-line try/catch keeps one failed line from breaking the cycle.
+      const allocations = allocateByWeight(stakers, rewardLines);
+      log('cycle: multi-line allocations', {
+        stakeMint: pool.stakeMint,
+        lines: rewardLines.map((l, i) => ({ mint: l.mint, source: l.source, weightBps: l.weightBps, lamports: allocations[i].toString() })),
+      });
+      for (let i = 0; i < rewardLines.length; i += 1) {
+        const line = rewardLines[i];
+        const allocLamports = allocations[i];
+        if (allocLamports === 0n || line.source === 'manual') {
+          lineResults.push({ line, ok: true, skipped: line.source === 'manual' ? 'manual' : 'zero' });
+          continue;
+        }
+        try {
+          if (line.source === 'pump-fees-direct') {
+            const res = await depositSolAsWsolToPool({
+              connection,
+              treasury,
+              stakeMint,
+              lamports: allocLamports,
+              platformLamports: 0n, // sweep is standalone in multi-line mode
+            });
+            depositSig = depositSig || res.depositSig;
+            lineResults.push({ line, ok: !!res.depositSig, depositSig: res.depositSig, depositedRaw: allocLamports.toString() });
+            log('cycle: line deposited (direct wSOL)', {
+              stakeMint: pool.stakeMint,
+              line: line.mint,
+              lamports: allocLamports.toString(),
+              sig: res.depositSig,
+            });
+          } else if (line.source === 'pump-fees-swap-jup') {
+            const res = await depositJupSwapToPool({
+              connection,
+              treasury,
+              stakeMint,
+              line,
+              lamports: allocLamports,
+            });
+            if (res) {
+              depositSig = depositSig || res.depositSig;
+              lineResults.push({
+                line, ok: true,
+                depositSig: res.depositSig,
+                swapSig: res.swapSig,
+                depositedRaw: res.acquiredRaw.toString(),
+              });
+              log('cycle: line swapped + deposited (jup)', {
+                stakeMint: pool.stakeMint,
+                line: line.mint,
+                lamportsIn: allocLamports.toString(),
+                acquiredRaw: res.acquiredRaw.toString(),
+                swapSig: res.swapSig,
+                depositSig: res.depositSig,
+              });
+            } else {
+              lineResults.push({ line, ok: false, error: 'jupiter returned no tokens' });
+            }
+          } else if (line.source === 'pump-fees-swap-pumpdev') {
+            const res = await depositTokensToPool({
+              connection,
+              treasury,
+              stakeMint,
+              lamports: allocLamports,
+              launchSource: launchSourceForClaim,
+              meteoraConfigKey,
+            });
+            if (res) {
+              depositSig = depositSig || res.depositSig;
+              buySig = buySig || res.buySig;
+              lineResults.push({
+                line, ok: !!res.depositSig,
+                depositSig: res.depositSig,
+                swapSig: res.buySig,
+                depositedRaw: res.depositedRaw,
+              });
+            } else {
+              lineResults.push({ line, ok: false, error: 'pump-buy returned no tokens' });
+            }
+          }
+        } catch (e) {
+          // Per-line failure isolation — log and continue with the next line.
+          // Treasury keeps the line's allocation (it stays as wSOL or SOL on
+          // the treasury wallet), so funds are NOT lost — they'll be retried
+          // next cycle as part of fresh fee accruals.
+          log('cycle: line failed (continuing)', {
+            stakeMint: pool.stakeMint,
+            line: line.mint,
+            source: line.source,
+            error: e.message,
+          });
+          lineResults.push({ line, ok: false, error: e.message });
+        }
+      }
+      // Standalone platform-fee sweep AFTER all lines (regardless of whether
+      // any deposited successfully). Even if every line failed we still want
+      // to skim the 2% — those lamports stay in the treasury otherwise.
+      if (platform > 0n) {
+        try {
+          sweepSig = await sweepPlatformFeeStandalone({ connection, treasury, lamports: platform });
+          if (sweepSig) log('cycle: swept platform fee (standalone)', { stakeMint: pool.stakeMint, sweepSig, lamports: platform.toString() });
+        } catch (e) {
+          log('cycle: platform-fee sweep failed (will retry next cycle)', { stakeMint: pool.stakeMint, error: e.message });
+        }
+      }
+      // Roll up totals for legacy metrics. We use lamports-in (allocLamports
+      // sum) as `rewardsDepositedRaw` for SOL-denominated metrics; per-line
+      // raw amounts are recorded individually in the cycle event.
+      const totalDepositedLamports = lineResults
+        .filter((r) => r.ok && r.depositSig)
+        .reduce((acc, r) => acc + BigInt(r.depositedRaw || 0n), 0n);
+      rewardsDepositedRaw = totalDepositedLamports.toString();
+      rewardsDepositedLabel = totalDepositedLamports.toString();
     }
   }
 
@@ -720,6 +1138,21 @@ export async function runPoolCycle({ pool }) {
   }
   addToPoolMetrics(pool.stakeMint, metricsDelta);
 
+  // Per-line breakdown for the cycle event log — admins can inspect which
+  // reward lines deposited successfully and which failed (and why).
+  const rewardLinesEvent = lineResults.map((r) => ({
+    mint: r.line.mint,
+    label: r.line.label || null,
+    source: r.line.source,
+    weightBps: r.line.weightBps,
+    ok: !!r.ok,
+    skipped: r.skipped || null,
+    depositSig: r.depositSig || null,
+    swapSig: r.swapSig || null,
+    depositedRaw: r.depositedRaw || null,
+    error: r.error || null,
+  }));
+
   recordEvent({
     type: 'cycle',
     stakeMint: pool.stakeMint,
@@ -729,6 +1162,7 @@ export async function runPoolCycle({ pool }) {
     platformFeeVault: config.platformFeeVault?.toBase58() || null,
     rewardsDepositedRaw,
     rewardsDepositedLabel,
+    rewardLines: rewardLinesEvent,
     claimSig,
     distributeSig,
     buySig,
@@ -746,6 +1180,7 @@ export async function runPoolCycle({ pool }) {
     claimedLamports: claimedLamports.toString(),
     platformFeeLamports: platform.toString(),
     rewardsDepositedRaw,
+    rewardLines: rewardLinesEvent,
     claimSig,
     distributeSig,
     buySig,

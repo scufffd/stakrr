@@ -31,6 +31,8 @@ import { PublicKey } from '@solana/web3.js';
 import { config, authoritySigner, getConnection } from './config.js';
 import { getPool, listPools } from './registry.js';
 import { runPoolCycle } from './claim-and-distribute.js';
+import { validateAndNormaliseRewardLines } from './reward-lines.js';
+import { probeRoute as probeJupiterRoute } from './jupiter.js';
 import { getUserPrefs, setUserPrefs } from './user-prefs.js';
 import nacl from 'tweetnacl';
 import bs58 from 'bs58';
@@ -42,6 +44,7 @@ import {
   buildCreatorAutoStakeTxBase64,
   finalizeCreatorLaunch,
   finalizeLockFeesOnly,
+  recoverFinalizeLaunch,
 } from './launch.js';
 import { buildWalletSummary } from './wallet-summary.js';
 import { getVanityPoolStats } from './vanity-mints.js';
@@ -113,6 +116,28 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB image cap
 });
+
+/**
+ * Parse + validate the optional `rewardLines` field from a launch request
+ * body. Accepts either a parsed array (JSON body) or a JSON string
+ * (multipart form-data). Returns `null` when the field is missing/empty —
+ * the caller then falls back to the legacy `rewardMode` single-line behaviour.
+ *
+ * Throws a 400-friendly error message on bad shape or invalid content. The
+ * error message is surfaced verbatim to the client so they can fix their
+ * input.
+ */
+function parseRewardLinesFromBody(body, { stakeMint } = {}) {
+  if (!body) return null;
+  let raw = body.rewardLines;
+  if (raw == null || raw === '') return null;
+  if (typeof raw === 'string') {
+    try { raw = JSON.parse(raw); }
+    catch { throw new Error('rewardLines: invalid JSON'); }
+  }
+  if (!Array.isArray(raw)) throw new Error('rewardLines: must be an array');
+  return validateAndNormaliseRewardLines(raw, { stakeMint });
+}
 
 /** When the browser pins metadata to Pump.fun first, it passes this + optional image URL. */
 function validateExternalMetadataUri(raw) {
@@ -932,6 +957,9 @@ app.post('/api/admin/snipe/launch', requireAdmin, requireVault, upload.single('i
       }
     }
 
+    let rewardLines = null;
+    try { rewardLines = parseRewardLinesFromBody(body); }
+    catch (e) { return res.status(400).json({ ok: false, error: e.message }); }
     const result = await stealthLaunch({
       devWalletId: body.devWalletId,
       sniperWalletIds,
@@ -940,6 +968,7 @@ app.post('/api/admin/snipe/launch', requireAdmin, requireVault, upload.single('i
       jitoTipSol: body.jitoTipSol == null ? null : Number(body.jitoTipSol),
       slippageBps: Number(body.slippageBps) || 5000,
       rewardMode: body.rewardMode === 'token' ? 'token' : 'sol',
+      rewardLines,
       metadata,
       fileBuffer: req.file?.buffer || null,
       fileContentType: req.file?.mimetype || null,
@@ -1756,6 +1785,10 @@ app.post('/api/launch/prepare', upload.single('image'), async (req, res) => {
       });
     }
     const rewardMode = body.rewardMode === 'token' ? 'token' : 'sol';
+    let rewardLines = null;
+    try { rewardLines = parseRewardLinesFromBody(body); }
+    catch (e) { return res.status(400).json({ ok: false, error: e.message }); }
+    const launchSource = body.launchSource === 'meteora' ? 'meteora' : 'pumpfun';
     const out = await prepareCreatorLaunch({
       metadata,
       uri: metadataUri || undefined,
@@ -1764,6 +1797,8 @@ app.post('/api/launch/prepare', upload.single('image'), async (req, res) => {
       fileBuffer: req.file?.buffer || null,
       fileContentType: req.file?.mimetype || null,
       rewardMode,
+      rewardLines,
+      launchSource,
     });
     res.json(out);
   } catch (e) {
@@ -1809,10 +1844,14 @@ app.post('/api/launch/pool-tx', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'creatorWallet and mint required' });
     }
     const rm = rewardMode === 'token' ? 'token' : 'sol';
+    let rewardLines = null;
+    try { rewardLines = parseRewardLinesFromBody(req.body, { stakeMint: mint.trim() }); }
+    catch (e) { return res.status(400).json({ ok: false, error: e.message }); }
     const out = await buildUnsignedPoolRewardTxBase64({
       creatorWallet: creatorWallet.trim(),
       mint: mint.trim(),
       rewardMode: rm,
+      rewardLines,
     });
     res.json({ ok: true, ...out });
   } catch (e) {
@@ -1868,6 +1907,58 @@ app.post('/api/launch/lock-fees-finalize', async (req, res) => {
   }
 });
 
+/**
+ * Recovery finalize: when a launch's create tx confirmed but the pool-init
+ * tx failed (e.g. blockhash expiry on the original 1-bundle flow), the
+ * on-chain mint + bonding-curve exist but no registry row was written.
+ * The user re-signs ONLY the pool tx (via /api/launch/pool-tx → wallet)
+ * and posts here to verify on-chain state and persist the registry row.
+ *
+ * Distinguished from /api/launch/finalize because:
+ *   - createSig is OPTIONAL — we'll fetch from RPC signature history if missing.
+ *   - No lockFeesSig support — recovery is Meteora-first; pump.fun recoveries
+ *     should retro-lock separately via /api/launch/lock-fees-finalize.
+ *   - persistedMetadata + metadataUri come from the user (the original
+ *     /prepare context is gone). Frontend captures these from the recovery
+ *     form.
+ */
+app.post('/api/launch/recover-finalize', async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (!b.mint?.trim() || !b.creatorWallet?.trim() || !b.poolRewardSig?.trim()) {
+      return res.status(400).json({
+        ok: false,
+        error: 'mint, creatorWallet, poolRewardSig required',
+      });
+    }
+    let rewardLines = null;
+    try { rewardLines = parseRewardLinesFromBody(b, { stakeMint: b.mint.trim() }); }
+    catch (e) { return res.status(400).json({ ok: false, error: e.message }); }
+    const launchSource = b.launchSource === 'pumpfun' ? 'pumpfun' : 'meteora';
+    const out = await recoverFinalizeLaunch({
+      mint: b.mint.trim(),
+      creatorWallet: b.creatorWallet.trim(),
+      poolRewardSig: b.poolRewardSig.trim(),
+      createSig: b.createSig?.trim() || null,
+      rewardMode: b.rewardMode === 'token' ? 'token' : 'sol',
+      rewardLines,
+      persistedMetadata: b.persistedMetadata || {},
+      metadataUri: b.metadataUri || null,
+      metadataSource: b.metadataSource || 'recovery',
+      launchSource,
+    });
+    res.json(out);
+  } catch (e) {
+    console.error(JSON.stringify({
+      ts: new Date().toISOString(),
+      message: 'launch recover-finalize failed',
+      error: e.message,
+      stack: e.stack?.split('\n').slice(0, 8),
+    }));
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.post('/api/launch/finalize', async (req, res) => {
   try {
     const b = req.body || {};
@@ -1877,6 +1968,10 @@ app.post('/api/launch/finalize', async (req, res) => {
         error: 'createSig, poolRewardSig, mint, creatorWallet required',
       });
     }
+    let rewardLines = null;
+    try { rewardLines = parseRewardLinesFromBody(b, { stakeMint: b.mint.trim() }); }
+    catch (e) { return res.status(400).json({ ok: false, error: e.message }); }
+    const launchSource = b.launchSource === 'meteora' ? 'meteora' : 'pumpfun';
     const out = await finalizeCreatorLaunch({
       createSig: b.createSig,
       lockFeesSig: b.lockFeesSig || null,
@@ -1885,12 +1980,14 @@ app.post('/api/launch/finalize', async (req, res) => {
       mint: b.mint.trim(),
       creatorWallet: b.creatorWallet.trim(),
       rewardMode: b.rewardMode === 'token' ? 'token' : 'sol',
+      rewardLines,
       persistedMetadata: b.persistedMetadata || {},
       metadataUri: b.metadataUri || null,
       metadataSource: b.metadataSource || 'caller',
       initialBuySol: Number(b.initialBuySol || 0),
       autoStake: !!(b.autoStake === true || b.autoStake === 'true' || b.autoStake === '1'),
       lockDays: Number(b.lockDays || 7),
+      launchSource,
     });
     res.json(out);
   } catch (e) {
@@ -1900,6 +1997,26 @@ app.post('/api/launch/finalize', async (req, res) => {
       error: e.message,
       stack: e.stack?.split('\n').slice(0, 8),
     }));
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * Public Jupiter route-probe. Client passes a candidate output mint; we
+ * quote 0.01 SOL → mint to confirm liquidity exists. Cheap (single quote)
+ * and idempotent. Used by the launch UI to validate user-picked reward
+ * tokens before they're locked into the pool config.
+ */
+app.get('/api/jupiter/probe', async (req, res) => {
+  try {
+    const outputMint = String(req.query.mint || '').trim();
+    if (!outputMint) return res.status(400).json({ ok: false, error: 'mint required' });
+    try { new PublicKey(outputMint); }
+    catch { return res.status(400).json({ ok: false, error: 'invalid mint pubkey' }); }
+    const slippageBps = Number(req.query.slippageBps || 100);
+    const out = await probeJupiterRoute({ outputMint, slippageBps });
+    res.json({ ok: out.ok, ...out });
+  } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });

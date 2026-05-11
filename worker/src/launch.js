@@ -13,15 +13,29 @@ import {
   Transaction,
 } from '@solana/web3.js';
 import bs58 from 'bs58';
-import { getAccount, getAssociatedTokenAddressSync } from '@solana/spl-token';
+import {
+  getAccount,
+  getAssociatedTokenAddressSync,
+  getMint,
+  getTokenMetadata,
+  TOKEN_2022_PROGRAM_ID,
+} from '@solana/spl-token';
 import { config, getConnection } from './config.js';
-import { buildCreateTokenTx } from './pumpdev.js';
+import { buildCreateTokenTx as buildPumpfunCreateTokenTx } from './pumpdev.js';
+import {
+  buildCreateTokenTx as buildMeteoraCreateTokenTx,
+  deriveMeteoraPoolAddress,
+  getMeteoraConfigKey,
+} from './meteora.js';
 import { uploadMetadata } from './pumpfun-ipfs.js';
 import {
   buildLockFeesUnsignedTx,
   fetchFeeSharingConfig,
   findFeeSharingConfigPda,
 } from './pump-fees.js';
+
+/** Whitelist for the new `launchSource` param. Only mainnet venues we operate. */
+const VALID_LAUNCH_SOURCES = ['pumpfun', 'meteora'];
 import {
   addRewardMintIx,
   detectTokenProgram,
@@ -68,6 +82,31 @@ function assertPumpCreateRequiresCreatorSigner(createTx, creatorPk) {
   }
 }
 
+/**
+ * Meteora's createPool tx is a legacy `Transaction` (not VersionedTransaction).
+ * Confirms the creator is required as a signer in at least one instruction.
+ *
+ * We can't inspect `tx.signatures` here because legacy Transaction populates
+ * that array lazily on compile (during `serialize()` or `partialSign()`),
+ * which we haven't called yet. Instead, walk the instructions' account
+ * meta to find a signer slot bound to the creator pubkey.
+ */
+function assertMeteoraCreateRequiresCreatorSigner(legacyTx, creatorPk) {
+  const instructions = legacyTx.instructions || [];
+  if (!Array.isArray(instructions) || instructions.length === 0) {
+    throw new Error('Meteora create: transaction has no instructions');
+  }
+  const creatorIsSigner = instructions.some((ix) =>
+    (ix.keys || []).some((k) => k?.isSigner && k.pubkey?.equals?.(creatorPk)),
+  );
+  if (!creatorIsSigner) {
+    throw new Error(
+      `Meteora createPool returned a transaction that does not require the creator wallet `
+      + `(${creatorPk.toBase58()}) as a signer.`,
+    );
+  }
+}
+
 async function confirmSucceeded(connection, signature, label) {
   const st = await connection.getTransaction(signature, {
     commitment: 'confirmed',
@@ -107,6 +146,15 @@ export async function prepareCreatorLaunch({
   fileBuffer = null,
   fileContentType = null,
   rewardMode = 'sol',
+  rewardLines = null,
+  /**
+   * Launch venue — selects which on-chain bonding curve the token is deployed
+   * to. Defaults to `pumpfun` for backwards-compat (every existing caller
+   * lands on the same code path). `meteora` deploys to a Stakrr-owned
+   * Meteora DBC config and skips the pump_fees lock step (Meteora's
+   * partner-fee model already routes 100% of trading fees to stakrr).
+   */
+  launchSource = 'pumpfun',
 }) {
   if (!metadata?.name || !metadata?.symbol) {
     throw new Error('prepareCreatorLaunch: metadata.name and symbol required');
@@ -124,25 +172,49 @@ export async function prepareCreatorLaunch({
   if (!validRewardModes.includes(rewardMode)) {
     throw new Error(`invalid rewardMode '${rewardMode}'`);
   }
+  if (!VALID_LAUNCH_SOURCES.includes(launchSource)) {
+    throw new Error(`invalid launchSource '${launchSource}' (expected one of ${VALID_LAUNCH_SOURCES.join(', ')})`);
+  }
+  // Meteora launches REQUIRE the pre-deployed config key. Surface a clear
+  // error here rather than letting it fail mid-tx-build.
+  if (launchSource === 'meteora') {
+    getMeteoraConfigKey(); // throws if METEORA_CONFIG_KEY env not set
+  }
 
   // Allocate the vanity mint FIRST (before metadata upload) so we can
   // auto-populate `website` with https://stakrr.xyz/token/<mint> when the
   // deployer leaves it blank. Each launch then has a real landing page even
   // for projects that never make a website. Pre-pinned client-side metadata
   // (`uri` arg) is honored as-is — no retroactive rewrites.
+  //
+  // Per-venue pool selection: Pump.fun launches use the default (`pump`-suffix)
+  // pool to match Pump.fun's tile branding. Meteora launches use a separate
+  // (`stkr`-suffix) pool because their landing page lives on Stakrr — a
+  // `pump` ending CA there would be misleading. If the Meteora pool isn't
+  // configured yet, we fall through to a random ephemeral keypair (never
+  // borrow from the Pump.fun pool).
   const connection = getConnection();
+  const vanityPoolFile = launchSource === 'meteora'
+    ? config.vanityMintMeteoraPoolFile
+    : config.vanityMintPoolFile;
+  const vanitySuffix = launchSource === 'meteora'
+    ? config.vanityMintMeteoraSuffix
+    : config.vanityMintSuffix;
   let mintKeypairSecretB58;
   let preallocatedVanity = null;
-  if (config.vanityMintPoolFile && config.vanityMintSuffix?.trim()) {
+  if (vanityPoolFile && vanitySuffix?.trim()) {
     const result = await popUnusedMintKeypairFromPool(
-      config.vanityMintPoolFile,
-      config.vanityMintSuffix.trim(),
+      vanityPoolFile,
+      vanitySuffix.trim(),
       connection,
     );
     if (result?.keypair) {
       preallocatedVanity = result.keypair;
       mintKeypairSecretB58 = bs58.encode(result.keypair.secretKey);
       log('launch:prepare vanity mint from pool', {
+        venue: launchSource,
+        pool: vanityPoolFile,
+        suffix: vanitySuffix,
         mint: result.keypair.publicKey.toBase58(),
         prunedUsed: result.pruned,
       });
@@ -200,19 +272,54 @@ export async function prepareCreatorLaunch({
     image: resolvedImage || metadata.image || null,
   };
 
-  const { tx: createTx, mint, mintKeypair } = await buildCreateTokenTx({
-    publicKey: creatorPk.toBase58(),
-    name: metadata.name,
-    symbol: metadata.symbol,
-    uri: metadataUri,
-    buyAmountSol: Number(initialBuySol) || 0,
-    mintKeypairSecretB58,
-  });
-  assertPumpCreateRequiresCreatorSigner(createTx, creatorPk);
-  // VersionedTransaction has sign(), not partialSign() (see @solana/web3.js).
-  createTx.sign([mintKeypair]);
-
-  const createTxBase64 = Buffer.from(createTx.serialize()).toString('base64');
+  // Build the venue-specific create tx. Both paths return the same shape
+  // `{ tx, mint, mintKeypair }` — Pump.fun returns a VersionedTransaction,
+  // Meteora returns a legacy Transaction. The frontend handles both via
+  // wallet adapter (`signTransaction` works for either).
+  let createTx;
+  let mint;
+  let mintKeypair;
+  let createTxBase64;
+  if (launchSource === 'meteora') {
+    const res = await buildMeteoraCreateTokenTx({
+      publicKey: creatorPk.toBase58(),
+      name: metadata.name,
+      symbol: metadata.symbol,
+      uri: metadataUri,
+      buyAmountSol: Number(initialBuySol) || 0,
+      mintKeypairSecretB58,
+    });
+    createTx = res.tx;
+    mint = res.mint;
+    mintKeypair = res.mintKeypair;
+    assertMeteoraCreateRequiresCreatorSigner(createTx, creatorPk);
+    // Set blockhash + feePayer FIRST, then partial-sign with the mint
+    // keypair (legacy Transaction.partialSign requires a recentBlockhash
+    // to derive the message hash it signs). The browser wallet adapter
+    // adds the creator signature on top.
+    const { blockhash } = await connection.getLatestBlockhash('confirmed');
+    createTx.recentBlockhash = blockhash;
+    createTx.feePayer = creatorPk;
+    createTx.partialSign(mintKeypair);
+    createTxBase64 = Buffer.from(
+      createTx.serialize({ requireAllSignatures: false, verifySignatures: false }),
+    ).toString('base64');
+  } else {
+    const res = await buildPumpfunCreateTokenTx({
+      publicKey: creatorPk.toBase58(),
+      name: metadata.name,
+      symbol: metadata.symbol,
+      uri: metadataUri,
+      buyAmountSol: Number(initialBuySol) || 0,
+      mintKeypairSecretB58,
+    });
+    createTx = res.tx;
+    mint = res.mint;
+    mintKeypair = res.mintKeypair;
+    assertPumpCreateRequiresCreatorSigner(createTx, creatorPk);
+    createTx.sign([mintKeypair]);
+    createTxBase64 = Buffer.from(createTx.serialize()).toString('base64');
+  }
   const mintPk = mintKeypair.publicKey;
   const mintStr = mintPk.toBase58();
   // Sanity: PumpDev should always use the keypair we provided; if it didn't,
@@ -223,7 +330,8 @@ export async function prepareCreatorLaunch({
     );
   }
 
-  log('launch:prepare pump create tx built', {
+  log('launch:prepare create tx built', {
+    venue: launchSource,
     creator: creatorPk.toBase58(),
     mint: mintStr,
     mintFromApi: mint,
@@ -234,12 +342,36 @@ export async function prepareCreatorLaunch({
   // the mint account to exist on chain yet, so this is safe to do here.
   // Reuses the `connection` opened earlier for the vanity-pool prune call.
   const stakeMint = mintPk;
-  const rewardMint = rewardMode === 'token' ? stakeMint : config.wsolMint;
 
+  // Resolve effective reward lines for this launch:
+  //   - explicit `rewardLines` (already validated by the caller)
+  //   - else legacy single-line derived from rewardMode
+  // The first line's mint is treated as the "primary" rewardMint for
+  // legacy callers / display purposes.
+  const effectiveLines = Array.isArray(rewardLines) && rewardLines.length > 0
+    ? rewardLines
+    : [{ mint: (rewardMode === 'token' ? stakeMint.toBase58() : config.wsolMint.toBase58()), weightBps: 10_000, source: rewardMode === 'token' ? 'pump-fees-swap-pumpdev' : 'pump-fees-direct' }];
+  const primaryRewardMintStr = effectiveLines[0].mint;
+  const primaryRewardMint = new PublicKey(primaryRewardMintStr);
+
+  // Meteora's partner-fee mechanism is configured at the config level (we
+  // are the partner; 100% of trading fees route to PLATFORM_TREASURY by
+  // construction). There is no "lock fees" tx to build — the security model
+  // is enforced by the on-chain config we deployed once at setup time.
+  const lockFeesPromise = launchSource === 'meteora'
+    ? Promise.resolve({ enabled: false, base64: null, recipient: null, reason: 'meteora_partner_fees' })
+    : buildLockFeesTxFor({ connection, creatorPk, mintPk: stakeMint });
   const [lockFees, poolReward] = await Promise.all([
-    buildLockFeesTxFor({ connection, creatorPk, mintPk: stakeMint }),
-    buildPoolRewardTxFor({ connection, creatorPk, stakeMint, rewardMint }),
+    lockFeesPromise,
+    buildPoolRewardTxFor({ connection, creatorPk, stakeMint, rewardLines: effectiveLines }),
   ]);
+
+  // Meteora pools have a deterministic on-chain pool address derived from
+  // (quoteMint, baseMint, configKey). Persist it now so the cycle worker
+  // can claim partner fees without re-deriving on every cycle.
+  const meteoraPoolAddress = launchSource === 'meteora'
+    ? deriveMeteoraPoolAddress({ baseMint: mintPk }).toBase58()
+    : null;
 
   return {
     ok: true,
@@ -248,13 +380,17 @@ export async function prepareCreatorLaunch({
     lockFeesRecipient: lockFees.recipient?.toBase58() || null,
     lockFeesEnabled: lockFees.enabled,
     poolRewardTxBase64: poolReward.base64,
-    rewardMint: rewardMint.toBase58(),
+    rewardMint: primaryRewardMint.toBase58(),
+    rewardLines: effectiveLines,
     mint: mintStr,
     metadataUri,
     metadataSource,
     persistedMetadata,
     rewardMode,
     initialBuySol: Number(initialBuySol) || 0,
+    launchSource,
+    meteoraPoolAddress,
+    meteoraConfigKey: launchSource === 'meteora' ? getMeteoraConfigKey().toBase58() : null,
   };
 }
 
@@ -293,18 +429,29 @@ async function buildLockFeesTxFor({ connection, creatorPk, mintPk }) {
   return { enabled: true, base64, recipient };
 }
 
-async function buildPoolRewardTxFor({ connection, creatorPk, stakeMint, rewardMint }) {
+/**
+ * `rewardLines` is an array of normalised reward-line specs (see
+ * `reward-lines.js`). For backward compat, callers may pass `rewardMint`
+ * (singular PublicKey) instead and we'll synthesise a single-line array
+ * from it. The stake mint is ALWAYS added as a reward line (deduped) so
+ * `unstake_early` can route the 10% principal penalty back to remaining
+ * stakers — see comment below.
+ *
+ * Tx-size budget: each `addRewardMintIx` is ~64 bytes of message data
+ * (3 account refs + 8 byte disc). With initialize_pool + up to 5 reward
+ * lines + the stake-mint dedup ix + set_pool_authority + priority fee ix,
+ * we stay well under the 1232-byte legacy tx ceiling.
+ */
+async function buildPoolRewardTxFor({ connection, creatorPk, stakeMint, rewardMint, rewardLines }) {
+  // Derive line list from singular `rewardMint` when caller hasn't migrated.
+  const lines = Array.isArray(rewardLines) && rewardLines.length > 0
+    ? rewardLines
+    : [{ mint: (rewardMint instanceof PublicKey ? rewardMint.toBase58() : String(rewardMint)) }];
+
   const { ix: ixPool } = await initializePoolIx({
     connection,
     authority: creatorPk,
     stakeMint,
-    allowMissingMint: true,
-  });
-  const { ix: ixReward } = await addRewardMintIx({
-    connection,
-    authority: creatorPk,
-    stakeMint,
-    rewardMint,
     allowMissingMint: true,
   });
 
@@ -312,17 +459,33 @@ async function buildPoolRewardTxFor({ connection, creatorPk, stakeMint, rewardMi
   const fee = priorityFeeIx();
   if (fee) tx.add(fee);
   tx.add(ixPool);
-  tx.add(ixReward);
+
+  // Track which reward mints we've already registered so we don't emit
+  // duplicate `add_reward_mint` ixs (would revert with AccountAlreadyInitialized).
+  const addedMints = new Set();
+  for (const line of lines) {
+    const mintStr = typeof line.mint === 'string' ? line.mint : line.mint.toBase58();
+    if (addedMints.has(mintStr)) continue;
+    addedMints.add(mintStr);
+    const lineMintPk = new PublicKey(mintStr);
+    const { ix: ixReward } = await addRewardMintIx({
+      connection,
+      authority: creatorPk,
+      stakeMint,
+      rewardMint: lineMintPk,
+      allowMissingMint: true,
+    });
+    tx.add(ixReward);
+  }
 
   // unstake_early routes the 10% principal penalty back to remaining stakers
   // through the stake-mint reward line, so the program requires
-  // `add_reward_mint(stake_mint)` to have been called once. In token-reward
-  // mode `rewardMint === stakeMint` already so the line above covers it; in
-  // SOL-reward mode we need a second registration. Bundling here means every
-  // launch is born with early-unstake support — without it the program fails
-  // at instruction-3 with `AccountNotInitialized` for `stake_reward_mint`
-  // (Anchor 3012), which we hit live on yks7qy…pump on a 30-day position.
-  if (!stakeMint.equals(rewardMint)) {
+  // `add_reward_mint(stake_mint)` to have been called once. If the user's
+  // reward-line config doesn't already include the stake mint, register it
+  // here as a no-payout line so early-unstake works. Without this the program
+  // fails at instruction-3 with `AccountNotInitialized` for
+  // `stake_reward_mint` (Anchor 3012), as we hit live on yks7qy…pump.
+  if (!addedMints.has(stakeMint.toBase58())) {
     const { ix: ixStakeRewardLine } = await addRewardMintIx({
       connection,
       authority: creatorPk,
@@ -443,11 +606,17 @@ export async function buildUnsignedPoolRewardTxBase64({
   creatorWallet,
   mint,
   rewardMode,
+  rewardLines = null,
 }) {
   const connection = getConnection();
   const creatorPk = new PublicKey(creatorWallet.trim());
   const stakeMint = new PublicKey(mint.trim());
-  const rewardMint = rewardMode === 'token' ? stakeMint : config.wsolMint;
+
+  const effectiveLines = Array.isArray(rewardLines) && rewardLines.length > 0
+    ? rewardLines
+    : [{ mint: (rewardMode === 'token' ? stakeMint.toBase58() : config.wsolMint.toBase58()), weightBps: 10_000, source: rewardMode === 'token' ? 'pump-fees-swap-pumpdev' : 'pump-fees-direct' }];
+  const primaryRewardMintStr = effectiveLines[0].mint;
+  const primaryRewardMint = new PublicKey(primaryRewardMintStr);
 
   const existingPool = await fetchPool({ connection, signer: null, stakeMint });
   if (existingPool) {
@@ -455,23 +624,31 @@ export async function buildUnsignedPoolRewardTxBase64({
   }
 
   const { ix: ixPool } = await initializePoolIx({ connection, authority: creatorPk, stakeMint });
-  const { ix: ixReward } = await addRewardMintIx({
-    connection,
-    authority: creatorPk,
-    stakeMint,
-    rewardMint,
-  });
 
   const tx = new Transaction();
   const fee = priorityFeeIx();
   if (fee) tx.add(fee);
   tx.add(ixPool);
-  tx.add(ixReward);
+
+  // Add an `add_reward_mint` ix for each configured reward line, deduped.
+  const addedMints = new Set();
+  for (const line of effectiveLines) {
+    const mintStr = typeof line.mint === 'string' ? line.mint : line.mint.toBase58();
+    if (addedMints.has(mintStr)) continue;
+    addedMints.add(mintStr);
+    const { ix: ixReward } = await addRewardMintIx({
+      connection,
+      authority: creatorPk,
+      stakeMint,
+      rewardMint: new PublicKey(mintStr),
+    });
+    tx.add(ixReward);
+  }
 
   // Mirror the bundled-launch path: register the stake mint as its own reward
   // line so unstake_early can pay the 10% penalty back to remaining stakers.
   // See buildPoolRewardTxFor for the full rationale.
-  if (!stakeMint.equals(rewardMint)) {
+  if (!addedMints.has(stakeMint.toBase58())) {
     const { ix: ixStakeRewardLine } = await addRewardMintIx({
       connection,
       authority: creatorPk,
@@ -502,7 +679,12 @@ export async function buildUnsignedPoolRewardTxBase64({
     tx.serialize({ requireAllSignatures: false, verifySignatures: false }),
   ).toString('base64');
 
-  return { poolRewardTxBase64, lastValidBlockHeight, rewardMint: rewardMint.toBase58() };
+  return {
+    poolRewardTxBase64,
+    lastValidBlockHeight,
+    rewardMint: primaryRewardMint.toBase58(),
+    rewardLines: effectiveLines,
+  };
 }
 
 /**
@@ -581,15 +763,21 @@ export async function finalizeCreatorLaunch({
   mint,
   creatorWallet,
   rewardMode = 'sol',
+  rewardLines = null,
   persistedMetadata,
   metadataUri,
   metadataSource = 'caller',
   initialBuySol = 0,
   autoStake = false,
   lockDays = 7,
+  /** Venue used for the create tx — must match what `prepare` was called with. */
+  launchSource = 'pumpfun',
 }) {
   if (!createSig || !poolRewardSig || !mint || !creatorWallet?.trim()) {
     throw new Error('finalizeCreatorLaunch: createSig, poolRewardSig, mint, creatorWallet required');
+  }
+  if (!VALID_LAUNCH_SOURCES.includes(launchSource)) {
+    throw new Error(`invalid launchSource '${launchSource}'`);
   }
   let creatorPk;
   let stakeMint;
@@ -599,7 +787,16 @@ export async function finalizeCreatorLaunch({
   } catch {
     throw new Error('invalid mint or creatorWallet');
   }
-  const rewardMint = rewardMode === 'token' ? stakeMint : config.wsolMint;
+  // Resolve effective reward lines for persistence: explicit array takes
+  // precedence over legacy rewardMode. The first line's mint is the primary
+  // reward mint that legacy single-line consumers (frontend stats, etc) read.
+  const effectiveLines = Array.isArray(rewardLines) && rewardLines.length > 0
+    ? rewardLines
+    : null;
+  const primaryRewardMintStr = effectiveLines
+    ? effectiveLines[0].mint
+    : (rewardMode === 'token' ? stakeMint.toBase58() : config.wsolMint.toBase58());
+  const rewardMint = new PublicKey(primaryRewardMintStr);
   const connection = getConnection();
 
   await confirmSucceeded(connection, createSig, 'create');
@@ -631,9 +828,10 @@ export async function finalizeCreatorLaunch({
       })),
       lockSig: lockFeesSig,
     };
-  } else if (config.lockFees.enabled) {
+  } else if (config.lockFees.enabled && launchSource !== 'meteora') {
     // Lock was supposed to run but the client didn't sign — emit a warning so
-    // ops can spot tokens that slipped through unlocked.
+    // ops can spot tokens that slipped through unlocked. Meteora launches
+    // intentionally skip the lock step (their fee model is config-driven).
     log('launch:finalize WARNING lock_fees enabled but no lockFeesSig supplied', {
       mint: stakeMint.toBase58(),
     });
@@ -685,12 +883,30 @@ export async function finalizeCreatorLaunch({
     autoStakeRes = { signature: autoStakeSig };
   }
 
+  // Persist the venue alongside the rest of the registry row. Cycle worker
+  // dispatches by `launchSource` to pick the right claim path.
+  const meteoraBlock = launchSource === 'meteora'
+    ? {
+        configKey: getMeteoraConfigKey().toBase58(),
+        poolAddress: deriveMeteoraPoolAddress({ baseMint: stakeMint }).toBase58(),
+        graduated: false, // flipped true after migration is detected
+        createSig,
+        metadataUri: metadataUri || null,
+        metadataSource,
+      }
+    : null;
+  const pumpfunBlock = launchSource === 'pumpfun'
+    ? { createSig, metadataUri: metadataUri || null, metadataSource }
+    : null;
+
   const pool = upsertPool({
     stakeMint: stakeMint.toBase58(),
     rewardMint: rewardMint.toBase58(),
     rewardMode,
+    rewardLines: effectiveLines, // null for legacy single-reward pools
     platformFeeBps: config.platformFeeBps,
     launchFunding: 'creator',
+    launchSource,
     poolAuthority: canonicalPoolAuthority.toBase58(),
     /**
      * Once feeLock is present, the BondingCurve.creator field is the
@@ -702,7 +918,11 @@ export async function finalizeCreatorLaunch({
     pumpFeeClaimer: config.treasuryKeypair.publicKey.toBase58(),
     creatorWallet: canonicalCreator.toBase58(),
     metadata: persistedMetadata || {},
-    pumpfun: { createSig, metadataUri: metadataUri || null, metadataSource },
+    // Per-venue blocks (only one is set per pool). Keeping `pumpfun` for
+    // back-compat with legacy registry consumers; new readers should switch
+    // on `launchSource` and consult the matching block.
+    pumpfun: pumpfunBlock,
+    meteora: meteoraBlock,
     feeLock,
     onchain: {
       poolInitSig: poolRewardSig,
@@ -724,12 +944,14 @@ export async function finalizeCreatorLaunch({
     feeLockRecipient: feeLock?.shareholders?.[0]?.address || null,
     autoStake: !!(autoStake && autoStakeSig),
     launchFunding: 'creator',
+    launchSource,
   });
 
   log('launch:finalize registry written', {
     mint: stakeMint.toBase58(),
     creator: canonicalCreator.toBase58(),
     rewardMode,
+    launchSource,
   });
 
   return {
@@ -748,6 +970,236 @@ export async function finalizeCreatorLaunch({
     pool,
     token: pool,
     lockDays: Number(lockDays) || 7,
+  };
+}
+
+/**
+ * Resume a launch that landed the on-chain create tx but never wrote a
+ * registry row. Triggered by the "Recover failed launch" UI when the user's
+ * pool-init tx failed (e.g. blockhash expiry between create + pool-init in
+ * the original 1-bundle flow). The mint exists, the venue's bonding curve
+ * exists, the staking pool was just initialised by the user (signed in the
+ * recovery flow); we just need to verify everything and write the registry.
+ *
+ * `createSig` is optional — when missing we fetch the mint's signature
+ * history and pick the earliest one (which is the create tx by construction;
+ * SPL Token mint accounts are only ever populated once at creation).
+ */
+export async function recoverFinalizeLaunch({
+  mint,
+  creatorWallet,
+  poolRewardSig,
+  rewardMode = 'sol',
+  rewardLines = null,
+  persistedMetadata = {},
+  metadataUri = null,
+  metadataSource = 'recovery',
+  launchSource = 'meteora',
+  createSig: providedCreateSig = null,
+}) {
+  if (!mint || !creatorWallet?.trim() || !poolRewardSig) {
+    throw new Error('recoverFinalizeLaunch: mint, creatorWallet, poolRewardSig required');
+  }
+  if (!VALID_LAUNCH_SOURCES.includes(launchSource)) {
+    throw new Error(`invalid launchSource '${launchSource}'`);
+  }
+  let creatorPk;
+  let stakeMint;
+  try {
+    creatorPk = new PublicKey(creatorWallet.trim());
+    stakeMint = new PublicKey(mint.trim());
+  } catch {
+    throw new Error('invalid mint or creatorWallet');
+  }
+  const connection = getConnection();
+
+  // Confirm the user's pool-init tx actually succeeded before we trust it.
+  await confirmSucceeded(connection, poolRewardSig, 'pool+reward');
+
+  // Resolve createSig — the venue's create tx that brought the mint into
+  // existence. We need this to populate the registry's pumpfun.createSig /
+  // meteora.createSig field for transparency. Fetched on-demand from RPC
+  // history because the original /prepare context is gone by the time we
+  // recover.
+  let createSig = providedCreateSig?.trim() || null;
+  if (!createSig) {
+    const history = await connection.getSignaturesForAddress(stakeMint, { limit: 100 }, 'confirmed');
+    if (!history || history.length === 0) {
+      throw new Error('recoverFinalizeLaunch: no signature history for mint — was create tx confirmed?');
+    }
+    // history is newest-first; create tx is the OLDEST signature touching
+    // the mint account (mint init only ever happens once).
+    const oldest = history[history.length - 1];
+    if (oldest.err) {
+      throw new Error(`recoverFinalizeLaunch: oldest mint sig errored on-chain: ${oldest.signature}`);
+    }
+    createSig = oldest.signature;
+  }
+  await confirmSucceeded(connection, createSig, 'create');
+
+  // Verify venue-specific bonding curve / pool exists on-chain. For Meteora,
+  // also derive the pool address for the registry row.
+  let meteoraBlock = null;
+  let pumpfunBlock = null;
+  if (launchSource === 'meteora') {
+    const cfgKey = getMeteoraConfigKey();
+    const poolAddr = deriveMeteoraPoolAddress({ baseMint: stakeMint, configKey: cfgKey });
+    const poolAcc = await connection.getAccountInfo(poolAddr, 'confirmed');
+    if (!poolAcc) {
+      throw new Error(`recoverFinalizeLaunch: Meteora pool ${poolAddr.toBase58()} not found on-chain`);
+    }
+    meteoraBlock = {
+      configKey: cfgKey.toBase58(),
+      poolAddress: poolAddr.toBase58(),
+      graduated: false,
+      createSig,
+      metadataUri: metadataUri || null,
+      metadataSource,
+    };
+  } else {
+    pumpfunBlock = { createSig, metadataUri: metadataUri || null, metadataSource };
+  }
+
+  // Pull on-chain metadata when the caller didn't supply a metadataUri /
+  // image. Meteora launches use Token-2022 with the TokenMetadata extension
+  // embedded in the mint, which includes the original IPFS URI. We then
+  // fetch the JSON to recover the image URL so the token page renders the
+  // same way it would have post-launch. Best-effort: failures here just
+  // leave the registry row with whatever fields the caller provided.
+  let resolvedMetadataUri = metadataUri || null;
+  let resolvedMetadata = { ...(persistedMetadata || {}) };
+  try {
+    const mintInfo = await getMint(
+      connection, stakeMint, 'confirmed', TOKEN_2022_PROGRAM_ID,
+    ).catch(() => null);
+    if (mintInfo) {
+      const tm = await getTokenMetadata(
+        connection, stakeMint, 'confirmed', TOKEN_2022_PROGRAM_ID,
+      );
+      if (tm) {
+        if (!resolvedMetadataUri && tm.uri) resolvedMetadataUri = tm.uri;
+        if (!resolvedMetadata.name && tm.name) resolvedMetadata.name = tm.name;
+        if (!resolvedMetadata.symbol && tm.symbol) resolvedMetadata.symbol = tm.symbol;
+      }
+    }
+    if (resolvedMetadataUri && !resolvedMetadata.image) {
+      // 5s timeout — IPFS gateways can be slow but we don't want recovery
+      // to hang on a bad URI. Failure here is non-fatal.
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 5000);
+      try {
+        const resp = await fetch(resolvedMetadataUri, { signal: ctrl.signal });
+        if (resp.ok) {
+          const j = await resp.json();
+          if (!resolvedMetadata.image && j.image) resolvedMetadata.image = j.image;
+          if (!resolvedMetadata.description && j.description) resolvedMetadata.description = j.description;
+          if (!resolvedMetadata.twitter && j.twitter) resolvedMetadata.twitter = j.twitter;
+          if (!resolvedMetadata.telegram && j.telegram) resolvedMetadata.telegram = j.telegram;
+          if (!resolvedMetadata.website && j.website) resolvedMetadata.website = j.website;
+        }
+      } finally {
+        clearTimeout(t);
+      }
+    }
+    // If we resolved a URI off-chain, mirror it into the venue block too
+    // (registry consumers read it from there for back-compat).
+    if (meteoraBlock && resolvedMetadataUri && !meteoraBlock.metadataUri) {
+      meteoraBlock.metadataUri = resolvedMetadataUri;
+    }
+    if (pumpfunBlock && resolvedMetadataUri && !pumpfunBlock.metadataUri) {
+      pumpfunBlock.metadataUri = resolvedMetadataUri;
+    }
+  } catch (e) {
+    log('launch:recover metadata pull failed (continuing)', { error: e.message });
+  }
+
+  // Verify on-chain staking-pool was initialised. The pool authority should
+  // either be the creator (legacy / pre-rotation) or platform authority
+  // (modern launches that include the rotation ix in the same tx).
+  const onchainPool = await fetchPool({ connection, signer: null, stakeMint });
+  if (!onchainPool) {
+    throw new Error('recoverFinalizeLaunch: stake pool not found on-chain after poolRewardSig');
+  }
+  const platformAuthorityPk = (config.authorityKeypair || config.treasuryKeypair).publicKey;
+  const authorityIsCreator = onchainPool.authority.equals(creatorPk);
+  const authorityIsPlatform = onchainPool.authority.equals(platformAuthorityPk);
+  if (!authorityIsCreator && !authorityIsPlatform) {
+    throw new Error(
+      `recoverFinalizeLaunch: on-chain pool authority ${onchainPool.authority.toBase58()} matches neither creator ${creatorPk.toBase58()} nor platform ${platformAuthorityPk.toBase58()}`,
+    );
+  }
+  const canonicalPoolAuthority = onchainPool.authority;
+
+  // Resolve effective reward lines + primary reward mint (mirrors finalize).
+  const effectiveLines = Array.isArray(rewardLines) && rewardLines.length > 0
+    ? rewardLines
+    : null;
+  const primaryRewardMintStr = effectiveLines
+    ? effectiveLines[0].mint
+    : (rewardMode === 'token' ? stakeMint.toBase58() : config.wsolMint.toBase58());
+  const rewardMint = new PublicKey(primaryRewardMintStr);
+
+  const rewardAcct = await fetchRewardMint({
+    connection,
+    signer: null,
+    stakeMint,
+    rewardMint,
+  });
+  if (!rewardAcct) {
+    throw new Error('recoverFinalizeLaunch: reward mint line not registered on-chain');
+  }
+
+  const pool = upsertPool({
+    stakeMint: stakeMint.toBase58(),
+    rewardMint: rewardMint.toBase58(),
+    rewardMode,
+    rewardLines: effectiveLines,
+    platformFeeBps: config.platformFeeBps,
+    launchFunding: 'creator',
+    launchSource,
+    poolAuthority: canonicalPoolAuthority.toBase58(),
+    pumpFeeClaimer: config.treasuryKeypair.publicKey.toBase58(),
+    creatorWallet: creatorPk.toBase58(),
+    metadata: resolvedMetadata,
+    pumpfun: pumpfunBlock,
+    meteora: meteoraBlock,
+    onchain: {
+      poolInitSig: poolRewardSig,
+      rewardInitSig: poolRewardSig,
+    },
+  });
+
+  recordEvent({
+    type: 'launch_recovered',
+    stakeMint: stakeMint.toBase58(),
+    creatorWallet: creatorPk.toBase58(),
+    name: persistedMetadata?.name,
+    symbol: persistedMetadata?.symbol,
+    createSig,
+    poolRewardSig,
+    launchFunding: 'creator',
+    launchSource,
+  });
+
+  log('launch:recover registry written', {
+    mint: stakeMint.toBase58(),
+    creator: creatorPk.toBase58(),
+    launchSource,
+    createSig,
+    poolRewardSig,
+  });
+
+  return {
+    ok: true,
+    stakeMint: stakeMint.toBase58(),
+    rewardMint: rewardMint.toBase58(),
+    sigs: {
+      create: createSig,
+      poolInit: poolRewardSig,
+      rewardInit: poolRewardSig,
+    },
+    pool,
+    token: pool,
   };
 }
 

@@ -453,6 +453,26 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
   // explanation + a disabled early-unstake button so they don't waste fees.
   const stakeMintB58Lower = stakeMint.toBase58();
   const stakeMintIsRewardLine = rewardTokenMints.includes(stakeMintB58Lower);
+
+  // Reward badges: enumerate every registered reward line that's NOT just the
+  // stake-mint penalty line. For multi-reward pools (50/50 USDC+GMEx etc.)
+  // this is what stakers actually receive each cycle. We map known mints
+  // (wSOL/USDC/USDT/GMEx) to friendly symbols; unknown mints get an 8-char
+  // shortform of their pubkey. Multi-reward state also drives the claim
+  // button label below — "Claim wSOL → SOL" makes no sense when you're
+  // also receiving GMEx + USDC.
+  const KNOWN_REWARD_MINTS = {
+    'So11111111111111111111111111111111111111112': 'SOL',
+    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 'USDC',
+    'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 'USDT',
+    'Xsf9mBktVB9BSU5kf4nHxPq5hCBJ2j2ui3ecFGxPRGc': 'GMEx',
+  };
+  const payoutRewardMints = rewardTokenMints.filter((m) => m !== stakeMintB58Lower);
+  const isMultiReward = payoutRewardMints.length > 1;
+  const rewardBadges = payoutRewardMints.map((m) => ({
+    mint: m,
+    label: KNOWN_REWARD_MINTS[m] || `${m.slice(0, 4)}…${m.slice(-4)}`,
+  }));
   const poolAuthorityB58 = pool?.authority?.toBase58?.() || null;
   const isPoolAuthority = !!poolAuthorityB58 && wallet?.publicKey?.toBase58?.() === poolAuthorityB58;
   const earlyUnstakeReady = stakeMintIsRewardLine;
@@ -514,6 +534,32 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
               {supplyNum != null ? fmtCompact(supplyNum) : '—'}
             </div>
           </div>
+          {rewardBadges.length > 0 && (
+            <div style={{ gridColumn: '1 / -1' }}>
+              <div style={{ fontSize: 10.5, fontWeight: 700, color: '#888', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                Rewards
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>
+                {rewardBadges.map((b) => (
+                  <span
+                    key={b.mint}
+                    title={b.mint}
+                    style={{
+                      padding: '3px 8px',
+                      borderRadius: 6,
+                      background: '#E0F7FB',
+                      color: '#0369A1',
+                      fontSize: 11,
+                      fontWeight: 700,
+                      fontFamily: "'DM Mono', monospace",
+                    }}
+                  >
+                    {b.label}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
         <p className="muted" style={{ fontSize: '0.875rem', margin: '0 0 12px' }}>
@@ -621,7 +667,11 @@ export default function StakePoolView({ stakeMintB58, symbol, rewardMode = 'sol'
                 </div>
                 <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
                   <button type="button" onClick={() => onClaim(p)} disabled={busy} className="btn-small">
-                    {isSolReward ? 'Claim wSOL → SOL' : `Claim ${rewardLabel}`}
+                    {isMultiReward
+                      ? 'Claim all rewards'
+                      : isSolReward
+                        ? 'Claim wSOL → SOL'
+                        : `Claim ${rewardLabel}`}
                   </button>
                   {expired ? (
                     <button type="button" onClick={() => onUnstake(p, false)} disabled={busy} className="btn-small">

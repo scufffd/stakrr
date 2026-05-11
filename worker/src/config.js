@@ -150,10 +150,24 @@ export const config = {
   registryFile: optional('POOL_REGISTRY_FILE', './data/pools.json'),
   eventLedgerFile: optional('EVENT_LEDGER_FILE', './data/events.jsonl'),
 
-  /** Optional JSON pool of pre-ground mints (see vanity-mints.js). */
+  /** Optional JSON pool of pre-ground mints (see vanity-mints.js).
+   * The default pool is used by Pump.fun launches — typically pre-ground
+   * with a `pump` suffix to match Pump.fun's tile branding. */
   vanityMintPoolFile: optional('VANITY_MINT_POOL_FILE', ''),
   /** Public key must end with this base58 substring (e.g. STK, pump). */
   vanityMintSuffix: optional('VANITY_MINT_SUFFIX', 'STK'),
+
+  /**
+   * Per-venue vanity overrides. Meteora launches MUST NOT pull from the
+   * `pump`-suffix pool because their landing page lives on Stakrr (not
+   * Pump.fun) and a `pump` ending CA is misleading branding. Default
+   * suffix is `stkr` — once the grinder produces a pool, set
+   * `VANITY_MINT_POOL_FILE_METEORA=./data/vanity-stkr.json`. Until a pool
+   * is configured, Meteora launches fall back to a freshly generated
+   * (random-suffix) ephemeral keypair — never to the Pump.fun pool.
+   */
+  vanityMintMeteoraPoolFile: optional('VANITY_MINT_POOL_FILE_METEORA', ''),
+  vanityMintMeteoraSuffix: optional('VANITY_MINT_SUFFIX_METEORA', 'stkr'),
 
   /**
    * Public origin Stakrr is served from. Used as the fallback `website` field

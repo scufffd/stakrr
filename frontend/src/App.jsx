@@ -207,7 +207,16 @@ export default function App() {
               minHeight: '55vh',
             }}
           >
-            {tab === 'launch' && <LaunchView onLaunched={onSelectToken} />}
+            {tab === 'launch' && (
+              <LaunchView
+                onLaunched={onSelectToken}
+                recoverMint={(() => {
+                  if (typeof window === 'undefined') return null;
+                  const m = new URLSearchParams(window.location.search).get('recover');
+                  return m && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(m) ? m : null;
+                })()}
+              />
+            )}
             {tab === 'token' && selectedMint && <PoolView mint={selectedMint} onBack={goHome} />}
             {tab === 'profile' && <UserDashboardView wallet={wallet} onSelectToken={onSelectToken} />}
             {tab === 'docs' && <DocsPage />}

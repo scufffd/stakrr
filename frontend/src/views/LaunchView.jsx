@@ -5,6 +5,7 @@ import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { apiUrl } from '../apiBase.js';
 import { confirmWithFallback } from '../lib/confirm.js';
 import { estimateBuyImpact } from '../lib/pump-curve.js';
+import { RewardLinesPicker, useRewardLinesState } from './RewardLinesPicker.jsx';
 
 const LOCK_TIERS = [
   { days: 1, mult: '1.00×', color: '#94A3B8' },
@@ -159,16 +160,26 @@ async function tryClientPumpfunMetadata({ name, symbol, description, twitter, te
  *   gateMessage             — optional message shown above the form
  *                             (e.g. "Step 1: Launch the token").
  */
+/**
+ * `recoverMint` — when set, this LaunchView renders in recovery mode for
+ * a stuck launch (mint exists on-chain but no Stakrr registry row). The
+ * user re-enters metadata, signs ONLY the pool-init tx, and we finalize
+ * via /api/launch/recover-finalize. Mounted by the parent route via the
+ * `?recover=<mint>` query param so users can recover from a fresh page
+ * load (no need for in-component state to survive the failure).
+ */
 export default function LaunchView({
   onLaunched,
   inline = false,
   forceAutoStakeOff = false,
   submitLabel,
   gateMessage,
+  recoverMint = null,
 }) {
   const { connection } = useConnection();
   const wallet = useWallet();
   const { publicKey, signTransaction, signAllTransactions } = wallet;
+  const isRecoverMode = !!recoverMint?.trim();
   const [name, setName] = useState('');
   const [symbol, setSymbol] = useState('');
   const [description, setDescription] = useState('');
@@ -185,6 +196,19 @@ export default function LaunchView({
   const [autoStake, setAutoStake] = useState(false);
   const [lockDays, setLockDays] = useState(7);
   const [rewardMode, setRewardMode] = useState('sol');
+  // Launch venue. `pumpfun` = pump.fun bonding curve (default, full feature
+  // parity with previous releases). `meteora` = Meteora Dynamic Bonding Curve
+  // memecoin preset (3k MC start → 69k MC migration, fees in SOL, all flow
+  // to stakers). The two venues are wire-compatible from the staking pool's
+  // perspective — only the upstream curve / fee-claim mechanism differs.
+  const [launchSource, setLaunchSource] = useState('pumpfun');
+  // Multi-reward (advanced): when `rewardLines.enabled` is true, the SOL/Token
+  // toggle is informational only and `rewardLines.payload` is sent to the
+  // server as the canonical `rewardLines` payload. Each cycle's claimed wSOL
+  // fees are split by `weightBps`, then for non-wSOL lines auto-swapped via
+  // Jupiter before deposit_rewards. See worker/src/reward-lines.js for the
+  // full schema.
+  const rewardLines = useRewardLinesState();
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
@@ -211,6 +235,77 @@ export default function LaunchView({
       if (!publicKey || !signTransaction || !signAllTransactions) {
         throw new Error('Connect your Solana wallet — you sign and pay all launch transactions');
       }
+
+      // Recovery mode short-circuits the whole create flow. We sign ONLY the
+      // pool-init tx (creator wallet is the original launch authority) and
+      // ask the worker to verify on-chain state + write the registry row.
+      if (isRecoverMode) {
+        const rmRecover = rewardMode === 'token' ? 'token' : 'sol';
+        if (rewardLines.enabled && !rewardLines.isValid) {
+          throw new Error(`Reward split is invalid — weights must sum to 100% (currently ${(rewardLines.totalWeightBps / 100).toFixed(2)}%)`);
+        }
+
+        const poolReqBody = {
+          creatorWallet: publicKey.toBase58(),
+          mint: recoverMint.trim(),
+          rewardMode: rmRecover,
+        };
+        if (rewardLines.enabled) poolReqBody.rewardLines = rewardLines.payload;
+        const poolRes = await fetch(apiUrl('/api/launch/pool-tx'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(poolReqBody),
+        });
+        const poolJson = await poolRes.json();
+        if (!poolRes.ok || poolJson.error) {
+          throw new Error(poolJson.error || `pool-tx HTTP ${poolRes.status}`);
+        }
+        const poolTx = Transaction.from(Buffer.from(poolJson.poolRewardTxBase64, 'base64'));
+        const signedPool = await signTransaction(poolTx);
+        const bhPool = await connection.getLatestBlockhash('confirmed');
+        const poolSig = await connection.sendRawTransaction(signedPool.serialize(), {
+          skipPreflight: false,
+          maxRetries: 3,
+        });
+        await confirmWithFallback(
+          connection,
+          poolSig,
+          { blockhash: bhPool.blockhash, lastValidBlockHeight: bhPool.lastValidBlockHeight },
+          { commitment: 'confirmed' },
+        );
+
+        const persistedMetadata = {
+          name: name.trim(),
+          symbol: symbol.trim().toUpperCase(),
+          description: description.trim(),
+          twitter: twitter.trim() || undefined,
+          telegram: telegram.trim() || undefined,
+          website: website.trim() || undefined,
+        };
+        const finRes = await fetch(apiUrl('/api/launch/recover-finalize'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            mint: recoverMint.trim(),
+            creatorWallet: publicKey.toBase58(),
+            poolRewardSig: poolSig,
+            rewardMode: rmRecover,
+            rewardLines: rewardLines.enabled ? rewardLines.payload : null,
+            persistedMetadata,
+            launchSource: 'meteora', // recovery only supports meteora today
+          }),
+        });
+        const data = await finRes.json();
+        if (!finRes.ok || data.error) throw new Error(data.error || `HTTP ${finRes.status}`);
+        setResult(data);
+        const mint = data.stakeMint || data.mint;
+        if (typeof onLaunched === 'function' && mint) {
+          if (inline) onLaunched(mint, data);
+          else setTimeout(() => onLaunched(mint), 2000);
+        }
+        return;
+      }
+
       if (!imageFile) throw new Error('Please pick an image for the token');
 
       // When the deployer leaves website blank we *want* the worker to pin
@@ -249,6 +344,18 @@ export default function LaunchView({
         fd.append('lockDays', String(lockDays));
       }
       fd.append('rewardMode', rewardMode);
+      fd.append('launchSource', launchSource);
+      // Multi-reward (advanced): when enabled, the worker uses `rewardLines`
+      // for both pool init (one add_reward_mint per line) and cycle dispatch
+      // (split + Jupiter-swap + deposit per line). `rewardMode` is left in
+      // the payload for backwards-compat with the registry primary-mint
+      // mirror but is otherwise ignored when `rewardLines` is present.
+      if (rewardLines.enabled) {
+        if (!rewardLines.isValid) {
+          throw new Error(`Reward split is invalid — weights must sum to 100% (currently ${(rewardLines.totalWeightBps / 100).toFixed(2)}%)`);
+        }
+        fd.append('rewardLines', JSON.stringify(rewardLines.payload));
+      }
       if (clientPin) {
         fd.append('metadataUri', clientPin.uri);
         if (clientPin.imageUrl) fd.append('metadataImageUrl', clientPin.imageUrl);
@@ -260,72 +367,165 @@ export default function LaunchView({
       const prep = await prepRes.json();
       if (!prepRes.ok) throw new Error(prep.error || `prepare failed (${prepRes.status})`);
 
-      // 1-click bundle: ask the wallet to sign create + lock-fees + pool-init
-      // in a single Phantom approval dialog. Sending is sequential afterwards
-      // (Pump create must land first so the BondingCurve account exists for
-      // lock-fees, and the staking pool init wants the mint to exist). The
-      // three blockhashes are independent (~150 slot validity each) which is
-      // plenty given the worst-case land-time of all three is well under a
-      // minute on mainnet.
-      const createTx = VersionedTransaction.deserialize(Buffer.from(prep.createTxBase64, 'base64'));
-      const lockTx = prep.lockFeesEnabled && prep.lockFeesTxBase64
-        ? Transaction.from(Buffer.from(prep.lockFeesTxBase64, 'base64'))
-        : null;
-      const poolTx = Transaction.from(Buffer.from(prep.poolRewardTxBase64, 'base64'));
-      const toSign = [createTx, lockTx, poolTx].filter(Boolean);
-      const signed = await signAllTransactions(toSign);
-      let cursor = 0;
-      const signedCreate = signed[cursor++];
-      const signedLock = lockTx ? signed[cursor++] : null;
-      const signedPool = signed[cursor++];
-
-      const bhCreate = await connection.getLatestBlockhash('confirmed');
-      const createSig = await connection.sendRawTransaction(signedCreate.serialize(), {
-        skipPreflight: false,
-        maxRetries: 3,
-      });
-      await confirmWithFallback(
-        connection,
-        createSig,
-        { blockhash: bhCreate.blockhash, lastValidBlockHeight: bhCreate.lastValidBlockHeight },
-        { commitment: 'confirmed' },
-      );
-
+      // Two flows depending on venue:
+      //
+      //   pumpfun: 1-click bundle — create + lock-fees + pool-init signed in
+      //            one Phantom approval, then sent sequentially. Works because
+      //            pump.fun's create tx lands in 1-3s, well within the
+      //            ~150-slot blockhash window of the bundled pool tx.
+      //
+      //   meteora: 2-stage signing — sign create alone, send + confirm,
+      //            THEN re-fetch a fresh pool tx (with a current blockhash)
+      //            and have the user sign that separately. Required because
+      //            Meteora's createPool tx is large and can take >30s to
+      //            confirm on busy slots, by which time the pool tx's
+      //            original blockhash has expired and RPC rejects the
+      //            send with "Blockhash not found". Trades 1 extra Phantom
+      //            dialog for guaranteed pool-init landing.
+      //
+      // Pump.fun returns a VersionedTransaction; Meteora returns a legacy
+      // Transaction. Branch on `prep.launchSource` so the wallet adapter
+      // serialises each correctly.
+      const isMeteora = (prep.launchSource || launchSource) === 'meteora';
+      const rm = prep.rewardMode || rewardMode;
+      let createSig;
       let lockFeesSig = null;
-      if (signedLock) {
+      let poolSig;
+
+      if (isMeteora) {
+        // STAGE 1 — sign + send + confirm the create tx alone.
+        const createTx = Transaction.from(Buffer.from(prep.createTxBase64, 'base64'));
+        const signedCreate = await signTransaction(createTx);
+        const bhCreate = await connection.getLatestBlockhash('confirmed');
+        createSig = await connection.sendRawTransaction(signedCreate.serialize(), {
+          skipPreflight: false,
+          maxRetries: 3,
+        });
+        await confirmWithFallback(
+          connection,
+          createSig,
+          { blockhash: bhCreate.blockhash, lastValidBlockHeight: bhCreate.lastValidBlockHeight },
+          { commitment: 'confirmed' },
+        );
+
+        // STAGE 2 — fetch a fresh pool-init tx (current blockhash) and sign it.
+        // If something blows up between here and finalize we surface a
+        // "Recover failed launch" handle so the user can resume without
+        // having to re-create the token.
+        const poolReqBody = {
+          creatorWallet: publicKey.toBase58(),
+          mint: prep.mint,
+          rewardMode: rm,
+        };
+        if (rewardLines.enabled) {
+          poolReqBody.rewardLines = rewardLines.payload;
+        }
+        let poolJson;
         try {
-          const bhLock = await connection.getLatestBlockhash('confirmed');
-          lockFeesSig = await connection.sendRawTransaction(signedLock.serialize(), {
+          const poolRes = await fetch(apiUrl('/api/launch/pool-tx'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(poolReqBody),
+          });
+          poolJson = await poolRes.json();
+          if (!poolRes.ok || poolJson.error) {
+            throw new Error(poolJson.error || `pool-tx HTTP ${poolRes.status}`);
+          }
+        } catch (err) {
+          throw new Error(
+            `Token created (${prep.mint}) but failed to build pool tx: ${err.message}. `
+            + `Recover at /launch?recover=${prep.mint}`,
+          );
+        }
+        const poolTx = Transaction.from(Buffer.from(poolJson.poolRewardTxBase64, 'base64'));
+        let signedPool;
+        try {
+          signedPool = await signTransaction(poolTx);
+        } catch (err) {
+          throw new Error(
+            `Token created (${prep.mint}) but pool-init signing was rejected. `
+            + `Recover at /launch?recover=${prep.mint}`,
+          );
+        }
+        try {
+          const bhPool = await connection.getLatestBlockhash('confirmed');
+          poolSig = await connection.sendRawTransaction(signedPool.serialize(), {
             skipPreflight: false,
             maxRetries: 3,
           });
           await confirmWithFallback(
             connection,
-            lockFeesSig,
-            { blockhash: bhLock.blockhash, lastValidBlockHeight: bhLock.lastValidBlockHeight },
+            poolSig,
+            { blockhash: bhPool.blockhash, lastValidBlockHeight: bhPool.lastValidBlockHeight },
             { commitment: 'confirmed' },
           );
         } catch (err) {
-          // Don't hard-fail the whole launch — surface a warning so the user
-          // knows fees are not yet locked and can retry from the token page.
-          // The pool tx still goes through; an unlocked token just keeps the
-          // deployer wallet as BC.creator (worker will warn).
-          console.warn('[stakrr] lock-fees send failed (continuing):', err);
+          throw new Error(
+            `Token created (${prep.mint}) but pool-init send failed: ${err.message}. `
+            + `Recover at /launch?recover=${prep.mint}`,
+          );
         }
-      }
+      } else {
+        // Pump.fun bundle path — unchanged.
+        const createTx = VersionedTransaction.deserialize(Buffer.from(prep.createTxBase64, 'base64'));
+        const lockTx = prep.lockFeesEnabled && prep.lockFeesTxBase64
+          ? Transaction.from(Buffer.from(prep.lockFeesTxBase64, 'base64'))
+          : null;
+        const poolTx = Transaction.from(Buffer.from(prep.poolRewardTxBase64, 'base64'));
+        const toSign = [createTx, lockTx, poolTx].filter(Boolean);
+        const signed = await signAllTransactions(toSign);
+        let cursor = 0;
+        const signedCreate = signed[cursor++];
+        const signedLock = lockTx ? signed[cursor++] : null;
+        const signedPool = signed[cursor++];
 
-      const rm = prep.rewardMode || rewardMode;
-      const bhPool = await connection.getLatestBlockhash('confirmed');
-      const poolSig = await connection.sendRawTransaction(signedPool.serialize(), {
-        skipPreflight: false,
-        maxRetries: 3,
-      });
-      await confirmWithFallback(
-        connection,
-        poolSig,
-        { blockhash: bhPool.blockhash, lastValidBlockHeight: bhPool.lastValidBlockHeight },
-        { commitment: 'confirmed' },
-      );
+        const bhCreate = await connection.getLatestBlockhash('confirmed');
+        createSig = await connection.sendRawTransaction(signedCreate.serialize(), {
+          skipPreflight: false,
+          maxRetries: 3,
+        });
+        await confirmWithFallback(
+          connection,
+          createSig,
+          { blockhash: bhCreate.blockhash, lastValidBlockHeight: bhCreate.lastValidBlockHeight },
+          { commitment: 'confirmed' },
+        );
+
+        if (signedLock) {
+          try {
+            const bhLock = await connection.getLatestBlockhash('confirmed');
+            lockFeesSig = await connection.sendRawTransaction(signedLock.serialize(), {
+              skipPreflight: false,
+              maxRetries: 3,
+            });
+            await confirmWithFallback(
+              connection,
+              lockFeesSig,
+              { blockhash: bhLock.blockhash, lastValidBlockHeight: bhLock.lastValidBlockHeight },
+              { commitment: 'confirmed' },
+            );
+          } catch (err) {
+            // Don't hard-fail the whole launch — surface a warning so the
+            // user knows fees are not yet locked and can retry from the
+            // token page. The pool tx still goes through; an unlocked
+            // token just keeps the deployer wallet as BC.creator (worker
+            // will warn).
+            console.warn('[stakrr] lock-fees send failed (continuing):', err);
+          }
+        }
+
+        const bhPool = await connection.getLatestBlockhash('confirmed');
+        poolSig = await connection.sendRawTransaction(signedPool.serialize(), {
+          skipPreflight: false,
+          maxRetries: 3,
+        });
+        await confirmWithFallback(
+          connection,
+          poolSig,
+          { blockhash: bhPool.blockhash, lastValidBlockHeight: bhPool.lastValidBlockHeight },
+          { commitment: 'confirmed' },
+        );
+      }
 
       let autoStakeSig = null;
       if (autoStakeActive) {
@@ -383,12 +583,14 @@ export default function LaunchView({
           mint: prep.mint,
           creatorWallet: publicKey.toBase58(),
           rewardMode: rm,
+          rewardLines: rewardLines.payload,
           persistedMetadata: prep.persistedMetadata,
           metadataUri: prep.metadataUri,
           metadataSource: prep.metadataSource,
           initialBuySol: prep.initialBuySol ?? Number(initialBuy || 0),
           autoStake: autoStakeActive,
           lockDays,
+          launchSource: prep.launchSource || launchSource,
         }),
       });
       const data = await finRes.json();
@@ -571,7 +773,7 @@ export default function LaunchView({
 
   return (
     <div style={{ maxWidth: 640, margin: inline ? 0 : '0 auto' }}>
-      {!inline && (
+      {!inline && !isRecoverMode && (
         <>
           <h2
             style={{
@@ -589,6 +791,42 @@ export default function LaunchView({
           </p>
         </>
       )}
+      {!inline && isRecoverMode && (
+        <>
+          <h2
+            style={{
+              fontWeight: 800,
+              fontSize: 28,
+              margin: '0 0 4px',
+              letterSpacing: '-0.5px',
+              fontFamily: "'Syne', sans-serif",
+            }}
+          >
+            Recover stuck launch
+          </h2>
+          <p style={{ color: '#888', fontSize: 14, margin: '0 0 16px', fontWeight: 500 }}>
+            Your token was created on-chain but the staking pool init transaction
+            didn’t land. Sign one transaction to finish setup — no new SOL spent on
+            the bonding curve.
+          </p>
+          <div
+            style={{
+              padding: '10px 14px',
+              background: '#F0F9FF',
+              border: '1px solid #BAE6FD',
+              borderRadius: 12,
+              marginBottom: 20,
+              fontSize: 12.5,
+              color: '#075985',
+              lineHeight: 1.5,
+              fontFamily: "'DM Mono', monospace",
+              wordBreak: 'break-all',
+            }}
+          >
+            Mint: <strong>{recoverMint}</strong>
+          </div>
+        </>
+      )}
       {gateMessage && (
         <p style={{ color: '#666', fontSize: 13, margin: '0 0 20px', fontFamily: "'DM Mono', monospace" }}>
           {gateMessage}
@@ -596,6 +834,7 @@ export default function LaunchView({
       )}
 
       <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+        {!isRecoverMode && (
         <div>
           <label style={{ display: 'block', fontWeight: 700, fontSize: 14, marginBottom: 8 }}>
             Token image <span style={{ color: 'red' }}>*</span>
@@ -657,6 +896,7 @@ export default function LaunchView({
             />
           </div>
         </div>
+        )}
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12 }}>
           <div>
@@ -723,6 +963,7 @@ export default function LaunchView({
           ))}
         </div>
 
+        {!isRecoverMode && (
         <div>
           <label style={{ display: 'block', fontWeight: 700, fontSize: 13, marginBottom: 6 }}>Initial buy (SOL)</label>
           <input
@@ -740,8 +981,9 @@ export default function LaunchView({
             </div>
           )}
         </div>
+        )}
 
-        {!forceAutoStakeOff && (
+        {!forceAutoStakeOff && !isRecoverMode && (
         <div
           style={{
             border: '1.5px solid',
@@ -875,38 +1117,120 @@ export default function LaunchView({
         </div>
         )}
 
+        {!isRecoverMode && (
         <div>
-          <label style={{ display: 'block', fontWeight: 700, fontSize: 13, marginBottom: 8 }}>Reward mode</label>
+          <label style={{ display: 'block', fontWeight: 700, fontSize: 13, marginBottom: 8 }}>
+            Launch venue
+          </label>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 6 }}>
+            {[
+              { id: 'pumpfun', label: 'Pump.fun', sub: 'Bonding curve · large memecoin audience' },
+              { id: 'meteora', label: 'Meteora DBC', sub: 'Memecoin preset · 3k → 69k MC · post-grad fees → stakers' },
+            ].map((v) => {
+              const isActive = launchSource === v.id;
+              return (
+                <button
+                  key={v.id}
+                  type="button"
+                  onClick={() => setLaunchSource(v.id)}
+                  style={{
+                    flex: '1 1 240px',
+                    padding: '12px',
+                    borderRadius: 14,
+                    border: '2px solid',
+                    borderColor: isActive ? '#35C5E0' : '#E8E8E8',
+                    background: isActive ? '#35C5E0' : 'white',
+                    color: isActive ? 'white' : '#555',
+                    fontWeight: 700,
+                    fontSize: 14,
+                    cursor: 'pointer',
+                    fontFamily: "'Syne', sans-serif",
+                    textAlign: 'left',
+                  }}
+                >
+                  <div>{v.label}</div>
+                  <div style={{ fontSize: 11.5, fontWeight: 500, marginTop: 4, opacity: 0.85 }}>
+                    {v.sub}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+          {launchSource === 'meteora' && (
+            <div
+              style={{
+                padding: '8px 12px',
+                background: '#F0F9FF',
+                border: '1px solid #BAE6FD',
+                borderRadius: 10,
+                fontSize: 12,
+                color: '#075985',
+                marginBottom: 14,
+                lineHeight: 1.5,
+              }}
+            >
+              Meteora launches use a Stakrr-owned bonding curve config. 100% of trading
+              fees flow back to stakers in SOL, both pre-graduation (partner-fee claim
+              on the virtual pool) and post-graduation (locked LP fees on the migrated
+              DAMM v2 pool). No fee-lock signature step — the on-chain config enforces it.
+            </div>
+          )}
+        </div>
+        )}
+
+        <div>
+          <label style={{ display: 'block', fontWeight: 700, fontSize: 13, marginBottom: 8 }}>
+            Reward mode {rewardLines.enabled && (
+              <span style={{ fontWeight: 500, fontSize: 11, color: '#999' }}>
+                — overridden by custom split below
+              </span>
+            )}
+          </label>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-            {['sol', 'token'].map((m) => (
-              <button
-                key={m}
-                type="button"
-                onClick={() => setRewardMode(m)}
-                style={{
-                  flex: '1 1 200px',
-                  padding: '12px',
-                  borderRadius: 14,
-                  border: '2px solid',
-                  borderColor: rewardMode === m ? '#35C5E0' : '#E8E8E8',
-                  background: rewardMode === m ? '#35C5E0' : 'white',
-                  color: rewardMode === m ? 'white' : '#555',
-                  fontWeight: 700,
-                  fontSize: 14,
-                  cursor: 'pointer',
-                  fontFamily: "'Syne', sans-serif",
-                }}
-              >
-                {m === 'sol' ? 'SOL rewards' : 'Token rewards'}
-              </button>
-            ))}
+            {['sol', 'token'].map((m) => {
+              // When the custom multi-reward picker is enabled, the SOL/Token
+              // toggle is informational only — the active value is ignored
+              // by the launch flow. We mute the buttons so users don't
+              // think the cyan highlight on "SOL rewards" is fighting their
+              // multi-reward setup.
+              const isActive = rewardMode === m;
+              const muted = rewardLines.enabled;
+              return (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setRewardMode(m)}
+                  disabled={muted}
+                  style={{
+                    flex: '1 1 200px',
+                    padding: '12px',
+                    borderRadius: 14,
+                    border: '2px solid',
+                    borderColor: muted ? '#E8E8E8' : (isActive ? '#35C5E0' : '#E8E8E8'),
+                    background: muted ? '#F5F5F5' : (isActive ? '#35C5E0' : 'white'),
+                    color: muted ? '#AAA' : (isActive ? 'white' : '#555'),
+                    fontWeight: 700,
+                    fontSize: 14,
+                    cursor: muted ? 'not-allowed' : 'pointer',
+                    fontFamily: "'Syne', sans-serif",
+                    opacity: muted ? 0.6 : 1,
+                  }}
+                >
+                  {m === 'sol' ? 'SOL rewards' : 'Token rewards'}
+                </button>
+              );
+            })}
           </div>
           <p style={{ margin: '8px 0 0', fontSize: 12, color: '#999', lineHeight: 1.45 }}>
-            {rewardMode === 'sol'
-              ? 'Stakers claim native SOL from creator fees (after the 2% platform share).'
-              : 'Each cycle swaps remaining fees to your token for staker rewards.'}
+            {rewardLines.enabled
+              ? 'Custom split below overrides this mode — fees are auto-swapped via Jupiter into the tokens you pick.'
+              : rewardMode === 'sol'
+                ? 'Stakers claim native SOL from creator fees (after the 2% platform share).'
+                : 'Each cycle swaps remaining fees to your token for staker rewards.'}
           </p>
         </div>
+
+        <RewardLinesPicker {...rewardLines} />
 
         {error && (
           <div
@@ -926,7 +1250,7 @@ export default function LaunchView({
 
         <button
           type="submit"
-          disabled={submitting || !walletConnected}
+          disabled={submitting || !walletConnected || !rewardLines.isValid}
           style={{
             width: '100%',
             padding: '16px',
@@ -947,16 +1271,27 @@ export default function LaunchView({
         >
           {submitting ? (
             <>
-              <IconLoader /> Launching…
+              <IconLoader /> {isRecoverMode ? 'Recovering…' : 'Launching…'}
             </>
           ) : (
             <>
-              <IconRocket /> {submitLabel || 'Launch token'}
+              <IconRocket />
+              {' '}
+              {isRecoverMode
+                ? 'Finish setup'
+                : (submitLabel || 'Launch token')}
             </>
           )}
         </button>
         <p style={{ margin: 0, textAlign: 'center', fontSize: 12, color: '#999' }}>
-          One Phantom approval covers create + fee lock + staking pool · 100% of creator royalties route on-chain to the Stakrr staking pool via Pump's <code style={{ fontFamily: "'DM Mono', monospace" }}>pump_fees</code> program · Fee lock is verifiable on Solscan
+          {isRecoverMode
+            ? 'One Phantom approval to initialise the staking pool for your existing token.'
+            : 'One Phantom approval covers create + fee lock + staking pool · 100% of creator royalties route on-chain to the Stakrr staking pool via Pump\'s '}
+          {!isRecoverMode && (
+            <>
+              <code style={{ fontFamily: "'DM Mono', monospace" }}>pump_fees</code> program · Fee lock is verifiable on Solscan
+            </>
+          )}
         </p>
       </form>
     </div>

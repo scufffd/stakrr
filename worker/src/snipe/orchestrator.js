@@ -122,7 +122,7 @@ async function resolveMintKeypair() {
  * Send the lock-fees + pool tx legs that follow the bundle. Each is
  * locally signed by the deployer vault keypair (no Phantom prompt).
  */
-async function postBundleSetup({ connection, devKeypair, mint, rewardMode, snipeId }) {
+async function postBundleSetup({ connection, devKeypair, mint, rewardMode, rewardLines = null, snipeId }) {
   const out = { lockFeesSig: null, poolRewardSig: null };
 
   // 1. Lock fees (idempotent on the worker side; if already locked we get
@@ -148,6 +148,7 @@ async function postBundleSetup({ connection, devKeypair, mint, rewardMode, snipe
     creatorWallet: devKeypair.publicKey.toBase58(),
     mint,
     rewardMode,
+    rewardLines,
   });
   const poolTx = Transaction.from(Buffer.from(poolOut.poolRewardTxBase64, 'base64'));
   out.poolRewardSig = await signAndPollConfirm(connection, poolTx, [devKeypair], {
@@ -299,6 +300,7 @@ export async function stealthLaunch(params) {
     jitoTipSol,
     slippageBps = 5000,
     rewardMode = 'sol',
+    rewardLines = null,
     metadata,
     fileBuffer = null,
     fileContentType = null,
@@ -550,6 +552,7 @@ export async function stealthLaunch(params) {
       devKeypair,
       mint: bundle.mint,
       rewardMode,
+      rewardLines,
       snipeId: snipeRow.id,
     });
     lockFeesSig = post.lockFeesSig;
@@ -823,6 +826,7 @@ export async function stealthLaunch(params) {
       mint: bundle.mint,
       creatorWallet: devKeypair.publicKey.toBase58(),
       rewardMode,
+      rewardLines,
       persistedMetadata: {
         name: metadata.name,
         symbol: metadata.symbol.toUpperCase(),
